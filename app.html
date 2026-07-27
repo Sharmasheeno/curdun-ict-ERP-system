@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="description" content="Cor Curdun — ERP Platform. Sign in to your company workspace or Curdun Super Admin console."/>
+  <meta name="robots" content="noindex"/>
+  <meta name="theme-color" content="#2D1859"/>
+  <title>Curdun Cor — Sign in</title>
+  <link rel="stylesheet" href="css/base.css"/>
+  <link rel="stylesheet" href="css/app.css"/>
+  <style>
+    /* Extra micro-details */
+    .gap-11 { gap: 11px; }
+    .flex-col.gap-11 { flex-direction: column; gap: 11px; }
+    html, body { background: #F4F5F9; }
+  </style>
+</head>
+<body class="app-root">
+
+  <!--
+    ============================================================
+    APP ROOT — All views rendered here by app.js
+    The state machine in js/app.js builds the entire UI.
+    Views:
+      login       — split panel sign-in
+      firstlogin  — first sign-in / new password setup
+      super       — Curdun super admin console (7 tabs)
+      workspace   — Company admin module launcher
+      pharmacy    — Pharmacy module (7 sub-tabs)
+    ============================================================
+  -->
+  <div id="app-root"></div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

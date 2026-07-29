@@ -17,7 +17,7 @@ const MODULES_DEF = [
     icon:`<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#F5C411" stroke-width="2"><circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3.5-6 7-6s7 2 7 6"/><circle cx="17" cy="7" r="3"/></svg>` },
   { key:'hr',         name:'HR & Payroll',     desc:'Staff · payroll · attendance',      users:0,  branches:'',               v:'v1.8.3',
     icon:`<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#F5C411" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg>` },
-  { key:'pos',        name:'Retail POS',       desc:'Multi-store checkout · loyalty',    users:0,  branches:'',               v:'v3.0.0',
+  { key:'pos',        name:'Retail POS',       desc:'Multi-store checkout · loyalty',    users:18, branches:'6 stores',        v:'v3.0.0',
     icon:`<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#F5C411" stroke-width="2"><path d="M3 3h18l-2 12H5L3 3z"/><circle cx="9" cy="20" r="1.5"/><circle cx="17" cy="20" r="1.5"/></svg>` },
   { key:'university', name:'University',       desc:'Students · courses · exams',       users:0,  branches:'',               v:'v2.4.0',
     icon:`<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#F5C411" stroke-width="2"><path d="M22 10L12 5 2 10l10 5 10-5z"/><path d="M6 12v5c0 2 3 3 6 3s6-1 6-3v-5"/></svg>` },
@@ -38,7 +38,7 @@ const SEED_TENANTS = [
 ];
 
 const SEED_LICENSES = {
-  'TN-0042': { pharmacy:true, financials:true, crm:true, hr:false, pos:false, university:false, hotel:false, hospital:false },
+  'TN-0042': { pharmacy:true, financials:true, crm:true, hr:false, pos:true, university:false, hotel:false, hospital:false },
   'TN-0117': { pharmacy:false, financials:true, crm:true, hr:true, pos:false, university:true, hotel:false, hospital:false },
   'TN-0208': { pharmacy:false, financials:true, crm:true, hr:false, pos:true, university:false, hotel:false, hospital:false },
   'TN-0091': { pharmacy:true, financials:true, crm:true, hr:true, pos:false, university:false, hotel:false, hospital:true },
@@ -62,12 +62,17 @@ const SEED_INVOICES = [
 // APP STATE
 // ============================================================
 const S = {
-  view: 'login',           // login | firstlogin | super | workspace | pharmacy
+  view: 'login',           // login | firstlogin | super | workspace | pharmacy | pos
   superTab: 'overview',    // overview | companies | admins | modules | infra | billing | audit
   pharmTab: 'dash',        // dash | sales | inventory | rx | users | branches | settings
+  posTab: 'dash',          // dash | checkout | products | customers | transactions | staff | settings
 
   // Auth
   loginEmail: '', loginPassword: '', loginError: false,
+
+  // Active company context — set when a company admin signs into the workspace
+  currentCompany: 'Shifo Pharmacy Group',
+  currentStore:   'Bakaara Main Store',
   newPw1: '', newPw2: '', pwError: '',
 
   // Tenants
@@ -98,6 +103,57 @@ const S = {
     { id:6, name:'Hodan Nur',     email:'hodan@shifo.so',    role:'Accountant',    branch:'HQ · Mogadishu' },
   ],
   showAddUser: false, newName:'', newRole:'Pharmacist', newBranch:'Bakaara Main',
+
+  // POS — core
+  posCart: [],
+  posSearchTerm: '',
+  posPaymentMethod: 'cash',
+  posReceiptVisible: false,
+  posLastReceipt: null,
+  posCustomerFilter: '',
+
+  // POS — dual currency
+  exchangeRate: 11800,
+  primaryCurrency: 'USD',
+
+  // POS — CRUD modals
+  crudModal: null,       // null | { type:'product'|'customer'|'staff', mode:'add'|'edit', id:null|number }
+  crudForm: {},          // live form field values
+  viewModal: null,       // { type:'transaction', id:string } — for read detail
+  confirmDeleteModal: null, // { type:'product'|'customer'|'staff'|'transaction', id:any }
+
+  // POS — mobile money modal
+  posMobileMoneyModal: false,
+  mobilePhone: '',
+  mobileTxId: '',
+  mobileError: '',
+
+  // POS — debt (Buugga Deynta)
+  posDebtCustomerId: null,
+
+  // POS — offline
+  isOffline: false,
+  syncQueue: 0,
+
+  // POS — shift reconciliation
+  shiftCashier: null,
+  shiftCountedUSD: '',
+  shiftCountedSOS: '',
+
+  // POS — RBAC auth
+  posActiveUser: null,     // { id, name, username, role, pin, access[] } | null
+  posAuthError: '',
+  posLoginPin: '',         // digits typed so far (max 4)
+  posShiftActive: false,   // cashier shift start/stop
+  posShiftStart: null,     // Date object
+
+  // POS — Admin login mode ('staff' = PIN grid, 'admin' = email/password, 'force-change' = new-password screen)
+  posLoginMode: 'staff',
+  posAdminEmail: '',
+  posAdminPassword: '',
+  posNewPassword: '',
+  posConfirmPassword: '',
+  posPendingAdmin: null,   // admin user awaiting password change
 
   liveTick: 0,
 };
@@ -143,6 +199,7 @@ function render() {
     case 'super':      root.appendChild(renderSuper());     break;
     case 'workspace':  root.appendChild(renderWorkspace()); break;
     case 'pharmacy':   root.appendChild(renderPharmacy());  break;
+    case 'pos':        root.appendChild(renderPOS());       break;
   }
 }
 
@@ -236,7 +293,7 @@ function renderLogin() {
 
   div.querySelector('#btn-signin').addEventListener('click', doSignIn);
   div.querySelector('#demo-super').addEventListener('click', () => { S.view='super'; render(); });
-  div.querySelector('#demo-admin').addEventListener('click', () => { S.view='workspace'; render(); });
+  div.querySelector('#demo-admin').addEventListener('click', () => { S.currentCompany='Shifo Pharmacy Group'; S.view='workspace'; render(); });
   div.querySelector('#demo-firstlogin').addEventListener('click', () => { S.newPw1=''; S.newPw2=''; S.pwError=''; S.view='firstlogin'; render(); });
   div.querySelector('#login-email').addEventListener('input', e => { S.loginEmail = e.target.value; S.loginError = false; });
   div.querySelector('#login-pw').addEventListener('keydown', e => { if(e.key==='Enter') doSignIn(); });
@@ -254,9 +311,9 @@ function doSignIn() {
 
   // Check if matches a created company admin
   const created = S.tenants.find(t => (t.adminEmail||'').toLowerCase() === email);
-  if (created) { S.view='firstlogin'; S.loginError=false; render(); return; }
+  if (created) { S.currentCompany = created.name; S.view='firstlogin'; S.loginError=false; render(); return; }
 
-  if (email.includes('shifo') || email.includes('ahmed')) { S.view='workspace'; S.loginError=false; render(); return; }
+  if (email.includes('shifo') || email.includes('ahmed')) { S.currentCompany='Shifo Pharmacy Group'; S.view='workspace'; S.loginError=false; render(); return; }
   if (/@[^\s@]+\.[a-z]{2,}$/i.test(email)) { S.view='firstlogin'; S.loginError=false; render(); return; }
 
   S.loginError = true; render();
@@ -1400,7 +1457,7 @@ function renderWorkspace() {
     <header class="workspace-header">
       <svg width="34" height="34" viewBox="0 0 64 64" fill="none"><rect x="2" y="2" width="60" height="60" rx="12" fill="#3B2170"/><path d="M22 20 L12 32 L22 44" stroke="#FFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><path d="M42 20 L52 32 L42 44" stroke="#FFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><rect x="30" y="14" width="4" height="36" rx="2" fill="#F5C411" transform="rotate(15 32 32)"/></svg>
       <div>
-        <div class="workspace-brand-name">Shifo Pharmacy Group</div>
+        <div class="workspace-brand-name">${S.currentCompany}</div>
         <div class="workspace-brand-sub">Company workspace · Cor platform</div>
       </div>
       <div class="workspace-header-actions">
@@ -1444,6 +1501,7 @@ function renderWorkspace() {
       const mod = modules.find(m=>m.key===key);
       if (!mod || !mod.on) return;
       if (key==='pharmacy') { S.view='pharmacy'; S.pharmTab='dash'; render(); return; }
+      if (key==='pos') { S.view='pos'; S.posTab='dash'; S.posCart=[]; S.posReceiptVisible=false; render(); return; }
       alert(mod.name+' module — full dashboard coming soon!');
     });
   });
@@ -1476,7 +1534,7 @@ function renderPharmacy() {
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
         Back to workspace
       </button>
-      <div class="pharm-co-name">Shifo Pharmacy Group</div>
+      <div class="pharm-co-name">${S.currentCompany}</div>
       <div class="pharm-co-sub">Pharmacy Module · v4.12.0</div>
     </div>
     <nav class="pharm-nav">
@@ -1774,6 +1832,1831 @@ function renderPharmSettings() {
       </div>
     </div>
   `;
+}
+
+// ============================================================
+// RETAIL POS MODULE
+// ============================================================
+const POS_PRODUCTS = [
+  { id:1,  name:'Basmati Rice 5kg',      cat:'Groceries',     price:12.00, wholesalePrice:88.00,  stock:84,  barcode:'6901234001' },
+  { id:2,  name:'Sunflower Oil 3L',      cat:'Groceries',     price:8.50,  wholesalePrice:62.00,  stock:62,  barcode:'6901234002' },
+  { id:3,  name:'Sugar 1kg',             cat:'Groceries',     price:1.80,  wholesalePrice:11.80,  stock:150, barcode:'6901234003' },
+  { id:4,  name:'Wheat Flour 2kg',       cat:'Groceries',     price:3.20,  wholesalePrice:22.00,  stock:95,  barcode:'6901234004' },
+  { id:5,  name:'Powdered Milk 400g',    cat:'Groceries',     price:6.50,  wholesalePrice:47.00,  stock:45,  barcode:'6901234005' },
+  { id:6,  name:'Coca-Cola 330ml',       cat:'Beverages',     price:0.80,  wholesalePrice:8.00,   stock:200, barcode:'6901234006' },
+  { id:7,  name:'Bottled Water 1.5L',    cat:'Beverages',     price:0.50,  wholesalePrice:4.50,   stock:300, barcode:'6901234007' },
+  { id:8,  name:'Fresh Juice Mango 1L',  cat:'Beverages',     price:2.40,  wholesalePrice:16.00,  stock:38,  barcode:'6901234008' },
+  { id:9,  name:'Laundry Detergent 1kg', cat:'Household',     price:4.20,  wholesalePrice:30.00,  stock:55,  barcode:'6901234009' },
+  { id:10, name:'Dish Soap 500ml',       cat:'Household',     price:1.50,  wholesalePrice:10.00,  stock:72,  barcode:'6901234010' },
+  { id:11, name:'Toothpaste 100ml',      cat:'Personal Care', price:2.00,  wholesalePrice:13.50,  stock:90,  barcode:'6901234011' },
+  { id:12, name:'Shampoo 250ml',         cat:'Personal Care', price:3.80,  wholesalePrice:26.00,  stock:48,  barcode:'6901234012' },
+  { id:13, name:'Canned Tuna 170g',      cat:'Groceries',     price:2.20,  wholesalePrice:15.00,  stock:110, barcode:'6901234013' },
+  { id:14, name:'Tea Bags x25',          cat:'Beverages',     price:1.60,  wholesalePrice:11.00,  stock:130, barcode:'6901234014' },
+  { id:15, name:'Instant Coffee 200g',   cat:'Beverages',     price:5.00,  wholesalePrice:36.00,  stock:40,  barcode:'6901234015' },
+  { id:16, name:'Biscuits 200g',         cat:'Snacks',        price:1.20,  wholesalePrice:8.50,   stock:160, barcode:'6901234016' },
+  { id:17, name:'Chocolate Bar 50g',     cat:'Snacks',        price:0.90,  wholesalePrice:6.00,   stock:180, barcode:'6901234017' },
+  { id:18, name:'Fresh Bread Loaf',      cat:'Bakery',        price:1.00,  wholesalePrice:7.00,   stock:60,  barcode:'6901234018' },
+  { id:19, name:'Eggs Tray x30',         cat:'Fresh',         price:4.50,  wholesalePrice:32.00,  stock:35,  barcode:'6901234019' },
+  { id:20, name:'Bananas 1kg',           cat:'Fresh',         price:1.40,  wholesalePrice:9.00,   stock:50,  barcode:'6901234020' },
+];
+
+const POS_CUSTOMERS = [
+  { id:1, name:'Abdi Mohamed',    phone:'061-234-5678', points:1240, visits:48, lastVisit:'Jul 25, 2026', tier:'Gold',   creditLimit:500,  debtBalance:120.00 },
+  { id:2, name:'Halima Farah',    phone:'061-345-6789', points:860,  visits:32, lastVisit:'Jul 26, 2026', tier:'Silver', creditLimit:200,  debtBalance:0 },
+  { id:3, name:'Yusuf Hassan',    phone:'061-456-7890', points:2100, visits:76, lastVisit:'Jul 27, 2026', tier:'Gold',   creditLimit:800,  debtBalance:645.50 },
+  { id:4, name:'Fartun Ali',      phone:'061-567-8901', points:420,  visits:15, lastVisit:'Jul 22, 2026', tier:'Bronze', creditLimit:100,  debtBalance:95.00 },
+  { id:5, name:'Omar Abdirahman', phone:'061-678-9012', points:1580, visits:55, lastVisit:'Jul 27, 2026', tier:'Gold',   creditLimit:600,  debtBalance:0 },
+  { id:6, name:'Sahra Nur',       phone:'061-789-0123', points:310,  visits:11, lastVisit:'Jul 20, 2026', tier:'Bronze', creditLimit:100,  debtBalance:100.00 },
+  { id:7, name:'Ibrahim Warsame', phone:'061-890-1234', points:720,  visits:28, lastVisit:'Jul 24, 2026', tier:'Silver', creditLimit:300,  debtBalance:210.00 },
+  { id:8, name:'Amina Osman',     phone:'061-901-2345', points:1890, visits:68, lastVisit:'Jul 26, 2026', tier:'Gold',   creditLimit:700,  debtBalance:0 },
+];
+
+const POS_TRANSACTIONS = [
+  { id:'TXN-4821', cashier:'Fartun Ali',     items:8,  total:64.20,  method:'EVC Plus', time:'14:32', date:'Jul 27, 2026', customer:'Abdi Mohamed' },
+  { id:'TXN-4820', cashier:'Mohamed Farah',  items:3,  total:18.90,  method:'Cash',     time:'14:18', date:'Jul 27, 2026', customer:'Walk-in' },
+  { id:'TXN-4819', cashier:'Fartun Ali',     items:12, total:95.40,  method:'Zaad',     time:'13:55', date:'Jul 27, 2026', customer:'Yusuf Hassan' },
+  { id:'TXN-4818', cashier:'Ismail Omar',    items:5,  total:42.00,  method:'Cash',     time:'13:40', date:'Jul 27, 2026', customer:'Walk-in' },
+  { id:'TXN-4817', cashier:'Mohamed Farah',  items:2,  total:9.50,   method:'EVC Plus', time:'13:22', date:'Jul 27, 2026', customer:'Halima Farah' },
+  { id:'TXN-4816', cashier:'Fartun Ali',     items:6,  total:34.80,  method:'Sahal',    time:'13:05', date:'Jul 27, 2026', customer:'Walk-in' },
+  { id:'TXN-4815', cashier:'Ismail Omar',    items:15, total:128.60, method:'Zaad',     time:'12:48', date:'Jul 27, 2026', customer:'Omar Abdirahman' },
+  { id:'TXN-4814', cashier:'Fartun Ali',     items:4,  total:22.40,  method:'Cash',     time:'12:30', date:'Jul 27, 2026', customer:'Walk-in' },
+  { id:'TXN-4813', cashier:'Mohamed Farah',  items:7,  total:56.10,  method:'EVC Plus', time:'12:15', date:'Jul 27, 2026', customer:'Amina Osman' },
+  { id:'TXN-4812', cashier:'Ismail Omar',    items:1,  total:5.00,   method:'Cash',     time:'11:58', date:'Jul 27, 2026', customer:'Walk-in' },
+];
+
+const POS_STAFF = [
+  { id:1, name:'Fartun Ali',     username:'fartun.a',  pin:'1234', role:'Senior Cashier',  store:'Bakaara Main',   shift:'Morning',  sales:186, status:'active', access:['dash','checkout','transactions'] },
+  { id:2, name:'Mohamed Farah',  username:'mohamed.f', pin:'5678', role:'Cashier',         store:'Hodan Store',    shift:'Morning',  sales:124, status:'active', access:['dash','checkout','transactions'] },
+  { id:3, name:'Ismail Omar',    username:'ismail.o',  pin:'9012', role:'Cashier',         store:'Wadajir Store',  shift:'Afternoon',sales:98,  status:'active', access:['dash','checkout','transactions'] },
+  { id:4, name:'Khadija Abdi',   username:'khadija.a', pin:'3456', role:'Store Manager',   store:'Bakaara Main',   shift:'Full day', sales:0,   status:'active', access:['dash','checkout','products','customers','transactions','staff'] },
+  { id:5, name:'Hassan Yusuf',   username:'hassan.y',  pin:'7890', role:'Cashier',         store:'Hamar Weyne',    shift:'Morning',  sales:72,  status:'active', access:['dash','checkout','transactions'] },
+  { id:6, name:'Nimco Ali',      username:'nimco.a',   pin:'2468', role:'Cashier',         store:'Hodan Store',    shift:'Afternoon',sales:45,  status:'break',  access:['dash','checkout','transactions'] },
+];
+
+// Company Admins — auto-created when Cor Super Admin provisions a company.
+// Login flow:
+//  - Core workspace: tempPassword works forever (never forced to change)
+//  - Retail POS: tempPassword works ONCE; forces posPassword creation on first login
+const COMPANY_ADMINS = [
+  {
+    id: 101,
+    name: 'Ahmed Yusuf',
+    email: 'admin@shifo.so',
+    phone: '+252-61-234-5678',
+    role: 'Admin',
+    company: 'Shifo Pharmacy Group',
+    store: 'Bakaara Main',
+    tempPassword: 'Cor-7441GS-24',   // issued at company creation
+    posPassword: null,               // set on first POS login
+    mustChangePosPassword: true,     // toggled false after user sets posPassword
+    access: ['dash','checkout','products','customers','transactions','staff','settings'],
+    status: 'active',
+    sales: 0,
+    shift: 'Full day',
+  },
+];
+
+// ============================================================
+// POS ROLE-BASED ACCESS CONTROL
+// ============================================================
+const POS_ROLES = {
+  'Cashier':       ['dash', 'checkout', 'transactions'],
+  'Senior Cashier':['dash', 'checkout', 'transactions'],
+  'Store Manager': ['dash', 'checkout', 'products', 'customers', 'transactions', 'staff'],
+  'Admin':         ['dash', 'checkout', 'products', 'customers', 'transactions', 'staff', 'settings'],
+};
+
+function renderPOSLogin() {
+  const pin = S.posLoginPin || '';
+  const dots = [0,1,2,3].map(i =>
+    `<div class="pin-dot ${i < pin.length ? 'filled' : ''}"></div>`
+  ).join('');
+
+  const staffList = POS_STAFF.map(s => `
+    <button class="login-staff-btn" data-login-id="${s.id}">
+      <div class="avatar avatar-sm" style="background:var(--purple-800);color:#FFF">${initials(s.name)}</div>
+      <div>
+        <div style="font-weight:700;font-size:13px">${s.name}</div>
+        <div style="font-size:11px;color:var(--text-muted)">${s.role}</div>
+      </div>
+    </button>
+  `).join('');
+
+  const selectedStaff = S._loginSelectedId
+    ? POS_STAFF.find(s => s.id === S._loginSelectedId) : null;
+
+  // --- Body: three modes ---
+  let body = '';
+
+  if (S.posLoginMode === 'force-change') {
+    const a = S.posPendingAdmin;
+    body = `
+      <div class="pos-login-who">
+        <div class="avatar" style="background:var(--purple-800);color:#FFF;width:56px;height:56px;font-size:20px">${initials(a.name)}</div>
+        <div>
+          <div style="font-weight:800;font-size:16px">${a.name}</div>
+          <div style="font-size:12px;color:var(--text-muted)">${a.role} · ${a.company}</div>
+        </div>
+      </div>
+      <div class="pin-hint" style="text-align:left;margin-bottom:14px">
+        <strong style="color:var(--purple-800)">First sign-in.</strong> Create a new POS password to continue.
+        Your temporary password will no longer work here.
+      </div>
+      ${S.posAuthError ? `<div class="pin-error">${S.posAuthError}</div>` : ''}
+      <form id="pos-force-change-form" style="display:flex;flex-direction:column;gap:12px;text-align:left">
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted)">
+          New password
+          <input type="password" id="pos-new-pw" class="form-input" placeholder="At least 8 characters" autocomplete="new-password" required />
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted)">
+          Confirm password
+          <input type="password" id="pos-confirm-pw" class="form-input" placeholder="Retype new password" autocomplete="new-password" required />
+        </label>
+        <button type="submit" class="btn btn-primary" style="margin-top:6px">Set password & continue</button>
+      </form>
+    `;
+  } else if (S.posLoginMode === 'admin') {
+    body = `
+      <div class="pos-login-who">
+        <div class="avatar" style="background:var(--gold);color:var(--purple-800);width:56px;height:56px;font-size:18px;font-weight:900">A</div>
+        <div>
+          <div style="font-weight:800;font-size:15px">Admin sign-in</div>
+          <div style="font-size:11px;color:var(--text-muted)">Company Admin · Email + password</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="btn-admin-back" style="margin-left:auto;font-size:12px">Back</button>
+      </div>
+      ${S.posAuthError ? `<div class="pin-error">${S.posAuthError}</div>` : ''}
+      <form id="pos-admin-login-form" style="display:flex;flex-direction:column;gap:12px;text-align:left">
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted)">
+          Email
+          <input type="email" id="pos-admin-email" class="form-input" placeholder="admin@company.so" value="${S.posAdminEmail || ''}" autocomplete="username" required />
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted)">
+          Password
+          <input type="password" id="pos-admin-pw" class="form-input" placeholder="Temporary or POS password" autocomplete="current-password" required />
+        </label>
+        <button type="submit" class="btn btn-primary" style="margin-top:6px">Sign in</button>
+        <div style="font-size:11px;color:var(--text-muted);text-align:center;margin-top:2px">
+          Try <strong>admin@shifo.so</strong> / <strong>Cor-7441GS-24</strong>
+        </div>
+      </form>
+    `;
+  } else if (!selectedStaff) {
+    // Staff grid + admin link
+    body = `
+      <div class="pos-login-staff-grid" id="login-staff-grid">
+        ${staffList}
+      </div>
+      <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);text-align:center">
+        <button type="button" class="btn-linklike" id="btn-open-admin-login"
+          style="background:none;border:none;color:var(--purple-800);font-weight:700;font-size:13px;cursor:pointer;text-decoration:underline;padding:6px 10px">
+          Sign in as Admin (email)
+        </button>
+      </div>
+    `;
+  } else {
+    // PIN entry for selected staff
+    body = `
+      <div class="pos-login-who">
+        <div class="avatar" style="background:var(--purple-800);color:#FFF;width:56px;height:56px;font-size:20px">${initials(selectedStaff.name)}</div>
+        <div>
+          <div style="font-weight:800;font-size:16px">${selectedStaff.name}</div>
+          <div style="font-size:12px;color:var(--text-muted)">${selectedStaff.role}</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="btn-login-back" style="margin-left:auto;font-size:12px">Change</button>
+      </div>
+      <div class="pin-dots">${dots}</div>
+      ${S.posAuthError ? `<div class="pin-error">${S.posAuthError}</div>` : '<div class="pin-hint">Enter your 4-digit PIN</div>'}
+      <div class="numpad">
+        ${[1,2,3,4,5,6,7,8,9,'','0','⌫'].map(k => `
+          <button class="numpad-key${k===''?' numpad-key-empty':''}" data-key="${k}">${k}</button>
+        `).join('')}
+      </div>
+    `;
+  }
+
+  return `
+    <div class="pos-login-screen">
+      <div class="pos-login-card">
+        <div class="pos-login-logo">
+          <img src="assets/curdun-logo.jpeg" alt="Curdun ICT" style="height:48px;width:auto;object-fit:contain;"/>
+        </div>
+        <div class="pos-login-title">Retail POS — Sign In</div>
+        <div class="pos-login-sub">${S.currentCompany} · ${S.currentStore}</div>
+        ${body}
+      </div>
+    </div>
+  `;
+}
+
+function renderPOS() {
+  // ---- Gate: show login if no active user ----
+  if (!S.posActiveUser) {
+    const loginWrap = document.createElement('div');
+    loginWrap.style.cssText = 'height:100%;display:flex;align-items:stretch;';
+    loginWrap.innerHTML = renderPOSLogin();
+    setTimeout(() => wirePOSLoginEvents(), 0);
+    return loginWrap;
+  }
+
+  const wrap = document.createElement('div');
+  wrap.className = 'pos-layout';
+
+  const sidebar = document.createElement('aside');
+  sidebar.className = 'pos-sidebar';
+
+  // Filter tabs by current user's role
+  const allTabs = [
+    ['dash',         'Dashboard',    posIcon('dash')],
+    ['checkout',     'Checkout',     posIcon('checkout')],
+    ['products',     'Products',     posIcon('products')],
+    ['customers',    'Customers',    posIcon('customers')],
+    ['transactions', 'Transactions', posIcon('transactions')],
+    ['staff',        'Staff',        posIcon('staff')],
+    ['settings',     'Settings',     settingsIcon()],
+  ];
+  const allowedTabs = POS_ROLES[S.posActiveUser.role] || POS_ROLES['Cashier'];
+  const tabs = allTabs.filter(([key]) => allowedTabs.includes(key));
+
+  // Reset posTab if current tab is no longer allowed
+  if (!allowedTabs.includes(S.posTab)) S.posTab = 'dash';
+
+  const roleColor = { Admin:'#F5C411', 'Store Manager':'#22C55E', 'Senior Cashier':'#7A5FB8', Cashier:'rgba(255,255,255,0.55)' };
+  sidebar.innerHTML = `
+    <div class="pos-sidebar-header">
+      <button class="pharm-back" id="btn-pos-back">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+        Back to workspace
+      </button>
+      <div class="pharm-co-name">${S.posActiveUser?.company || S.currentCompany}</div>
+      <div class="pharm-co-sub">Retail POS · v3.0.0</div>
+    </div>
+    <nav class="pharm-nav">
+      ${tabs.map(([key,label,icon])=>`
+        <button class="pharm-nav-item${S.posTab===key?' active':''}" data-pos-tab="${key}">
+          ${icon} ${label}
+        </button>
+      `).join('')}
+    </nav>
+    <div class="pos-sidebar-user">
+      <div class="avatar avatar-sm" style="background:var(--gold);color:var(--purple-800);font-weight:900">${initials(S.posActiveUser.name)}</div>
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:700;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${S.posActiveUser.name}</div>
+        <div style="font-size:10px;color:${roleColor[S.posActiveUser.role]||'rgba(255,255,255,0.5)'}">${S.posActiveUser.role}</div>
+      </div>
+      <button class="btn btn-ghost" id="btn-pos-logout" title="Sign out" style="padding:4px 8px;font-size:11px;color:rgba(255,255,255,0.5)">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+      </button>
+    </div>
+  `;
+  sidebar.querySelector('#btn-pos-back').addEventListener('click',()=>{ S.view='workspace'; render(); });
+  sidebar.querySelector('#btn-pos-logout').addEventListener('click',()=>{ S.posActiveUser=null; S.posLoginPin=''; S._loginSelectedId=null; S.posAuthError=''; S.posTab='dash'; S.posLoginMode='staff'; S.posAdminEmail=''; S.posPendingAdmin=null; render(); });
+  sidebar.querySelectorAll('[data-pos-tab]').forEach(btn=>{
+    btn.addEventListener('click',()=>{ S.posTab=btn.dataset.posTab; S.posReceiptVisible=false; render(); });
+  });
+
+  const main = document.createElement('div');
+  main.className = 'pos-main';
+  const labels = { dash:'Dashboard', checkout:'Checkout', products:'Products', customers:'Buugga Deynta', transactions:'Transactions', staff:'Staff', settings:'Settings' };
+
+  if (S.posTab === 'checkout') {
+    main.innerHTML = renderPOSCheckout();
+    if (S.posMobileMoneyModal) {
+      const overlay = document.createElement('div');
+      overlay.className = 'mm-modal-overlay';
+      overlay.innerHTML = renderMobileMoneyModal();
+      main.appendChild(overlay);
+    }
+  } else {
+    const offlineBanner = S.isOffline ? `<div class="pos-offline-banner"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 1l22 22M16.72 11.06A10.94 10.94 0 0 1 19 12.55M5 12.55a10.94 10.94 0 0 1 5.17-2.39M10.71 5.05A16 16 0 0 1 22.56 9M1.42 9a15.91 15.91 0 0 1 4.7-2.88M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/></svg> Offline \u2014 ${S.syncQueue} transaction${S.syncQueue!==1?'s':''} queued</div>` : '';
+    main.innerHTML = `
+      ${offlineBanner}
+      <div class="pharm-topbar">
+        <div class="pharm-tab-label">${labels[S.posTab]||'Dashboard'}</div>
+        <div class="ml-auto flex items-center gap-10">
+          <div class="pos-rate-badge" id="btn-toggle-currency">
+            <span>${S.primaryCurrency}</span>
+            <span style="opacity:0.5;font-size:10px">1 USD = ${S.exchangeRate.toLocaleString()} Sh</span>
+          </div>
+          <div style="font-size:12px;color:var(--text-muted);font-family:var(--font-mono)">Bakaara Main Store</div>
+          <span class="pill ${S.isOffline?'pill-red':'pill-green'}">${S.isOffline?'\u25cf Offline':'\u25cf Online'}</span>
+        </div>
+      </div>
+      <div class="pharm-content animate-fadein" id="pos-content">
+        ${renderPOSTab()}
+      </div>
+    `;
+  }
+
+  wrap.appendChild(sidebar);
+  wrap.appendChild(main);
+
+  setTimeout(()=> wirePOSEvents(), 0);
+
+  return wrap;
+}
+
+function renderPOSTab() {
+  switch(S.posTab) {
+    case 'dash':         return renderPOSDash();
+    case 'products':     return renderPOSProducts();
+    case 'customers':    return renderPOSCustomers();
+    case 'transactions': return renderPOSTransactions();
+    case 'staff':        return renderPOSStaff();
+    case 'settings':     return renderPOSSettings();
+    default:             return renderPOSDash();
+  }
+}
+
+function renderPOSDash() {
+  const u = S.posActiveUser;
+  const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
+
+  // ---- CASHIER: personal shift dashboard ----
+  if (u && u.role === 'Cashier' || u?.role === 'Senior Cashier') {
+    const myTxns = POS_TRANSACTIONS.filter(t => t.cashier === u.name);
+    const myTotal = myTxns.reduce((s,t) => s + t.total, 0);
+    const shiftStart = S.posShiftStart
+      ? S.posShiftStart.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit' })
+      : '—';
+    const shiftDuration = S.posShiftStart
+      ? Math.round((Date.now() - S.posShiftStart.getTime()) / 60000) + ' min'
+      : '—';
+    return `
+      <div class="cashier-dash-wrap">
+        <div class="cashier-dash-greeting">
+          <div class="cashier-dash-avatar">${initials(u.name)}</div>
+          <div>
+            <div style="font-size:11px;color:var(--text-muted);letter-spacing:1px;text-transform:uppercase">Good day,</div>
+            <div style="font-size:22px;font-weight:900;color:var(--purple-800)">${u.name}</div>
+            <div style="font-size:13px;color:var(--text-muted)">${u.role} · Bakaara Main</div>
+          </div>
+          <div style="margin-left:auto">
+            <button class="btn ${S.posShiftActive ? 'btn-danger' : 'btn-primary'}" id="btn-shift-toggle">
+              ${S.posShiftActive ? '⏹ End Shift' : '▶ Start Shift'}
+            </button>
+          </div>
+        </div>
+
+        ${S.posShiftActive ? `
+        <div class="cashier-shift-banner">
+          <span>🟢 Shift active since ${shiftStart}</span>
+          <span class="shift-duration-badge">${shiftDuration}</span>
+        </div>` : '<div class="cashier-shift-banner cashier-shift-idle">⚪ Shift not started — press Start Shift to begin</div>'}
+
+        <div class="kpi-grid">
+          <div class="kpi-card dark">
+            <div class="kpi-eyebrow" style="color:#F5C411">My sales today</div>
+            <div class="kpi-value">$${myTotal.toFixed(2)}</div>
+            <div class="kpi-dual-currency">${sos(myTotal)} Sh</div>
+          </div>
+          <div class="kpi-card light">
+            <div class="kpi-eyebrow">My transactions</div>
+            <div class="kpi-value">${myTxns.length}</div>
+            <div class="kpi-trend">Today</div>
+          </div>
+          <div class="kpi-card light">
+            <div class="kpi-eyebrow">Avg. ticket</div>
+            <div class="kpi-value">$${myTxns.length ? (myTotal/myTxns.length).toFixed(2) : '0.00'}</div>
+            <div class="kpi-trend">Per transaction</div>
+          </div>
+          <div class="kpi-card light">
+            <div class="kpi-eyebrow">Shift start</div>
+            <div class="kpi-value" style="font-size:20px">${shiftStart}</div>
+            <div class="kpi-trend">${shiftDuration !== '—' ? shiftDuration + ' elapsed' : 'Not started'}</div>
+          </div>
+        </div>
+
+        <div class="data-section">
+          <div class="section-header-bar"><h3 class="chart-title">My recent transactions</h3></div>
+          <div class="overflow-x-auto">
+            <table class="data-table" style="min-width:600px">
+              <thead><tr><th>ID</th><th>Customer</th><th>Items</th><th>Total</th><th>Payment</th><th>Time</th></tr></thead>
+              <tbody>
+                ${myTxns.slice(0,8).map(t=>`
+                  <tr>
+                    <td style="font-family:var(--font-mono);font-weight:700;color:#2D1859">${t.id}</td>
+                    <td style="font-size:12px;color:var(--text-muted)">${t.customer}</td>
+                    <td>${t.items}</td>
+                    <td style="font-weight:800">$${t.total.toFixed(2)}</td>
+                    <td><span class="pill ${t.method==='Cash'?'pill-green':'pill-gold'}">${t.method}</span></td>
+                    <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${t.time}</td>
+                  </tr>
+                `).join('')}
+                ${myTxns.length===0 ? '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:24px">No transactions yet this shift</td></tr>' : ''}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // ---- MANAGER / ADMIN: global store dashboard ----
+  const todayTotal = POS_TRANSACTIONS.reduce((s,t)=>s+t.total,0);
+  const todayTxns = POS_TRANSACTIONS.length;
+  const avgTicket = (todayTotal / todayTxns).toFixed(2);
+  return `
+    <div class="kpi-grid">
+      <div class="kpi-card dark">
+        <div class="kpi-eyebrow" style="color:#F5C411">Today's sales</div>
+        <div class="kpi-value">$${todayTotal.toFixed(2)}</div>
+        <div class="kpi-dual-currency">${sos(todayTotal)} Sh</div>
+        <div class="kpi-trend" style="color:#EFEAFB">▲ 18% vs yesterday</div>
+      </div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Transactions</div><div class="kpi-value">${todayTxns}</div><div class="kpi-trend trend-up">▲ 6 more</div></div>
+      <div class="kpi-card light">
+        <div class="kpi-eyebrow">Avg. ticket</div>
+        <div class="kpi-value">$${avgTicket}</div>
+        <div class="kpi-dual-currency">${sos(parseFloat(avgTicket))} Sh</div>
+        <div class="kpi-trend">Per transaction</div>
+      </div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Active staff</div><div class="kpi-value">${POS_STAFF.filter(s=>s.status==='active').length}</div><div class="kpi-trend">On register now</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:2fr 1fr;gap:16px">
+      <div class="chart-card">
+        <div class="chart-header"><div><h3 class="chart-title">Hourly sales</h3><div class="chart-sub">Today · all stores</div></div></div>
+        <svg viewBox="0 0 600 160" width="100%" height="160" preserveAspectRatio="none">
+          <defs><linearGradient id="posFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#F5C411" stop-opacity="0.3"/><stop offset="100%" stop-color="#F5C411" stop-opacity="0"/></linearGradient></defs>
+          <g stroke="#F0EEF7" stroke-width="1"><line x1="0" y1="40" x2="600" y2="40"/><line x1="0" y1="80" x2="600" y2="80"/><line x1="0" y1="120" x2="600" y2="120"/></g>
+          <path d="M0,140 C50,130 80,115 120,100 C160,88 200,75 250,60 C300,50 350,42 400,35 C450,30 500,25 550,22 L600,20 L600,160 L0,160 Z" fill="url(#posFill)"/>
+          <path d="M0,140 C50,130 80,115 120,100 C160,88 200,75 250,60 C300,50 350,42 400,35 C450,30 500,25 550,22 L600,20" fill="none" stroke="#F5C411" stroke-width="3"/>
+        </svg>
+        <div class="chart-x-axis"><span>8AM</span><span>9</span><span>10</span><span>11</span><span>12</span><span>1PM</span><span>2</span><span>3PM</span></div>
+      </div>
+      <div class="chart-card">
+        <h3 class="chart-title" style="margin-bottom:12px">Payment methods</h3>
+        ${[['Cash','$147.60','32%','#2D1859'],['EVC Plus','$138.30','30%','#F5C411'],['Zaad','$224.00','48%','#22C55E'],['Sahal','$34.80','8%','#7A5FB8']].map(([name,amt,pct,col])=>`
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+            <div style="width:8px;height:8px;border-radius:50%;background:${col};flex-shrink:0"></div>
+            <div style="flex:1;font-size:13px;font-weight:600">${name}</div>
+            <div style="font-size:12px;font-weight:700;color:var(--text-primary)">${amt}</div>
+            <div style="font-size:11px;color:var(--text-muted);width:32px;text-align:right">${pct}</div>
+          </div>
+        `).join('')}
+        <h3 class="chart-title" style="margin-bottom:12px;margin-top:16px">Top sellers</h3>
+        ${[['Basmati Rice 5kg','24 sold','#2D1859'],['Coca-Cola 330ml','42 sold','#F5C411'],['Sugar 1kg','38 sold','#22C55E'],['Bottled Water 1.5L','56 sold','#7A5FB8']].map(([name,sold,col])=>`
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+            <div style="width:8px;height:8px;border-radius:50%;background:${col};flex-shrink:0"></div>
+            <div style="flex:1;font-size:13px;font-weight:600">${name}</div>
+            <div style="font-size:12px;color:var(--text-muted);font-family:var(--font-mono)">${sold}</div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+    <div class="data-section">
+      <div class="section-header-bar"><h3 class="chart-title">Recent transactions</h3></div>
+      <div class="overflow-x-auto">
+        <table class="data-table" style="min-width:700px">
+          <thead><tr><th>ID</th><th>Cashier</th><th>Customer</th><th>Items</th><th>Total</th><th>Payment</th><th>Time</th></tr></thead>
+          <tbody>
+            ${POS_TRANSACTIONS.slice(0,5).map(t=>`
+              <tr>
+                <td style="font-family:var(--font-mono);font-weight:700;color:#2D1859">${t.id}</td>
+                <td>${t.cashier}</td>
+                <td style="font-size:12px;color:var(--text-muted)">${t.customer}</td>
+                <td>${t.items}</td>
+                <td style="font-weight:800">$${t.total.toFixed(2)}</td>
+                <td><span class="pill ${t.method==='Cash'?'pill-green':'pill-gold'}">${t.method}</span></td>
+                <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${t.time}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderPOSCheckout() {
+  const cart = S.posCart;
+  const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
+  const subtotal = cart.reduce((s,item)=>{ const p = item.isWholesale ? item.wholesalePrice : item.price; return s + p * item.qty; }, 0);
+  const tax = subtotal * 0.05;
+  const total = subtotal + tax;
+  const term = (S.posSearchTerm||'').toLowerCase();
+  const filtered = term ? POS_PRODUCTS.filter(p=>p.name.toLowerCase().includes(term)||p.barcode.includes(term)||p.cat.toLowerCase().includes(term)) : POS_PRODUCTS;
+  const catEmoji = {Groceries:'\ud83d\uded2',Beverages:'\ud83e\udd64',Household:'\ud83c\udfe0','Personal Care':'\ud83e\uddf4',Snacks:'\ud83c\udf6a',Bakery:'\ud83c\udf5e',Fresh:'\ud83e\udd6c'};
+
+  if (S.posReceiptVisible && S.posLastReceipt) return renderPOSReceipt();
+
+  const debtCustomer = S.posPaymentMethod==='deyn' && S.posDebtCustomerId ? POS_CUSTOMERS.find(c=>c.id===S.posDebtCustomerId) : null;
+  const overLimit = debtCustomer && (debtCustomer.debtBalance + total) > debtCustomer.creditLimit;
+
+  return `
+    <div class="pos-checkout-layout">
+      <div class="pos-product-panel">
+        <div class="pos-product-search-bar">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
+          <input class="pos-search-input" id="pos-search" type="text" placeholder="Raadi alaab ama scan barcode..." value="${S.posSearchTerm||''}"/>
+          <span style="font-size:11px;color:var(--text-muted)">${filtered.length} alaab</span>
+        </div>
+        <div class="pos-categories">
+          ${['All','Groceries','Beverages','Household','Personal Care','Snacks','Bakery','Fresh'].map(cat=>`<button class="pos-cat-btn" data-pos-cat="${cat}">${cat}</button>`).join('')}
+        </div>
+        <div class="pos-product-grid" id="pos-products">
+          ${filtered.map(p=>`
+            <button class="pos-product-tile" data-add-product="${p.id}">
+              <div class="pos-tile-emoji">${catEmoji[p.cat]||'\ud83d\udce6'}</div>
+              <div class="pos-tile-name">${p.name}</div>
+              <div class="pos-tile-price">$${p.price.toFixed(2)}</div>
+              <div class="pos-tile-price-sos">${sos(p.price)} Sh</div>
+              <div class="pos-tile-wholesale">Jumlo: $${p.wholesalePrice.toFixed(2)}</div>
+              <div class="pos-tile-stock">${p.stock} stock</div>
+            </button>
+          `).join('')}
+        </div>
+      </div>
+
+      <div class="pos-cart-panel">
+        <div class="pos-cart-header">
+          <h3 style="font-size:16px;font-weight:800;color:#FFF">Iibka hadda</h3>
+          <span style="font-size:12px;color:rgba(255,255,255,0.6)">${cart.length} alaab</span>
+        </div>
+
+        <div class="pos-cart-items" id="pos-cart-items">
+          ${cart.length===0 ? `
+            <div class="pos-cart-empty">
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="1.5"><path d="M3 3h18l-2 12H5L3 3z"/><circle cx="9" cy="20" r="1.5"/><circle cx="17" cy="20" r="1.5"/></svg>
+              <div style="font-size:13px;color:rgba(255,255,255,0.4);margin-top:8px">Cart ma jirto</div>
+              <div style="font-size:11px;color:rgba(255,255,255,0.25)">Taabo alaab si aad u darto</div>
+            </div>
+          ` : cart.map((item,i)=>{ const effPrice=item.isWholesale?item.wholesalePrice:item.price; const rowTotal=effPrice*item.qty; return `
+            <div class="pos-cart-row">
+              <div class="pos-cart-item-info">
+                <div class="pos-cart-item-name">${item.name}</div>
+                <div class="pos-cart-item-price">$${effPrice.toFixed(2)} \u00b7 ${sos(effPrice)} Sh</div>
+              </div>
+              <div class="pos-wholesale-toggle">
+                <span class="pos-wt-label ${!item.isWholesale?'active':''}">Xabo</span>
+                <label class="pos-wt-switch"><input type="checkbox" class="pos-wholesale-cb" data-cart-idx="${i}" ${item.isWholesale?'checked':''}><span class="pos-wt-track"></span></label>
+                <span class="pos-wt-label ${item.isWholesale?'active':''}">Karto</span>
+              </div>
+              <div class="pos-cart-qty">
+                <button class="pos-qty-btn" data-qty-minus="${i}">\u2212</button>
+                <span class="pos-qty-val">${item.qty}</span>
+                <button class="pos-qty-btn" data-qty-plus="${i}">+</button>
+              </div>
+              <div class="pos-cart-item-total">$${rowTotal.toFixed(2)}</div>
+              <button class="pos-cart-remove" data-remove-item="${i}">\u00d7</button>
+            </div>
+          `}).join('')}
+        </div>
+
+        <div class="pos-cart-summary">
+          <div class="pos-summary-row"><span>Wadarta yar</span><span>$${subtotal.toFixed(2)} / ${sos(subtotal)} Sh</span></div>
+          <div class="pos-summary-row"><span>Canshuur (5%)</span><span>$${tax.toFixed(2)}</span></div>
+          <div class="pos-summary-row pos-summary-total"><span>WADARTA</span><span>$${total.toFixed(2)}</span></div>
+          <div style="text-align:right;font-size:11px;color:rgba(255,255,255,0.45);margin-top:2px">${sos(total)} Somali Shilling</div>
+        </div>
+
+        <div class="pos-payment-methods">
+          <div class="pos-pay-section-label">Hab lacag-bixinta</div>
+          <div class="pos-pay-options">
+            <button class="pos-pay-btn${S.posPaymentMethod==='cash'?' active':''}" data-pay-method="cash">\ud83d\udcb5 Cash</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='evc'?' active':''} pos-pay-mobile" data-pay-method="evc">\ud83d\udcf1 EVC Plus</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='edahab'?' active':''} pos-pay-mobile" data-pay-method="edahab">\ud83d\udcb3 eDahab</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='zaad'?' active':''} pos-pay-mobile" data-pay-method="zaad">\ud83d\udcf2 Zaad</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='sahal'?' active':''}" data-pay-method="sahal">\ud83d\udcb3 Sahal</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='deyn'?' active':''} pos-pay-deyn" data-pay-method="deyn">\ud83d\udcd2 Deyn</button>
+          </div>
+          ${S.posPaymentMethod==='deyn' ? `
+            <div class="pos-deyn-selector">
+              <label class="pos-pay-section-label">Magaca macmiilka (Buugga Deynta)</label>
+              <select id="pos-deyn-customer" class="pos-deyn-select">
+                <option value="">\u2014 Dooro macmiil \u2014</option>
+                ${POS_CUSTOMERS.map(c=>{ const used=c.debtBalance+total; const over=used>c.creditLimit; return `<option value="${c.id}" ${S.posDebtCustomerId===c.id?'selected':''}>${c.name} \u2014 Deyn: $${c.debtBalance.toFixed(2)} / Xad: $${c.creditLimit} ${over?'\u26a0':'\u2713'}</option>`; }).join('')}
+              </select>
+              ${overLimit ? `<div class="pos-deyn-warning">\u26a0 Xadka deynta waa la dhaafay! Macmiilku xad: $${debtCustomer.creditLimit}, guud ahaan: $${(debtCustomer.debtBalance+total).toFixed(2)}.</div>` : ''}
+              ${debtCustomer && !overLimit ? `<div class="pos-deyn-ok">\u2713 ${debtCustomer.name} \u00b7 Deyn cusub: $${(debtCustomer.debtBalance+total).toFixed(2)} / $${debtCustomer.creditLimit} xad</div>` : ''}
+            </div>
+          ` : ''}
+        </div>
+
+        <div class="pos-cart-actions">
+          <button class="pos-charge-btn" id="btn-pos-charge" ${cart.length===0||overLimit?'disabled':''}>
+            ${['evc','edahab','zaad'].includes(S.posPaymentMethod) ? 'Soo dir OTP \u2192' : `Bixso $${total.toFixed(2)}`}
+          </button>
+          <button class="pos-clear-btn" id="btn-pos-clear" ${cart.length===0?'disabled':''}>Tirtir cart</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderMobileMoneyModal() {
+  const methodLabels = {evc:'EVC Plus \u00b7 Hormuud',edahab:'eDahab \u00b7 Somtel',zaad:'Zaad \u00b7 Telesom'};
+  const label = methodLabels[S.posPaymentMethod] || 'Mobile Money';
+  const cart = S.posCart;
+  const subtotal = cart.reduce((s,item)=>{ const p=item.isWholesale?item.wholesalePrice:item.price; return s+p*item.qty; }, 0);
+  const total = subtotal * 1.05;
+  const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
+  return `
+    <div class="mm-modal">
+      <div class="mm-modal-icon">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--gold)" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18" stroke-linecap="round"/></svg>
+      </div>
+      <h3 class="mm-modal-title">${label}</h3>
+      <p class="mm-modal-amount">$${total.toFixed(2)} <span class="mm-modal-sos">${sos(total)} Sh</span></p>
+      <div class="mm-modal-fields">
+        <div class="mm-field">
+          <label class="mm-label">Lambarka telefoonka</label>
+          <input class="mm-input" id="mm-phone" type="tel" placeholder="061 XXX XXXX" value="${S.mobilePhone||''}" maxlength="15"/>
+        </div>
+        <div class="mm-field">
+          <label class="mm-label">Transaction ID (6 lambar)</label>
+          <input class="mm-input" id="mm-txid" type="text" placeholder="123456" value="${S.mobileTxId||''}" maxlength="8" style="font-family:var(--font-mono);letter-spacing:3px"/>
+        </div>
+        ${S.mobileError ? `<div class="mm-error">${S.mobileError}</div>` : ''}
+      </div>
+      <div class="mm-modal-actions">
+        <button class="btn btn-gold" id="btn-mm-confirm">Xaqiiji \u2713</button>
+        <button class="btn btn-ghost" id="btn-mm-cancel" style="color:var(--purple-800)">Jooji</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderPOSReceipt() {
+  const r = S.posLastReceipt;
+  return `
+    <div class="pos-receipt-overlay">
+      <div class="pos-receipt-card">
+        <div class="pos-receipt-header">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#22C55E" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 12l3 3 5-5"/></svg>
+          <h3 style="font-size:18px;font-weight:900;color:var(--text-primary);margin-top:8px">Payment successful!</h3>
+        </div>
+        <div class="pos-receipt-body">
+          <div style="text-align:center;padding:16px 0;border-bottom:1px dashed var(--border)">
+            <div style="font-weight:900;font-size:15px">SHIFO RETAIL GROUP</div>
+            <div style="font-size:11px;color:var(--text-muted)">Bakaara Main Store · Mogadishu</div>
+            <div style="font-size:11px;color:var(--text-muted);font-family:var(--font-mono);margin-top:4px">${r.id} · ${r.date}</div>
+          </div>
+          <div style="padding:12px 0;border-bottom:1px dashed var(--border)">
+            ${r.items.map(item=>`
+              <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0">
+                <span>${item.name} × ${item.qty}</span>
+                <span style="font-weight:700">$${(item.price*item.qty).toFixed(2)}</span>
+              </div>
+            `).join('')}
+          </div>
+          <div style="padding:12px 0">
+            <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text-muted)"><span>Subtotal</span><span>$${r.subtotal.toFixed(2)}</span></div>
+            <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text-muted)"><span>Tax (5%)</span><span>$${r.tax.toFixed(2)}</span></div>
+            <div style="display:flex;justify-content:space-between;font-size:16px;font-weight:900;margin-top:8px;color:var(--purple-800)"><span>Total</span><span>$${r.total.toFixed(2)}</span></div>
+            <div style="display:flex;justify-content:space-between;font-size:12px;margin-top:8px;color:var(--text-muted)"><span>Paid via</span><span style="font-weight:700;color:var(--text-primary)">${r.method}</span></div>
+          </div>
+          <div style="text-align:center;font-size:11px;color:var(--text-muted);padding-top:12px;border-top:1px dashed var(--border)">Thank you for shopping at Shifo!</div>
+        </div>
+        <div style="display:flex;gap:10px;padding:16px 20px">
+          <button class="btn btn-primary" id="btn-receipt-new" style="flex:1">New sale</button>
+          <button class="btn btn-outline" id="btn-receipt-print" style="flex:1">Print receipt</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderPOSProducts() {
+  const cats = [...new Set(POS_PRODUCTS.map(p=>p.cat))];
+  const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
+
+  // CRUD Modal
+  let modalHtml = '';
+  if (S.crudModal && S.crudModal.type === 'product') {
+    const isEdit = S.crudModal.mode === 'edit';
+    const f = S.crudForm;
+    modalHtml = `
+      <div class="crud-overlay">
+        <div class="crud-modal">
+          <div class="crud-modal-header">
+            <h3>${isEdit ? 'Edit Product' : 'Add New Product'}</h3>
+            <button class="crud-close-btn" id="btn-crud-close">×</button>
+          </div>
+          <div class="crud-modal-body">
+            <div class="crud-grid-2">
+              <div class="form-group"><label class="form-label">Product Name *</label><input class="form-input" id="cf-name" value="${f.name||''}"/></div>
+              <div class="form-group"><label class="form-label">Category</label>
+                <select class="form-select" id="cf-cat">
+                  ${['Groceries','Beverages','Household','Personal Care','Snacks','Bakery','Fresh'].map(c=>`<option ${(f.cat||'Groceries')===c?'selected':''}>${c}</option>`).join('')}
+                </select>
+              </div>
+              <div class="form-group"><label class="form-label">Retail Price (USD) *</label><input class="form-input" id="cf-price" type="number" step="0.01" min="0" value="${f.price||''}"/></div>
+              <div class="form-group"><label class="form-label">Wholesale Price (USD)</label><input class="form-input" id="cf-wprice" type="number" step="0.01" min="0" value="${f.wholesalePrice||''}"/></div>
+              <div class="form-group"><label class="form-label">Stock Qty *</label><input class="form-input" id="cf-stock" type="number" min="0" value="${f.stock||''}"/></div>
+              <div class="form-group"><label class="form-label">Barcode</label><input class="form-input" id="cf-barcode" value="${f.barcode||''}"/></div>
+            </div>
+            ${S.crudForm._error ? `<div class="crud-error">${S.crudForm._error}</div>` : ''}
+          </div>
+          <div class="crud-modal-footer">
+            <button class="btn btn-primary" id="btn-crud-save">${isEdit ? 'Save changes' : 'Add product'}</button>
+            <button class="btn btn-ghost" id="btn-crud-cancel" style="color:var(--text-secondary)">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // Delete confirm
+  let deleteHtml = '';
+  if (S.confirmDeleteModal && S.confirmDeleteModal.type === 'product') {
+    const p = POS_PRODUCTS.find(x=>x.id===S.confirmDeleteModal.id);
+    deleteHtml = `
+      <div class="crud-overlay">
+        <div class="crud-confirm">
+          <div class="crud-confirm-icon">⚠️</div>
+          <h3>Delete "${p?.name}"?</h3>
+          <p>This will permanently remove the product from the catalog.</p>
+          <div class="crud-confirm-actions">
+            <button class="btn btn-danger" id="btn-delete-confirm">Yes, delete</button>
+            <button class="btn btn-outline" id="btn-delete-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  return `
+    ${modalHtml}${deleteHtml}
+    <div class="kpi-grid">
+      <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Total products</div><div class="kpi-value">${POS_PRODUCTS.length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Categories</div><div class="kpi-value">${cats.length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Low stock</div><div class="kpi-value trend-warn">${POS_PRODUCTS.filter(p=>p.stock<40).length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Total value</div><div class="kpi-value">$${POS_PRODUCTS.reduce((s,p)=>s+p.price*p.stock,0).toFixed(0)}</div></div>
+    </div>
+    <div class="data-section">
+      <div class="section-header-bar">
+        <h3 class="chart-title">Product catalog</h3>
+        <div class="ml-auto">
+          <button class="btn btn-primary btn-sm" id="btn-add-product">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add Product
+          </button>
+        </div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="data-table" style="min-width:820px">
+          <thead><tr><th>Product</th><th>Category</th><th>Retail</th><th>Wholesale</th><th>Stock</th><th>Barcode</th><th>Status</th><th class="col-right">Actions</th></tr></thead>
+          <tbody>
+            ${POS_PRODUCTS.map(p=>`
+              <tr>
+                <td style="font-weight:700">${p.name}</td>
+                <td><span class="pill" style="background:var(--gray-50);color:var(--text-secondary)">${p.cat}</span></td>
+                <td style="font-weight:800">$${p.price.toFixed(2)}<div style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono)">${sos(p.price)} Sh</div></td>
+                <td style="font-size:13px;color:var(--text-muted)">$${p.wholesalePrice.toFixed(2)}</td>
+                <td style="font-weight:700;color:${p.stock<40?'#B45309':'var(--text-primary)'}">${p.stock}</td>
+                <td style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">${p.barcode}</td>
+                <td><span class="pill ${p.stock<40?'pill-amber':'pill-green'}">● ${p.stock<40?'Low':'In stock'}</span></td>
+                <td class="col-right">
+                  <div class="crud-actions">
+                    <button class="crud-btn crud-btn-edit" data-edit-product="${p.id}" title="Edit">✏️</button>
+                    <button class="crud-btn crud-btn-delete" data-delete-product="${p.id}" title="Delete">🗑️</button>
+                  </div>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+      </div>
+    </div>
+  `;
+}
+
+
+
+function renderPOSCustomers() {
+  const tierColor = {Gold:'#F5C411',Silver:'#94A3B8',Bronze:'#CD7F32'};
+  const totalDebt = POS_CUSTOMERS.reduce((s,c)=>s+c.debtBalance,0);
+  const overdue = POS_CUSTOMERS.filter(c=>c.debtBalance>=c.creditLimit);
+  const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
+
+  // Add/Edit Customer Modal
+  let modalHtml = '';
+  if (S.crudModal && S.crudModal.type === 'customer') {
+    const isEdit = S.crudModal.mode === 'edit';
+    const f = S.crudForm;
+    modalHtml = `
+      <div class="crud-overlay">
+        <div class="crud-modal">
+          <div class="crud-modal-header">
+            <h3>${isEdit ? 'Edit Customer' : 'Add New Customer'}</h3>
+            <button class="crud-close-btn" id="btn-crud-close">×</button>
+          </div>
+          <div class="crud-modal-body">
+            <div class="crud-grid-2">
+              <div class="form-group"><label class="form-label">Full Name *</label><input class="form-input" id="cf-name" value="${f.name||''}"/></div>
+              <div class="form-group"><label class="form-label">Phone *</label><input class="form-input" id="cf-phone" value="${f.phone||''}"/></div>
+              <div class="form-group"><label class="form-label">Tier</label>
+                <select class="form-select" id="cf-tier">
+                  ${['Bronze','Silver','Gold'].map(t=>`<option ${(f.tier||'Bronze')===t?'selected':''}>${t}</option>`).join('')}
+                </select>
+              </div>
+              <div class="form-group"><label class="form-label">Credit Limit (USD)</label><input class="form-input" id="cf-credit" type="number" min="0" value="${f.creditLimit||0}"/></div>
+            </div>
+            ${S.crudForm._error ? `<div class="crud-error">${S.crudForm._error}</div>` : ''}
+          </div>
+          <div class="crud-modal-footer">
+            <button class="btn btn-primary" id="btn-crud-save">${isEdit ? 'Save changes' : 'Add customer'}</button>
+            <button class="btn btn-ghost" id="btn-crud-cancel" style="color:var(--text-secondary)">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+  }
+  let deleteHtml = '';
+  if (S.confirmDeleteModal && S.confirmDeleteModal.type === 'customer') {
+    const c = POS_CUSTOMERS.find(x=>x.id===S.confirmDeleteModal.id);
+    deleteHtml = `
+      <div class="crud-overlay">
+        <div class="crud-confirm">
+          <div class="crud-confirm-icon">⚠️</div>
+          <h3>Remove "${c?.name}"?</h3>
+          <p>This will remove the customer and their debt record.</p>
+          <div class="crud-confirm-actions">
+            <button class="btn btn-danger" id="btn-delete-confirm">Yes, remove</button>
+            <button class="btn btn-outline" id="btn-delete-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  return `
+    ${modalHtml}${deleteHtml}
+    <div class="buugga-header">
+      <div class="buugga-title-row">
+        <div>
+          <div style="font-size:10px;letter-spacing:1.5px;text-transform:uppercase;font-weight:800;color:var(--gold);margin-bottom:4px">📒 BUUGGA DEYNTA · Customer Debt Ledger</div>
+          <h2 style="font-size:22px;font-weight:900;color:var(--purple-800);margin:0">Macaamiisha Deynta</h2>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-primary btn-sm" id="btn-add-customer">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add Customer
+          </button>
+          <button class="btn btn-outline btn-sm" id="btn-export-deyn">Export PDF</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="kpi-card dark">
+        <div class="kpi-eyebrow" style="color:#F5C411">Wadarta Deynta</div>
+        <div class="kpi-value">$${totalDebt.toFixed(2)}</div>
+        <div class="kpi-dual-currency">${sos(totalDebt)} Sh</div>
+      </div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Macaamiil deyn ah</div><div class="kpi-value">${POS_CUSTOMERS.filter(c=>c.debtBalance>0).length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Xadka dhaafay \u26a0</div><div class="kpi-value" style="color:#B42318">${overdue.length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Macaamiil guud</div><div class="kpi-value">${POS_CUSTOMERS.length}</div></div>
+    </div>
+
+    <div class="data-section">
+      <div class="section-header-bar">
+        <h3 class="chart-title">\ud83d\udcd2 Liiska Deynta</h3>
+        <div class="ml-auto flex items-center gap-10" style="font-size:12px">
+          <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#B42318;display:inline-block"></span> Xad dhaafay</span>
+          <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#B45309;display:inline-block"></span> Deyn jirta</span>
+          <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#22C55E;display:inline-block"></span> Saafi</span>
+        </div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="data-table" style="min-width:820px">
+          <thead><tr><th>Macmiilka</th><th>Telefoon</th><th>Xad deynta</th><th>Deynta hadda</th><th>%</th><th>Xaaladda</th><th class="col-right">Actions</th></tr></thead>
+          <tbody>
+            ${POS_CUSTOMERS.map(c=>{
+              const pct = c.creditLimit>0 ? Math.round((c.debtBalance/c.creditLimit)*100) : 0;
+              const isOver = c.debtBalance>=c.creditLimit;
+              const hasDebt = c.debtBalance>0;
+              const rowClass = isOver?'buugga-row-over':hasDebt?'buugga-row-debt':'';
+              const statusPill = isOver ? '<span class="pill" style="background:#FEF0EE;color:#B42318;border:1px solid #FDA29B">● Xad dhaafay</span>' : hasDebt ? `<span class="pill" style="background:#FFFCEF;color:#B45309;border:1px solid rgba(245,196,17,0.3)">● ${pct}% used</span>` : '<span class="pill pill-green">● Saafi</span>';
+              return `<tr class="${rowClass}">
+                <td><div class="flex items-center gap-10"><div class="avatar avatar-sm">${initials(c.name)}</div><div><div style="font-weight:700">${c.name}</div><div style="font-size:10px;color:var(--text-muted)">${c.tier}</div></div></div></td>
+                <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${c.phone}</td>
+                <td style="font-weight:700">$${c.creditLimit}</td>
+                <td><div style="font-weight:800;color:${isOver?'#B42318':hasDebt?'#B45309':'var(--text-primary)'}">$${c.debtBalance.toFixed(2)}</div><div style="font-size:11px;color:var(--text-muted)">${sos(c.debtBalance)} Sh</div></td>
+                <td><div class="buugga-bar-wrap"><div class="buugga-bar" style="width:${Math.min(pct,100)}%;background:${isOver?'#B42318':pct>60?'#B45309':'#22C55E'}"></div></div><div style="font-size:11px;font-weight:700;margin-top:2px;color:${isOver?'#B42318':'var(--text-muted)'}">${pct}%</div></td>
+                <td>${statusPill}</td>
+                <td class="col-right">
+                  <div class="crud-actions">
+                    <button class="btn btn-xs btn-outline" data-collect-deyn="${c.id}" ${c.debtBalance===0?'disabled':''}>Collect</button>
+                    <button class="crud-btn crud-btn-edit" data-edit-customer="${c.id}" title="Edit">✏️</button>
+                    <button class="crud-btn crud-btn-delete" data-delete-customer="${c.id}" title="Delete">🗑️</button>
+                  </div>
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="data-section">
+      <div class="section-header-bar"><h3 class="chart-title">\u2605 Jadwalka Xubnahayda (Loyalty)</h3></div>
+      <div class="overflow-x-auto">
+        <table class="data-table" style="min-width:600px">
+          <thead><tr><th>Macmiilka</th><th>Heerka</th><th>Dhibcaha</th><th>Booqdooyinka</th><th>Booqashadii u dambeysay</th></tr></thead>
+          <tbody>
+            ${POS_CUSTOMERS.map(c=>{ const tc=tierColor[c.tier]||'#ccc'; return `<tr><td><div class="flex items-center gap-10"><div class="avatar avatar-sm">${initials(c.name)}</div><span style="font-weight:700">${c.name}</span></div></td><td><span class="pill" style="background:${tc}22;color:${tc==='#F5C411'?'#B45309':tc};border:1px solid ${tc}44;font-weight:800">\u2605 ${c.tier}</span></td><td style="font-weight:700">${c.points.toLocaleString()}</td><td>${c.visits}</td><td style="font-size:12px;color:var(--text-muted)">${c.lastVisit}</td></tr>`; }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderPOSTransactions() {
+  const totalSales = POS_TRANSACTIONS.reduce((s,t)=>s+t.total,0);
+  const cashTotal = POS_TRANSACTIONS.filter(t=>t.method==='Cash').reduce((s,t)=>s+t.total,0);
+  const mobileTotal = totalSales - cashTotal;
+  const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
+
+  // View detail modal
+  let viewHtml = '';
+  if (S.viewModal && S.viewModal.type === 'transaction') {
+    const t = POS_TRANSACTIONS.find(x=>x.id===S.viewModal.id);
+    if (t) viewHtml = `
+      <div class="crud-overlay">
+        <div class="crud-modal" style="max-width:440px">
+          <div class="crud-modal-header">
+            <h3>Transaction Detail</h3>
+            <button class="crud-close-btn" id="btn-view-close">×</button>
+          </div>
+          <div class="crud-modal-body">
+            <div class="txn-detail-grid">
+              <div class="txn-detail-row"><span>ID</span><span class="mono-val">${t.id}</span></div>
+              <div class="txn-detail-row"><span>Date</span><span>${t.date}</span></div>
+              <div class="txn-detail-row"><span>Time</span><span class="mono-val">${t.time}</span></div>
+              <div class="txn-detail-row"><span>Cashier</span><span>${t.cashier}</span></div>
+              <div class="txn-detail-row"><span>Customer</span><span>${t.customer}</span></div>
+              <div class="txn-detail-row"><span>Items</span><span>${t.items}</span></div>
+              <div class="txn-detail-row"><span>Payment</span><span>${t.method}</span></div>
+              <div class="txn-detail-row txn-total-row"><span>Total</span><span>$${t.total.toFixed(2)}</span></div>
+              <div class="txn-detail-row"><span>In SOS</span><span class="mono-val">${sos(t.total)} Sh</span></div>
+            </div>
+          </div>
+          <div class="crud-modal-footer">
+            <button class="btn btn-outline" id="btn-view-close">Close</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // Delete confirm
+  let deleteHtml = '';
+  if (S.confirmDeleteModal && S.confirmDeleteModal.type === 'transaction') {
+    const t = POS_TRANSACTIONS.find(x=>x.id===S.confirmDeleteModal.id);
+    deleteHtml = `
+      <div class="crud-overlay">
+        <div class="crud-confirm">
+          <div class="crud-confirm-icon">⚠️</div>
+          <h3>Void Transaction ${t?.id}?</h3>
+          <p>Amount: <strong>$${t?.total.toFixed(2)}</strong> · ${t?.method}. This action cannot be undone.</p>
+          <div class="crud-confirm-actions">
+            <button class="btn btn-danger" id="btn-delete-confirm">Void transaction</button>
+            <button class="btn btn-outline" id="btn-delete-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  return `
+    ${viewHtml}${deleteHtml}
+    <div class="kpi-grid">
+      <div class="kpi-card dark">
+        <div class="kpi-eyebrow" style="color:#F5C411">Total sales</div>
+        <div class="kpi-value">$${totalSales.toFixed(2)}</div>
+        <div class="kpi-dual-currency">${sos(totalSales)} Sh</div>
+      </div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Transactions</div><div class="kpi-value">${POS_TRANSACTIONS.length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Cash</div><div class="kpi-value">$${cashTotal.toFixed(2)}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Mobile money</div><div class="kpi-value">$${mobileTotal.toFixed(2)}</div></div>
+    </div>
+    <div class="data-section">
+      <div class="section-header-bar"><h3 class="chart-title">All transactions — Today</h3>
+        <div class="ml-auto" style="font-size:12px;color:var(--text-muted)">Click row to view · 🗑️ to void</div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="data-table" style="min-width:820px">
+          <thead><tr><th>ID</th><th>Cashier</th><th>Customer</th><th>Items</th><th>Total</th><th>Payment</th><th>Time</th><th class="col-right">Actions</th></tr></thead>
+          <tbody>
+            ${POS_TRANSACTIONS.map(t=>`
+              <tr class="txn-row-clickable" data-view-txn="${t.id}">
+                <td style="font-family:var(--font-mono);font-weight:700;color:#2D1859">${t.id}</td>
+                <td>${t.cashier}</td>
+                <td style="font-size:12px;color:var(--text-muted)">${t.customer}</td>
+                <td>${t.items}</td>
+                <td style="font-weight:800">$${t.total.toFixed(2)}<div style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono)">${sos(t.total)} Sh</div></td>
+                <td><span class="pill ${t.method==='Cash'?'pill-green':'pill-gold'}">${t.method}</span></td>
+                <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${t.time}</td>
+                <td class="col-right" onclick="event.stopPropagation()">
+                  <div class="crud-actions">
+                    <button class="crud-btn" data-view-txn-btn="${t.id}" title="View details" style="color:var(--purple-800)">👁️</button>
+                    <button class="crud-btn crud-btn-delete" data-delete-txn="${t.id}" title="Void">🗑️</button>
+                  </div>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderPOSStaff() {
+  const systemCashUSD = POS_TRANSACTIONS.filter(t=>t.method==='Cash').reduce((s,t)=>s+t.total,0);
+  const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
+  const countedUSD = parseFloat(S.shiftCountedUSD)||0;
+  const countedSOS = parseFloat(S.shiftCountedSOS)||0;
+  const countedSOStoUSD = countedSOS / S.exchangeRate;
+  const totalCountedUSD = countedUSD + countedSOStoUSD;
+  const variance = totalCountedUSD - systemCashUSD;
+  const varianceClass = variance===0?'shift-var-zero':variance>0?'shift-var-over':'shift-var-short';
+  const varianceLabel = variance===0 ? '\u2713 Sax' : variance>0 ? `\u25b2 Kordhay $${Math.abs(variance).toFixed(2)}` : `\u25bc Dhimay $${Math.abs(variance).toFixed(2)}`;
+
+  // Credential creation form state
+  const cf = S._staffCredForm || {};
+  const autoUser = cf.name ? (()=>{ const p=cf.name.trim().split(' '); return (p[0]||'').toLowerCase()+'.'+(p[1]?p[1][0].toLowerCase():''); })() : '';
+  const autoPin  = cf.generatedPin || '';
+
+  return `
+    <div class="kpi-grid">
+      <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Shaqaalaha guud</div><div class="kpi-value">${POS_STAFF.length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Shaqeeya</div><div class="kpi-value" style="color:#0F7A3A">${POS_STAFF.filter(s=>s.status==='active').length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Nasanaya</div><div class="kpi-value trend-warn">${POS_STAFF.filter(s=>s.status==='break').length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Iibka maanta</div><div class="kpi-value">${POS_STAFF.reduce((s,st)=>s+st.sales,0)}</div></div>
+    </div>
+
+    <!-- CREATE STAFF WITH CREDENTIALS -->
+    <div class="staff-cred-panel">
+      <div class="staff-cred-header">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <h3 class="staff-cred-title">Create Staff Account</h3>
+      </div>
+      <div class="staff-cred-grid">
+        <div class="form-group">
+          <label class="form-label" style="color:rgba(255,255,255,0.8)">Full Name *</label>
+          <input class="form-input shift-count-input" id="scf-name" placeholder="e.g. Ali Omar" value="${cf.name||''}"/>
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="color:rgba(255,255,255,0.8)">Role *</label>
+          <select class="form-select shift-count-input" id="scf-role">
+            ${['Cashier','Senior Cashier','Store Manager','Admin'].map(r=>`<option value="${r}" ${(cf.role||'Cashier')===r?'selected':''}>${r}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="color:rgba(255,255,255,0.8)">Store</label>
+          <select class="form-select shift-count-input" id="scf-store">
+            ${['Bakaara Main','Hodan Store','Wadajir Store','Hamar Weyne'].map(st=>`<option ${(cf.store||'Bakaara Main')===st?'selected':''}>${st}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="color:rgba(255,255,255,0.8)">Shift</label>
+          <select class="form-select shift-count-input" id="scf-shift">
+            ${['Morning','Afternoon','Full day'].map(sh=>`<option ${(cf.shift||'Morning')===sh?'selected':''}>${sh}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      ${autoUser ? `
+      <div class="staff-cred-preview">
+        <div class="cred-preview-item">
+          <span class="cred-preview-label">Auto username</span>
+          <span class="cred-preview-val" style="font-family:var(--font-mono)">${autoUser}</span>
+        </div>
+        <div class="cred-preview-item">
+          <span class="cred-preview-label">Auto-generated PIN</span>
+          <span class="cred-preview-val cred-pin">${autoPin || '—'}</span>
+          <button class="btn btn-ghost btn-sm" id="btn-regen-pin" style="color:var(--gold);font-size:11px">↺ New PIN</button>
+        </div>
+      </div>` : ''}
+      ${cf._error ? `<div class="crud-error" style="margin:8px 0">${cf._error}</div>` : ''}
+      <div style="display:flex;gap:10px;margin-top:14px">
+        <button class="btn btn-gold" id="btn-create-staff-cred">Create Account ✓</button>
+        <button class="btn btn-ghost" id="btn-clear-staff-cred" style="color:#EFEAFB">Clear</button>
+      </div>
+    </div>
+
+    <div class="shift-panel">
+      <div class="shift-panel-header">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+        <h3 class="shift-panel-title">Xirida Shiftiga \u2014 Shift Reconciliation</h3>
+      </div>
+      <div class="shift-cashier-select">
+        <label class="form-label" style="color:rgba(255,255,255,0.7)">Cashier-ka shiftiga xira</label>
+        <select class="form-select" id="shift-cashier-sel" style="max-width:280px;background:rgba(255,255,255,0.1);border-color:rgba(255,255,255,0.2);color:#FFF">
+          <option value="">\u2014 Dooro cashier \u2014</option>
+          ${POS_STAFF.map(s=>`<option value="${s.id}" ${S.shiftCashier===s.id?'selected':''}>${s.name} \u00b7 ${s.store}</option>`).join('')}
+        </select>
+      </div>
+      <div class="shift-system-totals">
+        <div class="shift-sys-row"><span class="shift-sys-label">Nidaamka: Cash USD</span><span class="shift-sys-val">$${systemCashUSD.toFixed(2)}</span><span class="shift-sys-sos">${sos(systemCashUSD)} Sh</span></div>
+      </div>
+      <div class="shift-count-grid">
+        <div class="shift-count-col">
+          <label class="form-label" style="color:rgba(255,255,255,0.7)">La tirisay \u2014 USD</label>
+          <input class="form-input shift-count-input" id="shift-usd" type="number" step="0.01" min="0" placeholder="0.00" value="${S.shiftCountedUSD||''}">
+        </div>
+        <div class="shift-count-col">
+          <label class="form-label" style="color:rgba(255,255,255,0.7)">La tirisay \u2014 Somali Sh</label>
+          <input class="form-input shift-count-input" id="shift-sos" type="number" step="100" min="0" placeholder="0" value="${S.shiftCountedSOS||''}">
+          ${countedSOS>0 ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);margin-top:3px">= $${countedSOStoUSD.toFixed(2)} USD @ ${S.exchangeRate.toLocaleString()}</div>` : ''}
+        </div>
+      </div>
+      ${(countedUSD>0||countedSOS>0) ? `
+      <div class="shift-variance-card ${varianceClass}">
+        <div style="flex:1"><div class="shift-var-label">Kala duwanaanshaha</div><div class="shift-var-value">${varianceLabel}</div></div>
+        <div style="text-align:right"><div style="font-size:11px;opacity:0.7">La tirisay</div><div style="font-weight:800">$${totalCountedUSD.toFixed(2)}</div></div>
+        <div style="text-align:right"><div style="font-size:11px;opacity:0.7">Nidaamka</div><div style="font-weight:800">$${systemCashUSD.toFixed(2)}</div></div>
+      </div>` : ''}
+      <div style="display:flex;gap:10px;margin-top:14px">
+        <button class="btn btn-gold" id="btn-close-shift">Xir Shiftiga \u2713</button>
+        <button class="btn btn-ghost" id="btn-reset-shift" style="color:#EFEAFB">Dib u bilow</button>
+      </div>
+    </div>
+
+    <!-- STAFF CRUD MODAL -->
+    ${(()=>{
+      let staffModal = '';
+      if (S.crudModal && S.crudModal.type === 'staff') {
+        const isEdit = S.crudModal.mode === 'edit';
+        const f = S.crudForm;
+        staffModal = `
+          <div class="crud-overlay">
+            <div class="crud-modal">
+              <div class="crud-modal-header">
+                <h3>${isEdit ? 'Edit Staff Member' : 'Add Staff Member'}</h3>
+                <button class="crud-close-btn" id="btn-crud-close">\u00d7</button>
+              </div>
+              <div class="crud-modal-body">
+                <div class="crud-grid-2">
+                  <div class="form-group"><label class="form-label">Full Name *</label><input class="form-input" id="cf-name" value="${f.name||''}"/></div>
+                  <div class="form-group"><label class="form-label">Role</label>
+                    <select class="form-select" id="cf-role">
+                      ${['Cashier','Senior Cashier','Store Manager','Admin'].map(r=>`<option ${(f.role||'Cashier')===r?'selected':''}>${r}</option>`).join('')}
+                    </select>
+                  </div>
+                  <div class="form-group"><label class="form-label">Store</label>
+                    <select class="form-select" id="cf-store">
+                      ${['Bakaara Main','Hodan Store','Wadajir Store','Hamar Weyne'].map(st=>`<option ${(f.store||'Bakaara Main')===st?'selected':''}>${st}</option>`).join('')}
+                    </select>
+                  </div>
+                  <div class="form-group"><label class="form-label">Shift</label>
+                    <select class="form-select" id="cf-shift">
+                      ${['Morning','Afternoon','Full day'].map(sh=>`<option ${(f.shift||'Morning')===sh?'selected':''}>${sh}</option>`).join('')}
+                    </select>
+                  </div>
+                  <div class="form-group"><label class="form-label">Status</label>
+                    <select class="form-select" id="cf-status">
+                      <option ${(f.status||'active')==='active'?'selected':''}>active</option>
+                      <option ${f.status==='break'?'selected':''}>break</option>
+                    </select>
+                  </div>
+                </div>
+                ${S.crudForm._error ? `<div class="crud-error">${S.crudForm._error}</div>` : ''}
+              </div>
+              <div class="crud-modal-footer">
+                <button class="btn btn-primary" id="btn-crud-save">${isEdit ? 'Save changes' : 'Add staff'}</button>
+                <button class="btn btn-ghost" id="btn-crud-cancel" style="color:var(--text-secondary)">Cancel</button>
+              </div>
+            </div>
+          </div>`;
+      }
+      if (S.confirmDeleteModal && S.confirmDeleteModal.type === 'staff') {
+        const s = POS_STAFF.find(x=>x.id===S.confirmDeleteModal.id);
+        staffModal += `
+          <div class="crud-overlay">
+            <div class="crud-confirm">
+              <div class="crud-confirm-icon">\u26a0\ufe0f</div>
+              <h3>Remove "${s?.name}"?</h3>
+              <p>This will remove the staff member from the POS system.</p>
+              <div class="crud-confirm-actions">
+                <button class="btn btn-danger" id="btn-delete-confirm">Yes, remove</button>
+                <button class="btn btn-outline" id="btn-delete-cancel">Cancel</button>
+              </div>
+            </div>
+          </div>`;
+      }
+      return staffModal;
+    })()
+    }
+    <div class="data-section">
+      <div class="section-header-bar">
+        <h3 class="chart-title">Shaqaalaha POS</h3>
+        <div class="ml-auto">
+          <button class="btn btn-primary btn-sm" id="btn-add-staff">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add Staff
+          </button>
+        </div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="data-table" style="min-width:820px">
+          <thead><tr><th>Magac</th><th>Username</th><th>Door</th><th>PIN</th><th>Dukaanka</th><th>Shift</th><th>Iibka maanta</th><th>Xaaladda</th><th class="col-right">Actions</th></tr></thead>
+          <tbody>
+            ${POS_STAFF.map(s=>`
+              <tr>
+                <td><div class="flex items-center gap-10"><div class="avatar avatar-sm">${initials(s.name)}</div><span style="font-weight:700">${s.name}</span></div></td>
+                <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${s.username||'—'}</td>
+                <td><span class="role-tag ${s.role.includes('Admin')?'role-manager':s.role.includes('Manager')?'role-manager':s.role.includes('Senior')?'role-pharmacist':'role-cashier'}">${s.role}</span></td>
+                <td><span class="pin-badge">${s.pin ? '●●●●' : '—'}</span></td>
+                <td style="font-size:13px">${s.store}</td>
+                <td style="font-size:12px;color:var(--text-muted)">${s.shift}</td>
+                <td style="font-weight:700">$${s.sales}</td>
+                <td><span class="pill ${s.status==='active'?'pill-green':'pill-amber'}">\u25cf ${s.status==='active'?'Shaqeeya':'Nasanaya'}</span></td>
+                <td class="col-right">
+                  <div class="crud-actions">
+                    <button class="crud-btn crud-btn-edit" data-edit-staff="${s.id}" title="Edit">\u270f\ufe0f</button>
+                    <button class="crud-btn crud-btn-delete" data-delete-staff="${s.id}" title="Remove">\ud83d\uddd1\ufe0f</button>
+                  </div>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderPOSSettings() {
+  return `
+    <div style="max-width:600px">
+      <div class="card" style="padding:24px;margin-bottom:16px">
+        <h3 style="font-size:16px;font-weight:800;margin-bottom:16px">Store Settings</h3>
+        <div class="flex-col gap-14">
+          <div class="form-group"><label class="form-label">Store name</label><input class="form-input" value="Shifo Retail Group"/></div>
+          <div class="form-group"><label class="form-label">Default currency</label><select class="form-select" id="settings-currency"><option ${S.primaryCurrency==='USD'?'selected':''}>USD ($)</option><option ${S.primaryCurrency==='SOS'?'selected':''}>SOS (Sh.)</option></select></div>
+          <div class="form-group"><label class="form-label">Tax rate (%)</label><input class="form-input" type="number" value="5"/></div>
+          <div class="form-group"><label class="form-label">Default store</label><select class="form-select"><option selected>Bakaara Main</option><option>Hodan Store</option><option>Wadajir Store</option><option>Hamar Weyne</option></select></div>
+          <div class="form-group">
+            <label class="form-label">Qiimaha lacag-bedelka: 1 USD = ? SOS</label>
+            <div style="display:flex;gap:10px;align-items:center">
+              <input class="form-input" id="settings-rate" type="number" min="1000" max="30000" step="100" value="${S.exchangeRate}" style="max-width:160px;font-family:var(--font-mono)"/>
+              <span style="font-size:13px;color:var(--text-muted)">Hadda: 1 USD = ${S.exchangeRate.toLocaleString()} Sh</span>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Offline mode (Xaalada internet la'aanta)</label>
+            <div style="display:flex;align-items:center;gap:12px">
+              <label class="toggle"><input type="checkbox" id="settings-offline" ${S.isOffline?'checked':''}><span class="toggle-slider"></span></label>
+              <span style="font-size:13px;color:var(--text-muted)">${S.isOffline?'Offline \u2014 '+S.syncQueue+' transactions queued':'Online'}</span>
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" id="btn-save-settings" style="align-self:flex-start">Save settings</button>
+        </div>
+      </div>
+      <div class="card" style="padding:24px;margin-bottom:16px">
+        <h3 style="font-size:16px;font-weight:800;margin-bottom:16px">Receipt Settings</h3>
+        <div class="flex-col gap-14">
+          <div class="form-group"><label class="form-label">Receipt header</label><input class="form-input" value="SHIFO RETAIL GROUP"/></div>
+          <div class="form-group"><label class="form-label">Footer message</label><input class="form-input" value="Thank you for shopping at Shifo!"/></div>
+          <div class="form-group"><label class="form-label">Show barcode on receipt</label><select class="form-select"><option selected>Yes</option><option>No</option></select></div>
+          <button class="btn btn-primary btn-sm" style="align-self:flex-start">Save</button>
+        </div>
+      </div>
+      <div class="card" style="padding:24px">
+        <h3 style="font-size:16px;font-weight:800;margin-bottom:16px">Payment Methods</h3>
+        <div class="flex-col gap-14">
+          ${['Cash','EVC Plus','Zaad','Sahal'].map(m=>`
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
+              <span style="font-weight:700">${m}</span>
+              <label class="toggle"><input type="checkbox" checked/><span class="toggle-slider"></span></label>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================
+// LOGIN EVENT HANDLER (separate from wirePOSEvents)
+// ============================================================
+function wirePOSLoginEvents() {
+  // --- Staff mode: card selection ---
+  document.querySelectorAll('[data-login-id]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S._loginSelectedId = parseInt(btn.dataset.loginId);
+      S.posLoginPin = '';
+      S.posAuthError = '';
+      render();
+    });
+  });
+
+  // --- Staff mode: back to staff grid ---
+  document.getElementById('btn-login-back')?.addEventListener('click', () => {
+    S._loginSelectedId = null;
+    S.posLoginPin = '';
+    S.posAuthError = '';
+    render();
+  });
+
+  // --- Open Admin sign-in mode ---
+  document.getElementById('btn-open-admin-login')?.addEventListener('click', () => {
+    S.posLoginMode = 'admin';
+    S.posAuthError = '';
+    S.posAdminEmail = '';
+    render();
+  });
+
+  // --- Admin mode: back to staff grid ---
+  document.getElementById('btn-admin-back')?.addEventListener('click', () => {
+    S.posLoginMode = 'staff';
+    S.posAuthError = '';
+    render();
+  });
+
+  // --- Admin login form submit ---
+  document.getElementById('pos-admin-login-form')?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const email = document.getElementById('pos-admin-email').value.trim().toLowerCase();
+    const pw = document.getElementById('pos-admin-pw').value;
+    S.posAdminEmail = email;
+
+    const admin = COMPANY_ADMINS.find(a => a.email.toLowerCase() === email);
+    if (!admin) {
+      S.posAuthError = 'No admin account found for that email.';
+      render();
+      return;
+    }
+
+    // 1) Matches saved POS password (already changed once) \u2192 sign in
+    if (admin.posPassword && pw === admin.posPassword) {
+      S.posActiveUser = { ...admin };
+      S.currentCompany = admin.company;
+      S.posLoginMode = 'staff';
+      S.posAuthError = '';
+      S.posAdminEmail = '';
+      S.posTab = 'dash';
+      render();
+      return;
+    }
+
+    // 2) Matches temp password AND still requires change \u2192 force change
+    if (admin.mustChangePosPassword && pw === admin.tempPassword) {
+      S.posPendingAdmin = admin;
+      S.posLoginMode = 'force-change';
+      S.posAuthError = '';
+      render();
+      return;
+    }
+
+    // 3) Temp password used after already-changed \u2192 reject (temp only works once in POS)
+    if (pw === admin.tempPassword && !admin.mustChangePosPassword) {
+      S.posAuthError = 'Temporary password no longer works in POS. Use your new POS password.';
+      render();
+      return;
+    }
+
+    S.posAuthError = 'Incorrect password.';
+    render();
+  });
+
+  // --- Force-change form submit ---
+  document.getElementById('pos-force-change-form')?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const np = document.getElementById('pos-new-pw').value;
+    const cp = document.getElementById('pos-confirm-pw').value;
+    if (np.length < 8) {
+      S.posAuthError = 'Password must be at least 8 characters.';
+      render();
+      return;
+    }
+    if (np !== cp) {
+      S.posAuthError = 'Passwords do not match.';
+      render();
+      return;
+    }
+    const admin = S.posPendingAdmin;
+    admin.posPassword = np;
+    admin.mustChangePosPassword = false;
+    S.posActiveUser = { ...admin };
+    S.currentCompany = admin.company;
+    S.posPendingAdmin = null;
+    S.posLoginMode = 'staff';
+    S.posAuthError = '';
+    S.posTab = 'dash';
+    render();
+  });
+
+  // --- Numpad (staff mode) ---
+  document.querySelectorAll('.numpad-key:not(.numpad-key-empty)').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const k = btn.dataset.key;
+      if (k === '\u232b') {
+        S.posLoginPin = (S.posLoginPin || '').slice(0, -1);
+        S.posAuthError = '';
+        render();
+        return;
+      }
+      if ((S.posLoginPin || '').length >= 4) return;
+      S.posLoginPin = (S.posLoginPin || '') + k;
+      if (S.posLoginPin.length === 4) {
+        const staff = POS_STAFF.find(s => s.id === S._loginSelectedId);
+        if (staff && String(staff.pin) === S.posLoginPin) {
+          S.posActiveUser = { ...staff };
+          S.posLoginPin = '';
+          S._loginSelectedId = null;
+          S.posAuthError = '';
+          S.posTab = 'dash';
+          render();
+        } else {
+          S.posAuthError = 'PIN is incorrect. Please try again.';
+          S.posLoginPin = '';
+          render();
+        }
+      } else {
+        render();
+      }
+    });
+  });
+}
+
+function wirePOSEvents() {
+  // ---- CRUD: Products ----
+  document.getElementById('btn-add-product')?.addEventListener('click', () => {
+    S.crudModal = { type:'product', mode:'add', id:null };
+    S.crudForm = {};
+    render();
+  });
+  document.querySelectorAll('[data-edit-product]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const p = POS_PRODUCTS.find(x=>x.id===parseInt(btn.dataset.editProduct));
+      if (!p) return;
+      S.crudModal = { type:'product', mode:'edit', id:p.id };
+      S.crudForm = { name:p.name, cat:p.cat, price:p.price, wholesalePrice:p.wholesalePrice, stock:p.stock, barcode:p.barcode };
+      render();
+    });
+  });
+  document.querySelectorAll('[data-delete-product]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S.confirmDeleteModal = { type:'product', id:parseInt(btn.dataset.deleteProduct) };
+      render();
+    });
+  });
+
+  // ---- CRUD: Customers ----
+  document.getElementById('btn-add-customer')?.addEventListener('click', () => {
+    S.crudModal = { type:'customer', mode:'add', id:null };
+    S.crudForm = {};
+    render();
+  });
+  document.querySelectorAll('[data-edit-customer]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const c = POS_CUSTOMERS.find(x=>x.id===parseInt(btn.dataset.editCustomer));
+      if (!c) return;
+      S.crudModal = { type:'customer', mode:'edit', id:c.id };
+      S.crudForm = { name:c.name, phone:c.phone, tier:c.tier, creditLimit:c.creditLimit };
+      render();
+    });
+  });
+  document.querySelectorAll('[data-delete-customer]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S.confirmDeleteModal = { type:'customer', id:parseInt(btn.dataset.deleteCustomer) };
+      render();
+    });
+  });
+
+  // ---- CRUD: Staff ----
+  document.getElementById('btn-add-staff')?.addEventListener('click', () => {
+    S.crudModal = { type:'staff', mode:'add', id:null };
+    S.crudForm = {};
+    render();
+  });
+  document.querySelectorAll('[data-edit-staff]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const s = POS_STAFF.find(x=>x.id===parseInt(btn.dataset.editStaff));
+      if (!s) return;
+      S.crudModal = { type:'staff', mode:'edit', id:s.id };
+      S.crudForm = { name:s.name, role:s.role, store:s.store, shift:s.shift, status:s.status };
+      render();
+    });
+  });
+  document.querySelectorAll('[data-delete-staff]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S.confirmDeleteModal = { type:'staff', id:parseInt(btn.dataset.deleteStaff) };
+      render();
+    });
+  });
+
+  // ---- Transactions: View + Delete ----
+  document.querySelectorAll('[data-view-txn]').forEach(row => {
+    row.addEventListener('click', () => {
+      S.viewModal = { type:'transaction', id:row.dataset.viewTxn };
+      render();
+    });
+  });
+  document.querySelectorAll('[data-view-txn-btn]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      S.viewModal = { type:'transaction', id:btn.dataset.viewTxnBtn };
+      render();
+    });
+  });
+  document.querySelectorAll('[data-delete-txn]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      S.confirmDeleteModal = { type:'transaction', id:btn.dataset.deleteTxn };
+      render();
+    });
+  });
+
+  // ---- Shared modal close/cancel ----
+  document.getElementById('btn-crud-close')?.addEventListener('click', () => { S.crudModal=null; S.crudForm={}; render(); });
+  document.getElementById('btn-crud-cancel')?.addEventListener('click', () => { S.crudModal=null; S.crudForm={}; render(); });
+  document.getElementById('btn-view-close')?.addEventListener('click', () => { S.viewModal=null; render(); });
+  document.getElementById('btn-delete-cancel')?.addEventListener('click', () => { S.confirmDeleteModal=null; render(); });
+
+  // ---- Shared SAVE ----
+  document.getElementById('btn-crud-save')?.addEventListener('click', () => {
+    if (!S.crudModal) return;
+    const f = {};
+    // Collect form values
+    ['name','phone','cat','role','store','shift','status','tier'].forEach(id => {
+      const el = document.getElementById('cf-'+id);
+      if (el) f[id] = el.value.trim();
+    });
+    ['price','wholesalePrice','stock','creditLimit'].forEach(id => {
+      const el = document.getElementById('cf-'+id);
+      if (el) f[id] = parseFloat(el.value)||0;
+    });
+    ['barcode'].forEach(id => {
+      const el = document.getElementById('cf-'+id);
+      if (el) f[id] = el.value.trim();
+    });
+
+    const { type, mode, id } = S.crudModal;
+
+    if (type === 'product') {
+      if (!f.name) { S.crudForm._error='Product name is required.'; render(); return; }
+      if (f.price<=0) { S.crudForm._error='Price must be greater than 0.'; render(); return; }
+      if (mode === 'add') {
+        POS_PRODUCTS.push({ id: Date.now(), name:f.name, cat:f.cat||'Groceries', price:f.price, wholesalePrice:f.wholesalePrice||f.price*6, stock:f.stock||0, barcode:f.barcode||'' });
+      } else {
+        const p = POS_PRODUCTS.find(x=>x.id===id);
+        if (p) Object.assign(p, { name:f.name, cat:f.cat, price:f.price, wholesalePrice:f.wholesalePrice, stock:f.stock, barcode:f.barcode });
+      }
+    } else if (type === 'customer') {
+      if (!f.name) { S.crudForm._error='Customer name is required.'; render(); return; }
+      if (!f.phone) { S.crudForm._error='Phone number is required.'; render(); return; }
+      if (mode === 'add') {
+        POS_CUSTOMERS.push({ id:Date.now(), name:f.name, phone:f.phone, tier:f.tier||'Bronze', creditLimit:f.creditLimit||100, debtBalance:0, points:0, visits:0, lastVisit:'—' });
+      } else {
+        const c = POS_CUSTOMERS.find(x=>x.id===id);
+        if (c) Object.assign(c, { name:f.name, phone:f.phone, tier:f.tier, creditLimit:f.creditLimit });
+      }
+    } else if (type === 'staff') {
+      if (!f.name) { S.crudForm._error='Staff name is required.'; render(); return; }
+      if (mode === 'add') {
+        POS_STAFF.push({ id:Date.now(), name:f.name, role:f.role||'Cashier', store:f.store||'Bakaara Main', shift:f.shift||'Morning', sales:0, status:f.status||'active' });
+      } else {
+        const s = POS_STAFF.find(x=>x.id===id);
+        if (s) Object.assign(s, { name:f.name, role:f.role, store:f.store, shift:f.shift, status:f.status });
+      }
+    }
+    S.crudModal = null; S.crudForm = {};
+    render();
+  });
+
+  // ---- Shared DELETE CONFIRM ----
+  document.getElementById('btn-delete-confirm')?.addEventListener('click', () => {
+    if (!S.confirmDeleteModal) return;
+    const { type, id } = S.confirmDeleteModal;
+    if (type === 'product') {
+      const i = POS_PRODUCTS.findIndex(x=>x.id===id);
+      if (i!==-1) POS_PRODUCTS.splice(i,1);
+    } else if (type === 'customer') {
+      const i = POS_CUSTOMERS.findIndex(x=>x.id===id);
+      if (i!==-1) POS_CUSTOMERS.splice(i,1);
+    } else if (type === 'staff') {
+      const i = POS_STAFF.findIndex(x=>x.id===id);
+      if (i!==-1) POS_STAFF.splice(i,1);
+    } else if (type === 'transaction') {
+      const i = POS_TRANSACTIONS.findIndex(x=>x.id===id);
+      if (i!==-1) POS_TRANSACTIONS.splice(i,1);
+    }
+    S.confirmDeleteModal = null;
+    render();
+  });
+
+  // ---- Deyn: collect ----
+  document.querySelectorAll('[data-collect-deyn]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const c = POS_CUSTOMERS.find(x=>x.id===parseInt(btn.dataset.collectDeyn));
+      if (c && c.debtBalance > 0) { c.debtBalance = 0; render(); }
+    });
+  });
+
+  // Currency toggle badge
+  const rateBadge = document.getElementById('btn-toggle-currency');
+  if (rateBadge) rateBadge.addEventListener('click', () => { S.primaryCurrency = S.primaryCurrency==='USD'?'SOS':'USD'; render(); });
+
+  // Offline toggle
+  const offlineCb = document.getElementById('settings-offline');
+  if (offlineCb) offlineCb.addEventListener('change', () => { S.isOffline = offlineCb.checked; render(); });
+
+  // Exchange rate save
+  const rateInput = document.getElementById('settings-rate');
+  const saveBtn = document.getElementById('btn-save-settings');
+  if (saveBtn) saveBtn.addEventListener('click', () => {
+    const v = parseInt(rateInput?.value || S.exchangeRate);
+    if (v>=1000 && v<=30000) S.exchangeRate = v;
+    render();
+  });
+
+  // Shift reconciliation
+  const shiftCashierSel = document.getElementById('shift-cashier-sel');
+  if (shiftCashierSel) shiftCashierSel.addEventListener('change', () => { S.shiftCashier = parseInt(shiftCashierSel.value)||null; render(); });
+  const shiftUSD = document.getElementById('shift-usd');
+  if (shiftUSD) shiftUSD.addEventListener('input', () => { S.shiftCountedUSD = shiftUSD.value; render(); });
+  const shiftSOS = document.getElementById('shift-sos');
+  if (shiftSOS) shiftSOS.addEventListener('input', () => { S.shiftCountedSOS = shiftSOS.value; render(); });
+  const closeShiftBtn = document.getElementById('btn-close-shift');
+  if (closeShiftBtn) closeShiftBtn.addEventListener('click', () => {
+    alert('Shiftiga waa la xiray! \u2713 Waraaqda waa la daabacay.');
+    S.shiftCountedUSD=''; S.shiftCountedSOS=''; S.shiftCashier=null;
+    render();
+  });
+  const resetShiftBtn = document.getElementById('btn-reset-shift');
+  if (resetShiftBtn) resetShiftBtn.addEventListener('click', () => { S.shiftCountedUSD=''; S.shiftCountedSOS=''; render(); });
+
+  if (S.posTab === 'checkout') {
+    const searchInput = document.getElementById('pos-search');
+    if (searchInput) { searchInput.addEventListener('input', e => { S.posSearchTerm = e.target.value; render(); }); searchInput.focus(); }
+
+    document.querySelectorAll('[data-add-product]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = parseInt(btn.dataset.addProduct);
+        const prod = POS_PRODUCTS.find(p=>p.id===id);
+        if (!prod) return;
+        const existing = S.posCart.find(item=>item.id===id);
+        if (existing) { existing.qty++; }
+        else { S.posCart.push({ id:prod.id, name:prod.name, price:prod.price, wholesalePrice:prod.wholesalePrice, qty:1, isWholesale:false }); }
+        render();
+      });
+    });
+
+    document.querySelectorAll('.pos-wholesale-cb').forEach(cb => {
+      cb.addEventListener('change', () => { S.posCart[parseInt(cb.dataset.cartIdx)].isWholesale = cb.checked; render(); });
+    });
+
+    document.querySelectorAll('[data-qty-plus]').forEach(btn => {
+      btn.addEventListener('click', () => { S.posCart[parseInt(btn.dataset.qtyPlus)].qty++; render(); });
+    });
+    document.querySelectorAll('[data-qty-minus]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const i = parseInt(btn.dataset.qtyMinus);
+        if (S.posCart[i].qty > 1) S.posCart[i].qty--;
+        else S.posCart.splice(i, 1);
+        render();
+      });
+    });
+    document.querySelectorAll('[data-remove-item]').forEach(btn => {
+      btn.addEventListener('click', () => { S.posCart.splice(parseInt(btn.dataset.removeItem), 1); render(); });
+    });
+    document.querySelectorAll('[data-pos-cat]').forEach(btn => {
+      btn.addEventListener('click', () => { S.posSearchTerm = btn.dataset.posCat==='All'?'':btn.dataset.posCat; render(); });
+    });
+    document.querySelectorAll('[data-pay-method]').forEach(btn => {
+      btn.addEventListener('click', () => { S.posPaymentMethod=btn.dataset.payMethod; S.posDebtCustomerId=null; render(); });
+    });
+    const deynSel = document.getElementById('pos-deyn-customer');
+    if (deynSel) deynSel.addEventListener('change', () => { S.posDebtCustomerId=parseInt(deynSel.value)||null; render(); });
+
+    const chargeBtn = document.getElementById('btn-pos-charge');
+    if (chargeBtn) {
+      chargeBtn.addEventListener('click', () => {
+        if (S.posCart.length===0) return;
+        if (['evc','edahab','zaad'].includes(S.posPaymentMethod)) {
+          S.posMobileMoneyModal=true; S.mobilePhone=''; S.mobileTxId=''; S.mobileError='';
+          render(); return;
+        }
+        finalizeCharge();
+      });
+    }
+    const clearBtn = document.getElementById('btn-pos-clear');
+    if (clearBtn) clearBtn.addEventListener('click', () => { S.posCart=[]; render(); });
+  }
+
+  if (S.posMobileMoneyModal) {
+    const phoneInput = document.getElementById('mm-phone');
+    const txInput = document.getElementById('mm-txid');
+    if (phoneInput) phoneInput.addEventListener('input', () => { S.mobilePhone=phoneInput.value; });
+    if (txInput) txInput.addEventListener('input', () => { S.mobileTxId=txInput.value; });
+    const confirmBtn = document.getElementById('btn-mm-confirm');
+    if (confirmBtn) {
+      confirmBtn.addEventListener('click', () => {
+        const phone=(S.mobilePhone||'').trim();
+        const txid=(S.mobileTxId||'').trim();
+        if (!/^[\d\s\-+]{7,}$/.test(phone)) { S.mobileError='Geli lambarka telefoonka saxda ah.'; render(); return; }
+        if (!/^\d{4,8}$/.test(txid)) { S.mobileError='Transaction ID waa inuu noqdaa 4\u20138 lambar.'; render(); return; }
+        S.posMobileMoneyModal=false;
+        finalizeCharge();
+      });
+    }
+    const cancelBtn = document.getElementById('btn-mm-cancel');
+    if (cancelBtn) cancelBtn.addEventListener('click', () => { S.posMobileMoneyModal=false; render(); });
+  }
+
+  if (S.posReceiptVisible) {
+    const newBtn = document.getElementById('btn-receipt-new');
+    if (newBtn) newBtn.addEventListener('click', () => { S.posReceiptVisible=false; S.posCart=[]; render(); });
+    const printBtn = document.getElementById('btn-receipt-print');
+    if (printBtn) printBtn.addEventListener('click', () => { window.print(); });
+  }
+
+  // ---- Cashier shift toggle ----
+  const shiftToggle = document.getElementById('btn-shift-toggle');
+  if (shiftToggle) {
+    shiftToggle.addEventListener('click', () => {
+      if (S.posShiftActive) {
+        S.posShiftActive = false;
+        S.posShiftStart = null;
+      } else {
+        S.posShiftActive = true;
+        S.posShiftStart = new Date();
+      }
+      render();
+    });
+  }
+
+  // ---- Staff credential creation ----
+  const scfName = document.getElementById('scf-name');
+  if (scfName) {
+    scfName.addEventListener('input', () => {
+      if (!S._staffCredForm) S._staffCredForm = {};
+      S._staffCredForm.name = scfName.value;
+      if (scfName.value.trim() && !S._staffCredForm.generatedPin) {
+        S._staffCredForm.generatedPin = String(Math.floor(1000 + Math.random() * 9000));
+      }
+      render();
+    });
+  }
+  const scfRole = document.getElementById('scf-role');
+  if (scfRole) scfRole.addEventListener('change', () => { if (!S._staffCredForm) S._staffCredForm = {}; S._staffCredForm.role = scfRole.value; });
+  const scfStore = document.getElementById('scf-store');
+  if (scfStore) scfStore.addEventListener('change', () => { if (!S._staffCredForm) S._staffCredForm = {}; S._staffCredForm.store = scfStore.value; });
+  const scfShift = document.getElementById('scf-shift');
+  if (scfShift) scfShift.addEventListener('change', () => { if (!S._staffCredForm) S._staffCredForm = {}; S._staffCredForm.shift = scfShift.value; });
+
+  const regenPin = document.getElementById('btn-regen-pin');
+  if (regenPin) {
+    regenPin.addEventListener('click', () => {
+      if (!S._staffCredForm) S._staffCredForm = {};
+      S._staffCredForm.generatedPin = String(Math.floor(1000 + Math.random() * 9000));
+      render();
+    });
+  }
+
+  const createCredBtn = document.getElementById('btn-create-staff-cred');
+  if (createCredBtn) {
+    createCredBtn.addEventListener('click', () => {
+      const cf = S._staffCredForm || {};
+      const name = (cf.name || '').trim();
+      if (!name) { S._staffCredForm = cf; cf._error = 'Full name is required.'; render(); return; }
+      const parts = name.split(/\s+/);
+      const username = (parts[0] || '').toLowerCase() + '.' + (parts[1] ? parts[1][0].toLowerCase() : '');
+      const pin = cf.generatedPin || String(Math.floor(1000 + Math.random() * 9000));
+      const role = cf.role || 'Cashier';
+      const access = POS_ROLES[role] || POS_ROLES['Cashier'];
+      POS_STAFF.push({
+        id: Date.now(), name, username, pin, role,
+        store: cf.store || 'Bakaara Main', shift: cf.shift || 'Morning',
+        sales: 0, status: 'active', access: [...access]
+      });
+      S._staffCredForm = {};
+      render();
+    });
+  }
+
+  const clearCredBtn = document.getElementById('btn-clear-staff-cred');
+  if (clearCredBtn) {
+    clearCredBtn.addEventListener('click', () => { S._staffCredForm = {}; render(); });
+  }
+}
+
+function finalizeCharge() {
+  const subtotal = S.posCart.reduce((s,item)=>{ const p=item.isWholesale?item.wholesalePrice:item.price; return s+p*item.qty; }, 0);
+  const tax = subtotal * 0.05;
+  const total = subtotal + tax;
+  const methodLabels = {cash:'Cash',evc:'EVC Plus',edahab:'eDahab',zaad:'Zaad',sahal:'Sahal',deyn:'Deyn (Credit)'};
+  if (S.posPaymentMethod==='deyn' && S.posDebtCustomerId) {
+    const cust = POS_CUSTOMERS.find(c=>c.id===S.posDebtCustomerId);
+    if (cust) cust.debtBalance = Math.round((cust.debtBalance+total)*100)/100;
+  }
+  if (S.isOffline) S.syncQueue++;
+  S.posLastReceipt = { id:'TXN-'+(4821+Math.floor(Math.random()*100)), date:new Date().toLocaleString(), items:[...S.posCart], subtotal, tax, total, method:methodLabels[S.posPaymentMethod]||'Cash', mobilePhone:S.mobilePhone||null, mobileTxId:S.mobileTxId||null };
+  S.posReceiptVisible=true; S.posCart=[]; S.posMobileMoneyModal=false;
+  render();
+}
+
+function posIcon(type) {
+  const icons = {
+    dash:         `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>`,
+    checkout:     `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18l-2 12H5L3 3z"/><circle cx="9" cy="20" r="1.5"/><circle cx="17" cy="20" r="1.5"/></svg>`,
+    products:     `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 7H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/><path d="M16 3v4M8 3v4"/></svg>`,
+    customers:    `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3.5-6 7-6s7 2 7 6"/><path d="M16 3c2 0 4 1 4 3s-2 3-4 3"/></svg>`,
+    transactions: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h8"/></svg>`,
+    staff:        `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg>`,
+  };
+  return icons[type] || icons.dash;
 }
 
 // ============================================================

@@ -195,6 +195,33 @@ const html = (str) => { const t = document.createElement('div'); t.innerHTML = s
 function initials(name) {
   return (name||'').split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
 }
+
+/**
+ * Wrap a password input with a show/hide eye toggle.
+ * Pass the same attributes you'd put on a <input type="password"> — id,
+ * placeholder, value, class, autocomplete, style, required.
+ * The toggle is wired globally by the delegated listener in wirePasswordToggles().
+ */
+function pwField(attrs = {}) {
+  const {
+    id = '',
+    placeholder = '',
+    value = '',
+    className = 'form-input',
+    autocomplete = 'current-password',
+    style = '',
+    required = false,
+  } = attrs;
+  const eyeOpen = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+  return `
+    <div class="pw-field">
+      <input type="password" id="${id}" class="${className}" placeholder="${placeholder}" value="${value}" autocomplete="${autocomplete}" ${required?'required':''} ${style?`style="${style}"`:''}/>
+      <button type="button" class="pw-toggle" data-pw-toggle="${id}" aria-label="Show password" tabindex="-1">
+        ${eyeOpen}
+      </button>
+    </div>
+  `;
+}
 function grantedCount(tenantId) {
   return Object.values(S.licenses[tenantId] || {}).filter(Boolean).length;
 }
@@ -273,7 +300,7 @@ function renderLogin() {
           <label class="form-label" for="login-pw" style="margin:0">Password</label>
           <a href="#" style="font-size:12px; font-weight:700; color:var(--purple-800)">Forgot?</a>
         </div>
-        <input id="login-pw" class="form-input mono" type="password" placeholder="••••••••" style="letter-spacing:2px"/>
+        ${pwField({ id:'login-pw', className:'form-input mono', placeholder:'••••••••', style:'letter-spacing:2px' })}
       </div>
 
       ${S.loginError ? `<div class="form-error">${S.loginError === true ? 'Invalid email or password.' : S.loginError}</div>` : ''}
@@ -396,11 +423,11 @@ function renderFirstLogin() {
           </div>
           <div class="form-group">
             <label class="form-label" for="pw1">New password</label>
-            <input id="pw1" class="form-input" type="password" placeholder="At least 10 characters" value="${S.newPw1}"/>
+            ${pwField({ id:'pw1', placeholder:'At least 10 characters', value:S.newPw1, autocomplete:'new-password' })}
           </div>
           <div class="form-group">
             <label class="form-label" for="pw2">Confirm new password</label>
-            <input id="pw2" class="form-input" type="password" placeholder="Type it again" value="${S.newPw2}"/>
+            ${pwField({ id:'pw2', placeholder:'Type it again', value:S.newPw2, autocomplete:'new-password' })}
           </div>
           <div class="pw-rules">
             <div class="title">Password must have</div>
@@ -2143,11 +2170,11 @@ function renderPOSLogin() {
       <form id="pos-force-change-form" style="display:flex;flex-direction:column;gap:12px;text-align:left">
         <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted)">
           New password
-          <input type="password" id="pos-new-pw" class="form-input" placeholder="At least 8 characters" autocomplete="new-password" required />
+          ${pwField({ id:'pos-new-pw', placeholder:'At least 8 characters', autocomplete:'new-password', required:true })}
         </label>
         <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted)">
           Confirm password
-          <input type="password" id="pos-confirm-pw" class="form-input" placeholder="Retype new password" autocomplete="new-password" required />
+          ${pwField({ id:'pos-confirm-pw', placeholder:'Retype new password', autocomplete:'new-password', required:true })}
         </label>
         <button type="submit" class="btn btn-primary" style="margin-top:6px">Set password & continue</button>
       </form>
@@ -2170,7 +2197,7 @@ function renderPOSLogin() {
         </label>
         <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted)">
           Password
-          <input type="password" id="pos-admin-pw" class="form-input" placeholder="Temporary or POS password" autocomplete="current-password" required />
+          ${pwField({ id:'pos-admin-pw', placeholder:'Temporary or POS password', autocomplete:'current-password', required:true })}
         </label>
         <button type="submit" class="btn btn-primary" style="margin-top:6px">Sign in</button>
         <div style="font-size:11px;color:var(--text-muted);text-align:center;margin-top:2px">
@@ -3893,6 +3920,22 @@ setInterval(() => {
 // ============================================================
 document.addEventListener('DOMContentLoaded', () => {
   render();
+
+  // Global delegated handler for password show/hide toggles created by pwField().
+  // Uses event delegation so it survives every re-render without re-binding.
+  const EYE_OPEN  = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+  const EYE_CLOSED= '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a19.6 19.6 0 0 1 5.06-5.94"/><path d="M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 8 11 8a19.6 19.6 0 0 1-3.17 4.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('.pw-toggle');
+    if (!btn) return;
+    const input = document.getElementById(btn.dataset.pwToggle);
+    if (!input) return;
+    const showing = input.type === 'text';
+    input.type = showing ? 'password' : 'text';
+    btn.innerHTML = showing ? EYE_OPEN : EYE_CLOSED;
+    btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+    input.focus();
+  });
 });
 
 // Expose to window for inline event handlers

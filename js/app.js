@@ -70,6 +70,24 @@ const S = {
   // Auth
   loginEmail: '', loginPassword: '', loginError: false,
 
+  // Active identities after sign-in (mutually exclusive)
+  activeSuperAdmin:   null,   // set when a Platform Super Admin signs in
+  activeCompanyAdmin: null,   // set when a Company Admin signs in to the workspace
+  pwUser:             null,   // pending user during first-login password change
+
+  // Retail POS store settings — editable from POS → Settings tab.
+  // Persists in memory for this session; wiring to backend comes later.
+  storeSettings: {
+    storeName:       'Shifo Retail Group',
+    taxRate:         5,
+    defaultStore:    'Bakaara Main',
+    receiptHeader:   'SHIFO RETAIL GROUP',
+    receiptFooter:   'Thank you for shopping at Shifo!',
+    showBarcodeOnReceipt: true,
+    payments:        { Cash: true, 'EVC Plus': true, Zaad: true, Sahal: true },
+  },
+  _settingsSaved: false,      // ephemeral flag for "Saved!" toast
+
   // Active company context — set when a company admin signs into the workspace
   currentCompany: 'Shifo Pharmacy Group',
   currentStore:   'Bakaara Main Store',
@@ -138,7 +156,6 @@ const S = {
   // POS — shift reconciliation
   shiftCashier: null,
   shiftCountedUSD: '',
-  shiftCountedSOS: '',
 
   // POS — RBAC auth
   posActiveUser: null,     // { id, name, username, role, pin, access[] } | null
@@ -227,11 +244,11 @@ function renderLogin() {
       <div class="login-brand-body">
         <div class="login-brand-eyebrow">Cor Platform</div>
         <div class="login-brand-headline">One login for every side of your business.</div>
-        <div class="login-brand-desc">Pharmacy, University, POS, Hospital, Hotel — all on the same core. Trusted by 148 companies across Mogadishu, Hargeisa, Kismayo, Bosaso and Baidoa.</div>
+        <div class="login-brand-desc">Pharmacy, University, POS, Hospital, Hotel — all on the same core. Serving businesses across Mogadishu, Hargeisa, Kismayo, Bosaso and Baidoa.</div>
       </div>
       <div class="login-brand-stats">
-        <div><div class="login-brand-stat-num">148</div>Companies</div>
-        <div><div class="login-brand-stat-num">8</div>Modules</div>
+        <div><div class="login-brand-stat-num">${S.tenants.length}</div>Companies</div>
+        <div><div class="login-brand-stat-num">${MODULES_DEF.length}</div>Modules</div>
         <div><div class="login-brand-stat-num">99.96%</div>Uptime</div>
       </div>
       <svg class="login-brand-bg-icon" width="340" height="340" viewBox="0 0 24 24" fill="#F5C411">
@@ -259,7 +276,7 @@ function renderLogin() {
         <input id="login-pw" class="form-input mono" type="password" placeholder="••••••••" style="letter-spacing:2px"/>
       </div>
 
-      ${S.loginError ? `<div class="form-error">Invalid credentials. Use one of the demo accounts below.</div>` : ''}
+      ${S.loginError ? `<div class="form-error">${S.loginError === true ? 'Invalid email or password.' : S.loginError}</div>` : ''}
 
       <button id="btn-signin" class="login-btn">
         Sign in
@@ -268,33 +285,11 @@ function renderLogin() {
         </svg>
       </button>
 
-      <div class="divider-text">DEMO ACCOUNTS</div>
-
-      <div class="demo-grid">
-        <button class="demo-card purple" id="demo-super">
-          <div class="demo-card-eyebrow">Curdun</div>
-          <div>Super Admin</div>
-          <div class="demo-card-email">admin@curdun.so</div>
-        </button>
-        <button class="demo-card gold" id="demo-admin">
-          <div class="demo-card-eyebrow">Shifo Pharmacy</div>
-          <div>Company Admin</div>
-          <div class="demo-card-email">ahmed@shifo.so</div>
-        </button>
-      </div>
-
-      <button class="demo-first-login" id="demo-firstlogin">
-        Try: new admin's <b>first sign-in</b> (temporary password → set new password)
-      </button>
-
       <div class="login-footer-note">SSO · SAML · Passkey — © 2026 Curdun ICT Solution</div>
     </div>
   `;
 
   div.querySelector('#btn-signin').addEventListener('click', doSignIn);
-  div.querySelector('#demo-super').addEventListener('click', () => { S.view='super'; render(); });
-  div.querySelector('#demo-admin').addEventListener('click', () => { S.currentCompany='Shifo Pharmacy Group'; S.view='workspace'; render(); });
-  div.querySelector('#demo-firstlogin').addEventListener('click', () => { S.newPw1=''; S.newPw2=''; S.pwError=''; S.view='firstlogin'; render(); });
   div.querySelector('#login-email').addEventListener('input', e => { S.loginEmail = e.target.value; S.loginError = false; });
   div.querySelector('#login-pw').addEventListener('keydown', e => { if(e.key==='Enter') doSignIn(); });
 
@@ -303,20 +298,65 @@ function renderLogin() {
 
 function doSignIn() {
   const email = (S.loginEmail || $('login-email')?.value || '').toLowerCase().trim();
-  const pw = ($('login-pw')?.value || '');
+  const pw    = ($('login-pw')?.value || '');
   S.loginEmail = email;
 
-  if (!email) { S.loginError = true; render(); return; }
-  if (email.includes('curdun')) { S.view='super'; S.loginError=false; render(); return; }
+  if (!email || !pw) {
+    S.loginError = 'Enter your email and password.';
+    render();
+    return;
+  }
 
-  // Check if matches a created company admin
-  const created = S.tenants.find(t => (t.adminEmail||'').toLowerCase() === email);
-  if (created) { S.currentCompany = created.name; S.view='firstlogin'; S.loginError=false; render(); return; }
+  // 1. Try Platform Super Admin.
+  const sa = SUPER_ADMINS.find(a => a.email.toLowerCase() === email);
+  if (sa && sa.password === pw) {
+    if (sa.mustChangePassword) {
+      // Newly-provisioned super admin must set their own password first.
+      S.pwUser = sa;                    // referenced by renderFirstLogin
+      S.newPw1 = ''; S.newPw2 = ''; S.pwError = '';
+      S.view = 'firstlogin';
+      S.loginError = false;
+      render();
+      return;
+    }
+    S.activeSuperAdmin = sa;
+    S.view = 'super';
+    S.loginError = false;
+    render();
+    return;
+  }
 
-  if (email.includes('shifo') || email.includes('ahmed')) { S.currentCompany='Shifo Pharmacy Group'; S.view='workspace'; S.loginError=false; render(); return; }
-  if (/@[^\s@]+\.[a-z]{2,}$/i.test(email)) { S.view='firstlogin'; S.loginError=false; render(); return; }
+  // 2. Try Company Admin (temporary or saved workspace password).
+  const ca = COMPANY_ADMINS.find(a => a.email.toLowerCase() === email);
+  if (ca) {
+    // Core workspace accepts the temporary password forever, and any
+    // module-level password the admin has set. The force-change-on-first-use
+    // rule fires later inside each active module (POS handles this today).
+    if (pw === ca.tempPassword || pw === ca.posPassword) {
+      S.currentCompany = ca.company;
+      S.activeCompanyAdmin = ca;
+      S.view = 'workspace';
+      S.loginError = false;
+      render();
+      return;
+    }
+  }
 
-  S.loginError = true; render();
+  // 3. Newly-provisioned company admins whose tenant lives in S.tenants
+  //    (created via Super Admin "New Company") flow through first-login.
+  const tenant = S.tenants.find(t => (t.adminEmail || '').toLowerCase() === email);
+  if (tenant && pw === tenant.adminTempPassword) {
+    S.currentCompany = tenant.name;
+    S.pwUser = { email, tenantId: tenant.id };
+    S.newPw1 = ''; S.newPw2 = ''; S.pwError = '';
+    S.view = 'firstlogin';
+    S.loginError = false;
+    render();
+    return;
+  }
+
+  S.loginError = 'Invalid email or password.';
+  render();
 }
 
 // ============================================================
@@ -440,8 +480,9 @@ function renderSidebar() {
     <nav class="sidebar-nav">
       ${[
         ['overview',  'Overview', overviewIcon()],
-        ['companies', 'Companies', companiesIcon(), 148],
-        ['admins',    'Company Admins', adminsIcon(), 148],
+        ['companies', 'Companies', companiesIcon(), S.tenants.length],
+        ['admins',    'Company Admins', adminsIcon(), S.tenants.length],
+        ['platform',  'Platform Admins', adminsIcon(), SUPER_ADMINS.length],
         ['modules',   'Systems Catalog', modulesIcon()],
         ['infra',     'Infrastructure', infraIcon()],
         ['billing',   'Billing & Subs', billingIcon()],
@@ -514,6 +555,7 @@ function renderTabContent() {
     case 'overview':  wrap.innerHTML = renderOverviewTab(); break;
     case 'companies': wrap.innerHTML = renderCompaniesTab(); break;
     case 'admins':    wrap.innerHTML = renderAdminsTab(); break;
+    case 'platform':  wrap.innerHTML = renderPlatformAdminsTab(); break;
     case 'modules':   wrap.innerHTML = renderModulesTab(); break;
     case 'infra':     wrap.innerHTML = renderInfraTab(); break;
     case 'billing':   wrap.innerHTML = renderBillingTab(); break;
@@ -804,6 +846,89 @@ function renderAdminsTab() {
   `;
 }
 
+// ---- PLATFORM ADMINS TAB (Curdun-level super admins) ----
+function renderPlatformAdminsTab() {
+  const rows = SUPER_ADMINS.map(a => `
+    <tr>
+      <td style="padding:12px 16px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="avatar avatar-sm" style="background:var(--purple-800);color:var(--gold)">${initials(a.name)}</div>
+          <div>
+            <div style="font-weight:700">${a.name}</div>
+            <div style="font-size:12px;color:var(--text-muted)">${a.email}</div>
+          </div>
+        </div>
+      </td>
+      <td style="padding:12px 16px"><span class="role-tag role-pharmacist">${a.role}</span></td>
+      <td style="padding:12px 16px;font-size:12px;color:var(--text-muted)">${a.mustChangePassword ? 'Pending first sign-in' : 'Active'}</td>
+      <td style="padding:12px 16px;font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${a.createdAt || '—'}</td>
+    </tr>
+  `).join('');
+
+  return `
+    <div class="page-title-bar">
+      <div>
+        <div class="page-title-eyebrow">Cor Platform · Governance</div>
+        <h1 class="page-title">Platform Admins</h1>
+        <div class="page-subtitle">Curdun-level operators who can provision companies, grant modules, and see every tenant. Only add people you trust with root-level access.</div>
+      </div>
+    </div>
+
+    <section class="two-col-grid">
+      <div class="data-section">
+        <div class="section-header-bar">
+          <div><div class="section-eyebrow">Operators</div><h2 class="section-h2">${SUPER_ADMINS.length} active</h2></div>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="data-table">
+            <thead><tr>
+              <th style="padding:12px 16px;text-align:left">Name / email</th>
+              <th style="padding:12px 16px;text-align:left">Role</th>
+              <th style="padding:12px 16px;text-align:left">Status</th>
+              <th style="padding:12px 16px;text-align:left">Created</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="add-user-panel">
+        <h4>Create Platform Admin</h4>
+        <div style="font-size:12px;color:#EFEAFB;line-height:1.5">
+          A temporary password is generated. The new admin is forced to set their own password on first sign-in.
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="color:#FFF">Full name</label>
+          <input class="form-input" id="new-sa-name" placeholder="e.g. Amina Hassan" value="${S._newSA?.name || ''}"/>
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="color:#FFF">Email</label>
+          <input class="form-input" id="new-sa-email" type="email" placeholder="operator@curdun.so" value="${S._newSA?.email || ''}"/>
+        </div>
+        ${S._newSAResult ? `
+          <div class="cred-box" style="grid-column:auto">
+            <div class="cred-box-header">
+              <div>
+                <div class="cred-eyebrow">CREATED</div>
+                <div class="cred-title">${S._newSAResult.name}</div>
+                <div class="cred-subtitle">${S._newSAResult.email}</div>
+              </div>
+            </div>
+            <div>
+              <div class="cred-field-label">Temporary password</div>
+              <input class="cred-input pw" value="${S._newSAResult.tempPassword}" readonly onfocus="this.select()"/>
+              <div class="cred-hint">Share once. They'll be forced to change it on first sign-in.</div>
+            </div>
+          </div>
+        ` : `
+          <div class="cred-hint" style="color:#EFEAFB">No password to show yet.</div>
+        `}
+        <button class="btn btn-primary" id="btn-create-sa">Create admin</button>
+      </div>
+    </section>
+  `;
+}
+
 // ---- MODULES CATALOG TAB ----
 function renderModulesTab() {
   const allModules = [...MODULES_DEF];
@@ -1036,6 +1161,38 @@ function renderAuditTab() {
 
 // ---- WIRE TAB EVENTS ----
 function wireTabEvents(wrap) {
+  // Platform Admins: form field state + create
+  wrap.querySelector('#new-sa-name')?.addEventListener('input', e => {
+    S._newSA = { ...(S._newSA || {}), name: e.target.value };
+  });
+  wrap.querySelector('#new-sa-email')?.addEventListener('input', e => {
+    S._newSA = { ...(S._newSA || {}), email: e.target.value };
+  });
+  wrap.querySelector('#btn-create-sa')?.addEventListener('click', () => {
+    const f = S._newSA || {};
+    const name  = (f.name || '').trim();
+    const email = (f.email || '').trim().toLowerCase();
+    if (!name || !email) { alert('Name and email are required.'); return; }
+    if (SUPER_ADMINS.some(a => a.email.toLowerCase() === email)) {
+      alert('A platform admin with that email already exists.'); return;
+    }
+    // Generate a temporary password — short human-readable prefix + 6 hex.
+    const rand = Math.random().toString(16).slice(2, 8).toUpperCase();
+    const tempPassword = `Cor-${rand}-26`;
+    const newSA = {
+      id: Math.max(...SUPER_ADMINS.map(a => a.id)) + 1,
+      name, email,
+      password: tempPassword,
+      role: 'Super Admin',
+      mustChangePassword: true,
+      createdAt: new Date().toISOString().slice(0, 10),
+    };
+    SUPER_ADMINS.push(newSA);
+    S._newSAResult = { name, email, tempPassword };   // shown in the panel
+    S._newSA = null;                                   // clear the form
+    render();
+  });
+
   // Companies tab: select tenant
   wrap.querySelectorAll('[data-select]').forEach(btn => {
     btn.addEventListener('click', () => { S.selectedTenantId = btn.dataset.select; render(); });
@@ -1893,10 +2050,30 @@ const POS_STAFF = [
   { id:6, name:'Nimco Ali',      username:'nimco.a',   pin:'2468', role:'Cashier',         store:'Hodan Store',    shift:'Afternoon',sales:45,  status:'break',  access:['dash','checkout','transactions'] },
 ];
 
+// ============================================================
+// PLATFORM SUPER ADMINS — Cor Curdun operators
+// ============================================================
+// The first entry is the platform-default super admin, always present.
+// Additional super admins can be created from the Super Admin console
+// ("Platform Admins" tab). New entries start with mustChangePassword:true
+// so the recipient is forced to set their own password on first sign-in.
+const SUPER_ADMINS = [
+  {
+    id: 1,
+    name: 'Curdun Platform Admin',
+    email: 'admin@curdun.so',
+    password: 'Admin@1234',              // default — change on first sign-in in production
+    role: 'Super Admin',
+    mustChangePassword: false,           // the platform-default admin is trusted
+    createdAt: '2026-01-01',
+  },
+];
+
 // Company Admins — auto-created when Cor Super Admin provisions a company.
 // Login flow:
-//  - Core workspace: tempPassword works forever (never forced to change)
-//  - Retail POS: tempPassword works ONCE; forces posPassword creation on first login
+//  - Core workspace: tempPassword works (never forced to change here)
+//  - Any active module (Retail POS): tempPassword works ONCE; forces
+//    module password creation on first login
 const COMPANY_ADMINS = [
   {
     id: 101,
@@ -2134,11 +2311,7 @@ function renderPOS() {
       <div class="pharm-topbar">
         <div class="pharm-tab-label">${labels[S.posTab]||'Dashboard'}</div>
         <div class="ml-auto flex items-center gap-10">
-          <div class="pos-rate-badge" id="btn-toggle-currency">
-            <span>${S.primaryCurrency}</span>
-            <span style="opacity:0.5;font-size:10px">1 USD = ${S.exchangeRate.toLocaleString()} Sh</span>
-          </div>
-          <div style="font-size:12px;color:var(--text-muted);font-family:var(--font-mono)">Bakaara Main Store</div>
+          <div style="font-size:12px;color:var(--text-muted);font-family:var(--font-mono)">${S.storeSettings.defaultStore} Store</div>
           <span class="pill ${S.isOffline?'pill-red':'pill-green'}">${S.isOffline?'\u25cf Offline':'\u25cf Online'}</span>
         </div>
       </div>
@@ -2208,7 +2381,6 @@ function renderPOSDash() {
           <div class="kpi-card dark">
             <div class="kpi-eyebrow" style="color:#F5C411">My sales today</div>
             <div class="kpi-value">$${myTotal.toFixed(2)}</div>
-            <div class="kpi-dual-currency">${sos(myTotal)} Sh</div>
           </div>
           <div class="kpi-card light">
             <div class="kpi-eyebrow">My transactions</div>
@@ -2261,14 +2433,12 @@ function renderPOSDash() {
       <div class="kpi-card dark">
         <div class="kpi-eyebrow" style="color:#F5C411">Today's sales</div>
         <div class="kpi-value">$${todayTotal.toFixed(2)}</div>
-        <div class="kpi-dual-currency">${sos(todayTotal)} Sh</div>
         <div class="kpi-trend" style="color:#EFEAFB">▲ 18% vs yesterday</div>
       </div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Transactions</div><div class="kpi-value">${todayTxns}</div><div class="kpi-trend trend-up">▲ 6 more</div></div>
       <div class="kpi-card light">
         <div class="kpi-eyebrow">Avg. ticket</div>
         <div class="kpi-value">$${avgTicket}</div>
-        <div class="kpi-dual-currency">${sos(parseFloat(avgTicket))} Sh</div>
         <div class="kpi-trend">Per transaction</div>
       </div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Active staff</div><div class="kpi-value">${POS_STAFF.filter(s=>s.status==='active').length}</div><div class="kpi-trend">On register now</div></div>
@@ -2360,7 +2530,6 @@ function renderPOSCheckout() {
               <div class="pos-tile-emoji">${catEmoji[p.cat]||'\ud83d\udce6'}</div>
               <div class="pos-tile-name">${p.name}</div>
               <div class="pos-tile-price">$${p.price.toFixed(2)}</div>
-              <div class="pos-tile-price-sos">${sos(p.price)} Sh</div>
               <div class="pos-tile-wholesale">Jumlo: $${p.wholesalePrice.toFixed(2)}</div>
               <div class="pos-tile-stock">${p.stock} stock</div>
             </button>
@@ -2385,7 +2554,7 @@ function renderPOSCheckout() {
             <div class="pos-cart-row">
               <div class="pos-cart-item-info">
                 <div class="pos-cart-item-name">${item.name}</div>
-                <div class="pos-cart-item-price">$${effPrice.toFixed(2)} \u00b7 ${sos(effPrice)} Sh</div>
+                <div class="pos-cart-item-price">$${effPrice.toFixed(2)}</div>
               </div>
               <div class="pos-wholesale-toggle">
                 <span class="pos-wt-label ${!item.isWholesale?'active':''}">Xabo</span>
@@ -2404,10 +2573,9 @@ function renderPOSCheckout() {
         </div>
 
         <div class="pos-cart-summary">
-          <div class="pos-summary-row"><span>Wadarta yar</span><span>$${subtotal.toFixed(2)} / ${sos(subtotal)} Sh</span></div>
+          <div class="pos-summary-row"><span>Wadarta yar</span><span>$${subtotal.toFixed(2)}</span></div>
           <div class="pos-summary-row"><span>Canshuur (5%)</span><span>$${tax.toFixed(2)}</span></div>
           <div class="pos-summary-row pos-summary-total"><span>WADARTA</span><span>$${total.toFixed(2)}</span></div>
-          <div style="text-align:right;font-size:11px;color:rgba(255,255,255,0.45);margin-top:2px">${sos(total)} Somali Shilling</div>
         </div>
 
         <div class="pos-payment-methods">
@@ -2457,7 +2625,7 @@ function renderMobileMoneyModal() {
         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--gold)" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18" stroke-linecap="round"/></svg>
       </div>
       <h3 class="mm-modal-title">${label}</h3>
-      <p class="mm-modal-amount">$${total.toFixed(2)} <span class="mm-modal-sos">${sos(total)} Sh</span></p>
+      <p class="mm-modal-amount">$${total.toFixed(2)}</p>
       <div class="mm-modal-fields">
         <div class="mm-field">
           <label class="mm-label">Lambarka telefoonka</label>
@@ -2600,7 +2768,7 @@ function renderPOSProducts() {
               <tr>
                 <td style="font-weight:700">${p.name}</td>
                 <td><span class="pill" style="background:var(--gray-50);color:var(--text-secondary)">${p.cat}</span></td>
-                <td style="font-weight:800">$${p.price.toFixed(2)}<div style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono)">${sos(p.price)} Sh</div></td>
+                <td style="font-weight:800">$${p.price.toFixed(2)}</td>
                 <td style="font-size:13px;color:var(--text-muted)">$${p.wholesalePrice.toFixed(2)}</td>
                 <td style="font-weight:700;color:${p.stock<40?'#B45309':'var(--text-primary)'}">${p.stock}</td>
                 <td style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">${p.barcode}</td>
@@ -2700,7 +2868,6 @@ function renderPOSCustomers() {
       <div class="kpi-card dark">
         <div class="kpi-eyebrow" style="color:#F5C411">Wadarta Deynta</div>
         <div class="kpi-value">$${totalDebt.toFixed(2)}</div>
-        <div class="kpi-dual-currency">${sos(totalDebt)} Sh</div>
       </div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Macaamiil deyn ah</div><div class="kpi-value">${POS_CUSTOMERS.filter(c=>c.debtBalance>0).length}</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Xadka dhaafay \u26a0</div><div class="kpi-value" style="color:#B42318">${overdue.length}</div></div>
@@ -2730,7 +2897,7 @@ function renderPOSCustomers() {
                 <td><div class="flex items-center gap-10"><div class="avatar avatar-sm">${initials(c.name)}</div><div><div style="font-weight:700">${c.name}</div><div style="font-size:10px;color:var(--text-muted)">${c.tier}</div></div></div></td>
                 <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${c.phone}</td>
                 <td style="font-weight:700">$${c.creditLimit}</td>
-                <td><div style="font-weight:800;color:${isOver?'#B42318':hasDebt?'#B45309':'var(--text-primary)'}">$${c.debtBalance.toFixed(2)}</div><div style="font-size:11px;color:var(--text-muted)">${sos(c.debtBalance)} Sh</div></td>
+                <td><div style="font-weight:800;color:${isOver?'#B42318':hasDebt?'#B45309':'var(--text-primary)'}">$${c.debtBalance.toFixed(2)}</div></td>
                 <td><div class="buugga-bar-wrap"><div class="buugga-bar" style="width:${Math.min(pct,100)}%;background:${isOver?'#B42318':pct>60?'#B45309':'#22C55E'}"></div></div><div style="font-size:11px;font-weight:700;margin-top:2px;color:${isOver?'#B42318':'var(--text-muted)'}">${pct}%</div></td>
                 <td>${statusPill}</td>
                 <td class="col-right">
@@ -2788,7 +2955,6 @@ function renderPOSTransactions() {
               <div class="txn-detail-row"><span>Items</span><span>${t.items}</span></div>
               <div class="txn-detail-row"><span>Payment</span><span>${t.method}</span></div>
               <div class="txn-detail-row txn-total-row"><span>Total</span><span>$${t.total.toFixed(2)}</span></div>
-              <div class="txn-detail-row"><span>In SOS</span><span class="mono-val">${sos(t.total)} Sh</span></div>
             </div>
           </div>
           <div class="crud-modal-footer">
@@ -2822,7 +2988,6 @@ function renderPOSTransactions() {
       <div class="kpi-card dark">
         <div class="kpi-eyebrow" style="color:#F5C411">Total sales</div>
         <div class="kpi-value">$${totalSales.toFixed(2)}</div>
-        <div class="kpi-dual-currency">${sos(totalSales)} Sh</div>
       </div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Transactions</div><div class="kpi-value">${POS_TRANSACTIONS.length}</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Cash</div><div class="kpi-value">$${cashTotal.toFixed(2)}</div></div>
@@ -2842,7 +3007,7 @@ function renderPOSTransactions() {
                 <td>${t.cashier}</td>
                 <td style="font-size:12px;color:var(--text-muted)">${t.customer}</td>
                 <td>${t.items}</td>
-                <td style="font-weight:800">$${t.total.toFixed(2)}<div style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono)">${sos(t.total)} Sh</div></td>
+                <td style="font-weight:800">$${t.total.toFixed(2)}</td>
                 <td><span class="pill ${t.method==='Cash'?'pill-green':'pill-gold'}">${t.method}</span></td>
                 <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${t.time}</td>
                 <td class="col-right" onclick="event.stopPropagation()">
@@ -2862,12 +3027,8 @@ function renderPOSTransactions() {
 
 function renderPOSStaff() {
   const systemCashUSD = POS_TRANSACTIONS.filter(t=>t.method==='Cash').reduce((s,t)=>s+t.total,0);
-  const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
   const countedUSD = parseFloat(S.shiftCountedUSD)||0;
-  const countedSOS = parseFloat(S.shiftCountedSOS)||0;
-  const countedSOStoUSD = countedSOS / S.exchangeRate;
-  const totalCountedUSD = countedUSD + countedSOStoUSD;
-  const variance = totalCountedUSD - systemCashUSD;
+  const variance = countedUSD - systemCashUSD;
   const varianceClass = variance===0?'shift-var-zero':variance>0?'shift-var-over':'shift-var-short';
   const varianceLabel = variance===0 ? '\u2713 Sax' : variance>0 ? `\u25b2 Kordhay $${Math.abs(variance).toFixed(2)}` : `\u25bc Dhimay $${Math.abs(variance).toFixed(2)}`;
 
@@ -2946,23 +3107,18 @@ function renderPOSStaff() {
         </select>
       </div>
       <div class="shift-system-totals">
-        <div class="shift-sys-row"><span class="shift-sys-label">Nidaamka: Cash USD</span><span class="shift-sys-val">$${systemCashUSD.toFixed(2)}</span><span class="shift-sys-sos">${sos(systemCashUSD)} Sh</span></div>
+        <div class="shift-sys-row"><span class="shift-sys-label">Nidaamka: Cash USD</span><span class="shift-sys-val">$${systemCashUSD.toFixed(2)}</span></div>
       </div>
       <div class="shift-count-grid">
         <div class="shift-count-col">
           <label class="form-label" style="color:rgba(255,255,255,0.7)">La tirisay \u2014 USD</label>
           <input class="form-input shift-count-input" id="shift-usd" type="number" step="0.01" min="0" placeholder="0.00" value="${S.shiftCountedUSD||''}">
         </div>
-        <div class="shift-count-col">
-          <label class="form-label" style="color:rgba(255,255,255,0.7)">La tirisay \u2014 Somali Sh</label>
-          <input class="form-input shift-count-input" id="shift-sos" type="number" step="100" min="0" placeholder="0" value="${S.shiftCountedSOS||''}">
-          ${countedSOS>0 ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);margin-top:3px">= $${countedSOStoUSD.toFixed(2)} USD @ ${S.exchangeRate.toLocaleString()}</div>` : ''}
-        </div>
       </div>
-      ${(countedUSD>0||countedSOS>0) ? `
+      ${countedUSD>0 ? `
       <div class="shift-variance-card ${varianceClass}">
         <div style="flex:1"><div class="shift-var-label">Kala duwanaanshaha</div><div class="shift-var-value">${varianceLabel}</div></div>
-        <div style="text-align:right"><div style="font-size:11px;opacity:0.7">La tirisay</div><div style="font-weight:800">$${totalCountedUSD.toFixed(2)}</div></div>
+        <div style="text-align:right"><div style="font-size:11px;opacity:0.7">La tirisay</div><div style="font-weight:800">$${countedUSD.toFixed(2)}</div></div>
         <div style="text-align:right"><div style="font-size:11px;opacity:0.7">Nidaamka</div><div style="font-weight:800">$${systemCashUSD.toFixed(2)}</div></div>
       </div>` : ''}
       <div style="display:flex;gap:10px;margin-top:14px">
@@ -3076,48 +3232,74 @@ function renderPOSStaff() {
 }
 
 function renderPOSSettings() {
+  const s = S.storeSettings;
+  const stores = ['Bakaara Main','Hodan Store','Wadajir Store','Hamar Weyne'];
+  const savedBanner = S._settingsSaved
+    ? `<div style="background:#DEF7EC;color:#0F7A3A;border:1px solid #86EFAC;padding:10px 14px;border-radius:8px;font-size:13px;font-weight:700;margin-bottom:16px">Settings saved.</div>`
+    : '';
+
   return `
     <div style="max-width:600px">
+      ${savedBanner}
+
       <div class="card" style="padding:24px;margin-bottom:16px">
         <h3 style="font-size:16px;font-weight:800;margin-bottom:16px">Store Settings</h3>
         <div class="flex-col gap-14">
-          <div class="form-group"><label class="form-label">Store name</label><input class="form-input" value="Shifo Retail Group"/></div>
-          <div class="form-group"><label class="form-label">Default currency</label><select class="form-select" id="settings-currency"><option ${S.primaryCurrency==='USD'?'selected':''}>USD ($)</option><option ${S.primaryCurrency==='SOS'?'selected':''}>SOS (Sh.)</option></select></div>
-          <div class="form-group"><label class="form-label">Tax rate (%)</label><input class="form-input" type="number" value="5"/></div>
-          <div class="form-group"><label class="form-label">Default store</label><select class="form-select"><option selected>Bakaara Main</option><option>Hodan Store</option><option>Wadajir Store</option><option>Hamar Weyne</option></select></div>
           <div class="form-group">
-            <label class="form-label">Qiimaha lacag-bedelka: 1 USD = ? SOS</label>
-            <div style="display:flex;gap:10px;align-items:center">
-              <input class="form-input" id="settings-rate" type="number" min="1000" max="30000" step="100" value="${S.exchangeRate}" style="max-width:160px;font-family:var(--font-mono)"/>
-              <span style="font-size:13px;color:var(--text-muted)">Hadda: 1 USD = ${S.exchangeRate.toLocaleString()} Sh</span>
-            </div>
+            <label class="form-label">Store name</label>
+            <input class="form-input" id="ss-store-name" value="${s.storeName}"/>
           </div>
           <div class="form-group">
-            <label class="form-label">Offline mode (Xaalada internet la'aanta)</label>
-            <div style="display:flex;align-items:center;gap:12px">
-              <label class="toggle"><input type="checkbox" id="settings-offline" ${S.isOffline?'checked':''}><span class="toggle-slider"></span></label>
-              <span style="font-size:13px;color:var(--text-muted)">${S.isOffline?'Offline \u2014 '+S.syncQueue+' transactions queued':'Online'}</span>
-            </div>
+            <label class="form-label">Default currency</label>
+            <input class="form-input" value="USD ($)" readonly style="background:var(--gray-50);color:var(--text-muted)"/>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:4px">USD is the only supported currency for this deployment.</div>
           </div>
-          <button class="btn btn-primary btn-sm" id="btn-save-settings" style="align-self:flex-start">Save settings</button>
+          <div class="form-group">
+            <label class="form-label">Tax rate (%)</label>
+            <input class="form-input" id="ss-tax-rate" type="number" min="0" max="100" step="0.5" value="${s.taxRate}"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Default store</label>
+            <select class="form-select" id="ss-default-store">
+              ${stores.map(st => `<option ${s.defaultStore===st?'selected':''}>${st}</option>`).join('')}
+            </select>
+          </div>
+          <button class="btn btn-primary btn-sm" id="btn-save-store-settings" style="align-self:flex-start">Save store settings</button>
         </div>
       </div>
+
       <div class="card" style="padding:24px;margin-bottom:16px">
         <h3 style="font-size:16px;font-weight:800;margin-bottom:16px">Receipt Settings</h3>
         <div class="flex-col gap-14">
-          <div class="form-group"><label class="form-label">Receipt header</label><input class="form-input" value="SHIFO RETAIL GROUP"/></div>
-          <div class="form-group"><label class="form-label">Footer message</label><input class="form-input" value="Thank you for shopping at Shifo!"/></div>
-          <div class="form-group"><label class="form-label">Show barcode on receipt</label><select class="form-select"><option selected>Yes</option><option>No</option></select></div>
-          <button class="btn btn-primary btn-sm" style="align-self:flex-start">Save</button>
+          <div class="form-group">
+            <label class="form-label">Receipt header</label>
+            <input class="form-input" id="ss-receipt-header" value="${s.receiptHeader}"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Footer message</label>
+            <input class="form-input" id="ss-receipt-footer" value="${s.receiptFooter}"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Show barcode on receipt</label>
+            <select class="form-select" id="ss-receipt-barcode">
+              <option value="yes" ${s.showBarcodeOnReceipt?'selected':''}>Yes</option>
+              <option value="no"  ${!s.showBarcodeOnReceipt?'selected':''}>No</option>
+            </select>
+          </div>
+          <button class="btn btn-primary btn-sm" id="btn-save-receipt-settings" style="align-self:flex-start">Save receipt settings</button>
         </div>
       </div>
+
       <div class="card" style="padding:24px">
         <h3 style="font-size:16px;font-weight:800;margin-bottom:16px">Payment Methods</h3>
         <div class="flex-col gap-14">
-          ${['Cash','EVC Plus','Zaad','Sahal'].map(m=>`
+          ${Object.keys(s.payments).map(m => `
             <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
               <span style="font-weight:700">${m}</span>
-              <label class="toggle"><input type="checkbox" checked/><span class="toggle-slider"></span></label>
+              <label class="toggle">
+                <input type="checkbox" data-payment-toggle="${m}" ${s.payments[m]?'checked':''}/>
+                <span class="toggle-slider"></span>
+              </label>
             </div>
           `).join('')}
         </div>
@@ -3444,21 +3626,33 @@ function wirePOSEvents() {
     });
   });
 
-  // Currency toggle badge
-  const rateBadge = document.getElementById('btn-toggle-currency');
-  if (rateBadge) rateBadge.addEventListener('click', () => { S.primaryCurrency = S.primaryCurrency==='USD'?'SOS':'USD'; render(); });
-
-  // Offline toggle
-  const offlineCb = document.getElementById('settings-offline');
-  if (offlineCb) offlineCb.addEventListener('change', () => { S.isOffline = offlineCb.checked; render(); });
-
-  // Exchange rate save
-  const rateInput = document.getElementById('settings-rate');
-  const saveBtn = document.getElementById('btn-save-settings');
-  if (saveBtn) saveBtn.addEventListener('click', () => {
-    const v = parseInt(rateInput?.value || S.exchangeRate);
-    if (v>=1000 && v<=30000) S.exchangeRate = v;
+  // ---- POS Settings tab ----
+  // Store settings save
+  const btnSaveStore = document.getElementById('btn-save-store-settings');
+  if (btnSaveStore) btnSaveStore.addEventListener('click', () => {
+    const name = document.getElementById('ss-store-name').value.trim();
+    if (!name) { alert('Store name is required.'); return; }
+    S.storeSettings.storeName    = name;
+    S.storeSettings.taxRate      = parseFloat(document.getElementById('ss-tax-rate').value) || 0;
+    S.storeSettings.defaultStore = document.getElementById('ss-default-store').value;
+    S.currentStore               = S.storeSettings.defaultStore + ' Store';
+    S._settingsSaved = true;
     render();
+    setTimeout(() => { S._settingsSaved = false; render(); }, 2500);
+  });
+  const btnSaveReceipt = document.getElementById('btn-save-receipt-settings');
+  if (btnSaveReceipt) btnSaveReceipt.addEventListener('click', () => {
+    S.storeSettings.receiptHeader        = document.getElementById('ss-receipt-header').value;
+    S.storeSettings.receiptFooter        = document.getElementById('ss-receipt-footer').value;
+    S.storeSettings.showBarcodeOnReceipt = document.getElementById('ss-receipt-barcode').value === 'yes';
+    S._settingsSaved = true;
+    render();
+    setTimeout(() => { S._settingsSaved = false; render(); }, 2500);
+  });
+  document.querySelectorAll('[data-payment-toggle]').forEach(cb => {
+    cb.addEventListener('change', () => {
+      S.storeSettings.payments[cb.dataset.paymentToggle] = cb.checked;
+    });
   });
 
   // Shift reconciliation
@@ -3466,16 +3660,14 @@ function wirePOSEvents() {
   if (shiftCashierSel) shiftCashierSel.addEventListener('change', () => { S.shiftCashier = parseInt(shiftCashierSel.value)||null; render(); });
   const shiftUSD = document.getElementById('shift-usd');
   if (shiftUSD) shiftUSD.addEventListener('input', () => { S.shiftCountedUSD = shiftUSD.value; render(); });
-  const shiftSOS = document.getElementById('shift-sos');
-  if (shiftSOS) shiftSOS.addEventListener('input', () => { S.shiftCountedSOS = shiftSOS.value; render(); });
   const closeShiftBtn = document.getElementById('btn-close-shift');
   if (closeShiftBtn) closeShiftBtn.addEventListener('click', () => {
     alert('Shiftiga waa la xiray! \u2713 Waraaqda waa la daabacay.');
-    S.shiftCountedUSD=''; S.shiftCountedSOS=''; S.shiftCashier=null;
+    S.shiftCountedUSD=''; S.shiftCashier=null;
     render();
   });
   const resetShiftBtn = document.getElementById('btn-reset-shift');
-  if (resetShiftBtn) resetShiftBtn.addEventListener('click', () => { S.shiftCountedUSD=''; S.shiftCountedSOS=''; render(); });
+  if (resetShiftBtn) resetShiftBtn.addEventListener('click', () => { S.shiftCountedUSD=''; render(); });
 
   if (S.posTab === 'checkout') {
     const searchInput = document.getElementById('pos-search');

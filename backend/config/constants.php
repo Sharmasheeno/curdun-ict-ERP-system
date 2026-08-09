@@ -1,0 +1,50 @@
+<?php
+
+// Order statuses
+define('ORDER_STATUS_DRAFT', 'DRAFT');
+define('ORDER_STATUS_PENDING', 'PENDING');
+define('ORDER_STATUS_CONFIRMED', 'CONFIRMED');
+define('ORDER_STATUS_COMPLETED', 'COMPLETED');
+define('ORDER_STATUS_CANCELLED', 'CANCELLED');
+
+// Invoice statuses
+define('INVOICE_STATUS_DRAFT', 'DRAFT');
+define('INVOICE_STATUS_SENT', 'SENT');
+define('INVOICE_STATUS_PARTIAL', 'PARTIAL');
+define('INVOICE_STATUS_PAID', 'PAID');
+define('INVOICE_STATUS_OVERDUE', 'OVERDUE');
+define('INVOICE_STATUS_CANCELLED', 'CANCELLED');
+
+// Payment statuses
+define('PAYMENT_STATUS_PENDING', 'PENDING');
+define('PAYMENT_STATUS_COMPLETED', 'COMPLETED');
+define('PAYMENT_STATUS_FAILED', 'FAILED');
+define('PAYMENT_STATUS_REFUNDED', 'REFUNDED');
+
+// Purchase statuses
+define('PURCHASE_STATUS_DRAFT', 'DRAFT');
+define('PURCHASE_STATUS_PENDING', 'PENDING');
+define('PURCHASE_STATUS_APPROVED', 'APPROVED');
+define('PURCHASE_STATUS_RECEIVED', 'RECEIVED');
+define('PURCHASE_STATUS_CANCELLED', 'CANCELLED');
+
+// Stock movement types
+define('STOCK_MOVEMENT_PURCHASE', 'PURCHASE');
+define('STOCK_MOVEMENT_SALE', 'SALE');
+define('STOCK_MOVEMENT_RETURN', 'RETURN');
+define('STOCK_MOVEMENT_ADJUSTMENT', 'ADJUSTMENT');
+define('STOCK_MOVEMENT_TRANSFER', 'TRANSFER');
+
+// User statuses
+define('USER_STATUS_ACTIVE', 'ACTIVE');
+define('USER_STATUS_INACTIVE', 'INACTIVE');
+define('USER_STATUS_SUSPENDED', 'SUSPENDED');
+
+// Roles
+define('ROLE_SUPERADMIN', 'superadmin');
+define('ROLE_ADMIN', 'admin');
+define('ROLE_MANAGER', 'manager');
+define('ROLE_ACCOUNTANT', 'accountant');
+define('ROLE_SALES', 'sales');
+define('ROLE_INVENTORY', 'inventory');
+define('ROLE_STAFF', 'staff');

@@ -4,3 +4,12 @@
 node_modules/
 .vscode/
 .idea/
+
+# Test artifacts
+cookies.txt
+/tmp/
+*.bak
+
+# Composer artifacts (backend has its own .gitignore for /vendor)
+backend/composer-setup.php
+backend/composer.phar

@@ -27,14 +27,18 @@ const MODULES_DEF = [
     icon:`<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#F5C411" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M12 8v8M8 12h8"/></svg>` },
 ];
 
+// Each tenant carries its Company Admin identity: adminEmail (the address
+// used both for sign-in and for reset-password emails), adminStatus,
+// lastSignInAt (ISO string or null if never), and pendingReset (populated
+// when the Super Admin generates a reset token from the Admins table).
 const SEED_TENANTS = [
-  { id:'TN-0042', name:'Shifo Pharmacy Group',    city:'Mogadishu', owner:'Ahmed Yusuf',    since:'May 2024', plan:'Enterprise', users:62,  invoice:'3,200', region:'SO-MG-1' },
-  { id:'TN-0117', name:'Jamhuriya University',    city:'Hargeisa',  owner:'Fadumo Ibrahim', since:'Oct 2023', plan:'Enterprise', users:214, invoice:'4,500', region:'SO-HL-1' },
-  { id:'TN-0208', name:'Bosaso Retail Co-op',     city:'Bosaso',    owner:'Yusuf Kahin',    since:'Feb 2025', plan:'Business',   users:34,  invoice:'1,100', region:'SO-BO-1' },
-  { id:'TN-0091', name:'Kismayo General Hospital',city:'Kismayo',   owner:'Sahra Ali',      since:'Mar 2024', plan:'Enterprise', users:118, invoice:'3,600', region:'SO-KI-1' },
-  { id:'TN-0155', name:'Baidoa Grand Hotel',      city:'Baidoa',    owner:'Omar Sharif',    since:'Nov 2024', plan:'Business',   users:22,  invoice:'850',   region:'SO-BA-1' },
-  { id:'TN-0173', name:'Halane School System',    city:'Mogadishu', owner:'Zeinab Warsame', since:'Jul 2025', plan:'Business',   users:47,  invoice:'1,300', region:'SO-MG-1' },
-  { id:'TN-0201', name:'Mogadishu Livestock Ltd', city:'Mogadishu', owner:'Bashir Mohamud', since:'Jan 2025', plan:'Starter',    users:9,   invoice:'320',   region:'SO-MG-1' },
+  { id:'TN-0042', name:'Shifo Pharmacy Group',    city:'Mogadishu', owner:'Ahmed Yusuf',    since:'May 2024', plan:'Enterprise', users:62,  invoice:'3,200', region:'SO-MG-1', adminEmail:'admin@shifo.so',          adminStatus:'active',    lastSignInAt:'2026-08-10T14:22:00', pendingReset:null },
+  { id:'TN-0117', name:'Jamhuriya University',    city:'Hargeisa',  owner:'Fadumo Ibrahim', since:'Oct 2023', plan:'Enterprise', users:214, invoice:'4,500', region:'SO-HL-1', adminEmail:'admin@jamhuriya.so',      adminStatus:'active',    lastSignInAt:'2026-08-09T09:15:00', pendingReset:null },
+  { id:'TN-0208', name:'Bosaso Retail Co-op',     city:'Bosaso',    owner:'Yusuf Kahin',    since:'Feb 2025', plan:'Business',   users:34,  invoice:'1,100', region:'SO-BO-1', adminEmail:'admin@bosasoretail.so',   adminStatus:'active',    lastSignInAt:'2026-08-09T18:40:00', pendingReset:null },
+  { id:'TN-0091', name:'Kismayo General Hospital',city:'Kismayo',   owner:'Sahra Ali',      since:'Mar 2024', plan:'Enterprise', users:118, invoice:'3,600', region:'SO-KI-1', adminEmail:'admin@kismayohospital.so',adminStatus:'suspended', lastSignInAt:'2026-08-08T11:03:00', pendingReset:null },
+  { id:'TN-0155', name:'Baidoa Grand Hotel',      city:'Baidoa',    owner:'Omar Sharif',    since:'Nov 2024', plan:'Business',   users:22,  invoice:'850',   region:'SO-BA-1', adminEmail:'admin@baidoagrand.so',    adminStatus:'active',    lastSignInAt:'2026-08-08T16:20:00', pendingReset:null },
+  { id:'TN-0173', name:'Halane School System',    city:'Mogadishu', owner:'Zeinab Warsame', since:'Jul 2025', plan:'Business',   users:47,  invoice:'1,300', region:'SO-MG-1', adminEmail:'admin@halane.so',         adminStatus:'active',    lastSignInAt:'2026-08-08T08:55:00', pendingReset:null },
+  { id:'TN-0201', name:'Mogadishu Livestock Ltd', city:'Mogadishu', owner:'Bashir Mohamud', since:'Jan 2025', plan:'Starter',    users:9,   invoice:'320',   region:'SO-MG-1', adminEmail:'admin@moglivestock.so',   adminStatus:'invited',   lastSignInAt:null,                  pendingReset:null },
 ];
 
 const SEED_LICENSES = {
@@ -69,6 +73,11 @@ const S = {
   overviewRange:      '30d',    // '30d' | 'quarter' | 'year' — time-range selector
   platformSearch:     '',       // header search box query
   platformNotifOpen:  false,    // notification bell dropdown
+
+  // Company Admins page — reset-password flow modal
+  //   step 'confirm' → shows admin details and delivery options
+  //   step 'sent'    → shows the generated reset token + copy-paste link
+  resetAdminModal: null,   // { tenantId, step, sendEmail, sendSMS, token, link }
 
   // Platform alerts — real state, editable. Icon/tone/desc drive rendering.
   platformAlerts: [
@@ -206,6 +215,25 @@ const html = (str) => { const t = document.createElement('div'); t.innerHTML = s
 
 function initials(name) {
   return (name||'').split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
+}
+
+/**
+ * "Today, 14:22" | "Yesterday" | "3 days ago" | "Never" (when null).
+ * Not locale-perfect — enough for the Admins table.
+ */
+function formatRelativeTime(iso) {
+  if (!iso) return 'Never';
+  const then = new Date(iso);
+  if (isNaN(then)) return String(iso);
+  const now  = new Date();
+  const startOfToday     = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfYesterday = new Date(startOfToday); startOfYesterday.setDate(startOfYesterday.getDate()-1);
+  const hh = String(then.getHours()).padStart(2,'0');
+  const mm = String(then.getMinutes()).padStart(2,'0');
+  if (then >= startOfToday)     return `Today, ${hh}:${mm}`;
+  if (then >= startOfYesterday) return 'Yesterday';
+  const days = Math.floor((startOfToday - then) / (24*3600*1000));
+  return `${days} day${days===1?'':'s'} ago`;
 }
 
 /**
@@ -374,6 +402,12 @@ function doSignIn() {
     if (pw === ca.tempPassword || pw === ca.posPassword) {
       S.currentCompany = ca.company;
       S.activeCompanyAdmin = ca;
+      // Reflect sign-in on the tenant row shown to the Super Admin.
+      const tRow = S.tenants.find(t => (t.adminEmail || '').toLowerCase() === email);
+      if (tRow) {
+        tRow.lastSignInAt = new Date().toISOString();
+        tRow.adminStatus  = 'active';
+      }
       S.view = 'workspace';
       S.loginError = false;
       render();
@@ -970,6 +1004,29 @@ function renderCompaniesTab() {
 
 // ---- ADMINS TAB ----
 function renderAdminsTab() {
+  // Real counts from state (was previously hardcoded).
+  const total     = S.tenants.length;
+  const active    = S.tenants.filter(t => t.adminStatus === 'active').length;
+  const invited   = S.tenants.filter(t => t.adminStatus === 'invited').length;
+  const suspended = S.tenants.filter(t => t.adminStatus === 'suspended').length;
+  const suspendedName = S.tenants.find(t => t.adminStatus === 'suspended')?.name || '—';
+
+  // Status pill config per state
+  const statusPill = {
+    active:    { cls:'pill-green', label:'● Active' },
+    suspended: { cls:'pill-red',   label:'● Suspended' },
+    invited:   { cls:'pill-amber', label:'● Invited' },
+  };
+
+  // Optional filter from the platform-wide header search
+  const q = (S.platformSearch || '').toLowerCase().trim();
+  const rows = q === ''
+    ? S.tenants
+    : S.tenants.filter(t =>
+        t.name.toLowerCase().includes(q) ||
+        t.owner.toLowerCase().includes(q) ||
+        (t.adminEmail || '').toLowerCase().includes(q));
+
   return `
     <div class="page-title-bar">
       <div>
@@ -983,36 +1040,123 @@ function renderAdminsTab() {
       </button>
     </div>
     <section class="admins-stat-grid">
-      <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Total admins</div><div class="kpi-value">${S.tenants.length}</div><div class="kpi-trend" style="color:#EFEAFB">One per company</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Active</div><div class="kpi-value" style="color:#0F7A3A">${Math.max(0,S.tenants.length-6)}</div><div class="kpi-trend">Signed in this week</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Invite sent</div><div class="kpi-value" style="color:#B45309">5</div><div class="kpi-trend">Pending first sign-in</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Suspended</div><div class="kpi-value" style="color:#B42318">1</div><div class="kpi-trend">Kismayo Hospital</div></div>
+      <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Total admins</div><div class="kpi-value">${total}</div><div class="kpi-trend" style="color:#EFEAFB">One per company</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Active</div><div class="kpi-value" style="color:#0F7A3A">${active}</div><div class="kpi-trend">Signed in recently</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Invited</div><div class="kpi-value" style="color:#B45309">${invited}</div><div class="kpi-trend">Pending first sign-in</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Suspended</div><div class="kpi-value" style="color:#B42318">${suspended}</div><div class="kpi-trend">${suspended ? suspendedName : 'None'}</div></div>
     </section>
     <section class="data-section">
       <div class="section-header-bar">
-        <h3 class="chart-title">All company admins</h3>
+        <h3 class="chart-title">All company admins${q ? ` <span style="font-size:12px;color:var(--text-muted);font-weight:500">— filter: "${q}"</span>` : ''}</h3>
       </div>
       <div class="overflow-x-auto">
         <table class="data-table" style="min-width:700px">
           <thead><tr><th>Admin</th><th>Company</th><th>Plan</th><th>Last sign-in</th><th>Status</th><th class="col-right">Actions</th></tr></thead>
           <tbody>
-            ${S.tenants.map((t,i)=>`<tr>
-              <td>
-                <div class="flex items-center gap-10">
-                  <div style="width:32px;height:32px;border-radius:50%;background:#2D1859;color:#F5C411;display:grid;place-items:center;font-weight:900;font-size:11px;flex-shrink:0">${initials(t.owner)}</div>
-                  <div><div style="font-weight:700">${t.owner}</div><div style="font-size:11px;color:var(--text-muted)">admin@${t.name.toLowerCase().replace(/\s+/,'')+'.so'}</div></div>
-                </div>
-              </td>
-              <td style="font-weight:600">${t.name}</td>
-              <td><span style="font-size:11px;font-weight:800;padding:3px 8px;border-radius:999px;background:#F5C41133;color:#8B5A00">${t.plan}</span></td>
-              <td style="color:var(--text-muted);font-size:12px">${i===0?'Today, 14:22':i<3?'Yesterday':'2 days ago'}</td>
-              <td><span class="pill ${i===3?'pill-red':'pill-green'}">${i===3?'● Suspended':'● Active'}</span></td>
-              <td class="col-right"><button class="btn btn-outline btn-xs">Reset password</button></td>
-            </tr>`).join('')}
+            ${rows.length === 0 ? `
+              <tr><td colspan="6" style="padding:24px;text-align:center;color:var(--text-muted);font-style:italic">No admins match "${q}".</td></tr>
+            ` : rows.map(t => {
+              const s = statusPill[t.adminStatus] || statusPill.active;
+              const pending = t.pendingReset ? ` <span title="Reset link generated" style="font-size:11px;color:var(--amber);margin-left:6px">↺ reset pending</span>` : '';
+              return `<tr>
+                <td>
+                  <div class="flex items-center gap-10">
+                    <div style="width:32px;height:32px;border-radius:50%;background:#2D1859;color:#F5C411;display:grid;place-items:center;font-weight:900;font-size:11px;flex-shrink:0">${initials(t.owner)}</div>
+                    <div>
+                      <div style="font-weight:700">${t.owner}</div>
+                      <div style="font-size:11px;color:var(--text-muted)">${t.adminEmail || '—'}</div>
+                    </div>
+                  </div>
+                </td>
+                <td style="font-weight:600">${t.name}${pending}</td>
+                <td><span style="font-size:11px;font-weight:800;padding:3px 8px;border-radius:999px;background:#F5C41133;color:#8B5A00">${t.plan}</span></td>
+                <td style="color:var(--text-muted);font-size:12px">${formatRelativeTime(t.lastSignInAt)}</td>
+                <td><span class="pill ${s.cls}">${s.label}</span></td>
+                <td class="col-right">
+                  <button class="btn btn-outline btn-xs" data-reset-admin="${t.id}">Reset password</button>
+                </td>
+              </tr>`;
+            }).join('')}
           </tbody>
         </table>
       </div>
     </section>
+
+    ${renderResetAdminModal()}
+  `;
+}
+
+/**
+ * Reset-password modal for the Company Admin listing.
+ * Two-step flow:
+ *   1. confirm  → show admin details + delivery-channel checkboxes
+ *   2. sent     → show the generated one-time reset link + a Copy button
+ */
+function renderResetAdminModal() {
+  const m = S.resetAdminModal;
+  if (!m) return '';
+  const t = S.tenants.find(x => x.id === m.tenantId);
+  if (!t) return '';
+
+  if (m.step === 'sent') {
+    return `
+      <div class="crud-overlay" data-modal-close>
+        <div class="crud-modal" style="max-width:520px" onclick="event.stopPropagation()">
+          <div class="crud-modal-header">
+            <h3>Reset link generated</h3>
+            <button class="crud-close-btn" data-modal-close>×</button>
+          </div>
+          <div class="crud-modal-body">
+            <div style="padding:14px;background:#DEF7EC;border:1px solid #86EFAC;border-radius:10px;margin-bottom:16px;font-size:13px;color:#065F46">
+              ✓ Sent to <b>${t.adminEmail}</b>${m.sendSMS ? ' and via SMS' : ''}. The admin has 60 minutes to use the link.
+            </div>
+            <label class="form-label">Reset link (share only if the admin didn't receive the email)</label>
+            <div style="display:flex;gap:8px;margin-top:4px">
+              <input class="form-input mono" id="reset-link-input" value="${m.link}" readonly onfocus="this.select()" style="font-size:12px"/>
+              <button class="btn btn-primary btn-sm" id="btn-copy-reset-link" style="flex-shrink:0">Copy</button>
+            </div>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:6px">Token: <span class="mono">${m.token}</span> · expires in 60 min</div>
+          </div>
+          <div class="crud-modal-footer">
+            <button class="btn btn-primary" data-modal-close>Done</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // step: 'confirm'
+  return `
+    <div class="crud-overlay" data-modal-close>
+      <div class="crud-modal" style="max-width:480px" onclick="event.stopPropagation()">
+        <div class="crud-modal-header">
+          <h3>Reset admin password</h3>
+          <button class="crud-close-btn" data-modal-close>×</button>
+        </div>
+        <div class="crud-modal-body">
+          <div style="display:flex;align-items:center;gap:12px;padding:14px;background:var(--gray-50);border-radius:10px;margin-bottom:16px">
+            <div style="width:44px;height:44px;border-radius:50%;background:#2D1859;color:#F5C411;display:grid;place-items:center;font-weight:900;font-size:14px">${initials(t.owner)}</div>
+            <div>
+              <div style="font-weight:800;font-size:15px">${t.owner}</div>
+              <div style="font-size:12px;color:var(--text-muted)">${t.adminEmail} · ${t.name}</div>
+            </div>
+          </div>
+          <div style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:16px">
+            A one-time reset link will be generated. The admin can use it to set a new password (valid for 60 minutes).
+            The old password stops working the moment they open the link.
+          </div>
+          <div class="form-group">
+            <label class="form-label">Delivery channels</label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;padding:6px 0"><input type="checkbox" id="reset-email" checked/> Send by email <span style="color:var(--text-muted)">(${t.adminEmail})</span></label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;padding:6px 0"><input type="checkbox" id="reset-sms"/> Send by SMS (Hormuud)</label>
+          </div>
+        </div>
+        <div class="crud-modal-footer">
+          <button class="btn btn-ghost" data-modal-close>Cancel</button>
+          <button class="btn btn-primary" id="btn-send-reset">Generate &amp; send reset link</button>
+        </div>
+      </div>
+    </div>
   `;
 }
 
@@ -1356,6 +1500,66 @@ function wireTabEvents(wrap) {
       if (a) a.status = 'resolved';
       render();
     });
+  });
+
+  // Company Admins tab: Reset password buttons + Invite button
+  wrap.querySelectorAll('[data-reset-admin]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S.resetAdminModal = {
+        tenantId: btn.dataset.resetAdmin,
+        step: 'confirm',
+        sendEmail: true,
+        sendSMS: false,
+        token: null,
+        link: null,
+      };
+      render();
+    });
+  });
+  wrap.querySelector('#btn-invite-admin')?.addEventListener('click', () => {
+    // Opens the existing "Add company" flow — creating a company auto-provisions
+    // its Company Admin with a temp password (see the tenant-create modal).
+    S.tenantModalMode = 'add';
+    S.tenantForm = { name:'', city:'', plan:'Business', adminName:'', adminEmail:'' };
+    S.superTab = 'companies';
+    render();
+    setTimeout(() => document.getElementById('btn-add-company')?.click(), 50);
+  });
+
+  // Reset-password modal: close, generate, copy
+  wrap.querySelectorAll('[data-modal-close]').forEach(el => {
+    el.addEventListener('click', (e) => {
+      // Only close when the click actually landed on the close/backdrop target,
+      // not when it bubbled up from a nested click.
+      if (e.target === el) { S.resetAdminModal = null; render(); }
+    });
+  });
+  wrap.querySelector('#btn-send-reset')?.addEventListener('click', () => {
+    const m = S.resetAdminModal;
+    if (!m) return;
+    m.sendEmail = document.getElementById('reset-email')?.checked ?? true;
+    m.sendSMS   = document.getElementById('reset-sms')?.checked ?? false;
+    if (!m.sendEmail && !m.sendSMS) { alert('Select at least one delivery channel.'); return; }
+    // Generate a random one-time token — real backend would sign and persist it.
+    const token = Array.from(crypto.getRandomValues(new Uint8Array(24)))
+      .map(b => b.toString(16).padStart(2, '0')).join('');
+    m.token = token;
+    m.link  = `${location.origin}/app.html?reset=${token}`;
+    m.step  = 'sent';
+    // Mark the tenant as having a pending reset for the row indicator
+    const t = S.tenants.find(x => x.id === m.tenantId);
+    if (t) t.pendingReset = { token, createdAt: new Date().toISOString(), expiresInMin: 60 };
+    render();
+  });
+  wrap.querySelector('#btn-copy-reset-link')?.addEventListener('click', () => {
+    const input = document.getElementById('reset-link-input');
+    if (!input) return;
+    input.select();
+    navigator.clipboard.writeText(input.value).catch(() => document.execCommand('copy'));
+    const btn = document.getElementById('btn-copy-reset-link');
+    const orig = btn.textContent;
+    btn.textContent = '✓ Copied';
+    setTimeout(() => { btn.textContent = orig; }, 1500);
   });
 
   // Platform Admins: form field state + create

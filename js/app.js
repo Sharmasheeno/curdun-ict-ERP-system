@@ -218,6 +218,35 @@ function initials(name) {
 }
 
 /**
+ * Small fetch wrapper for the /api/v1/* backend.
+ * - Always sends/receives JSON.
+ * - Includes credentials so the PHPSESSID cookie authenticates the request.
+ * - Throws an Error with the server's message + attaches .status on failure,
+ *   so callers can show a real error to the user.
+ * Usage:
+ *   await api('/companies', { method:'POST', body:{ name, city } });
+ */
+async function api(path, opts = {}) {
+  const url = path.startsWith('http') ? path : `/api/v1${path}`;
+  const res = await fetch(url, {
+    method:      opts.method || 'GET',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+    body: opts.body != null ? JSON.stringify(opts.body) : undefined,
+  });
+  let payload = null;
+  try { payload = await res.json(); } catch (_) {}
+  if (!res.ok || (payload && payload.success === false)) {
+    const msg = (payload && payload.message) || `HTTP ${res.status}`;
+    const err = new Error(msg);
+    err.status = res.status;
+    err.payload = payload;
+    throw err;
+  }
+  return payload && Object.prototype.hasOwnProperty.call(payload, 'data') ? payload.data : payload;
+}
+
+/**
  * "Today, 14:22" | "Yesterday" | "3 days ago" | "Never" (when null).
  * Not locale-perfect — enough for the Admins table.
  */
@@ -1534,22 +1563,37 @@ function wireTabEvents(wrap) {
       if (e.target === el) { S.resetAdminModal = null; render(); }
     });
   });
-  wrap.querySelector('#btn-send-reset')?.addEventListener('click', () => {
+  wrap.querySelector('#btn-send-reset')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
     const m = S.resetAdminModal;
     if (!m) return;
     m.sendEmail = document.getElementById('reset-email')?.checked ?? true;
     m.sendSMS   = document.getElementById('reset-sms')?.checked ?? false;
     if (!m.sendEmail && !m.sendSMS) { alert('Select at least one delivery channel.'); return; }
-    // Generate a random one-time token — real backend would sign and persist it.
-    const token = Array.from(crypto.getRandomValues(new Uint8Array(24)))
-      .map(b => b.toString(16).padStart(2, '0')).join('');
-    m.token = token;
-    m.link  = `${location.origin}/app.html?reset=${token}`;
-    m.step  = 'sent';
-    // Mark the tenant as having a pending reset for the row indicator
+
     const t = S.tenants.find(x => x.id === m.tenantId);
-    if (t) t.pendingReset = { token, createdAt: new Date().toISOString(), expiresInMin: 60 };
-    render();
+    if (!t || !t.adminEmail) { alert('No admin email on file for this tenant.'); return; }
+
+    btn.disabled = true;
+    const origText = btn.textContent;
+    btn.textContent = 'Generating…';
+
+    try {
+      // Backend generates the token AND stores it in the password_resets table.
+      const data = await api('/auth/admin-reset', {
+        method: 'POST',
+        body:   { email: t.adminEmail },
+      });
+      m.token = data.token;
+      m.link  = `${location.origin}/app.html?reset=${data.token}`;
+      m.step  = 'sent';
+      t.pendingReset = { token: data.token, createdAt: new Date().toISOString(), expiresInMin: 60 };
+      render();
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = origText;
+      alert(`Failed to generate reset link: ${err.message}`);
+    }
   });
   wrap.querySelector('#btn-copy-reset-link')?.addEventListener('click', () => {
     const input = document.getElementById('reset-link-input');
@@ -1744,30 +1788,97 @@ function renderTenantModal() {
     modal.querySelector('#btn-copy-pw').textContent = 'Copied!';
     setTimeout(()=>{ const b=modal.querySelector('#btn-copy-pw'); if(b) b.textContent='Copy'; },2000);
   });
-  modal.querySelector('#btn-save-tenant').addEventListener('click', () => {
+  modal.querySelector('#btn-save-tenant').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
     const name  = modal.querySelector('#mf-name').value.trim();
     const owner = modal.querySelector('#mf-owner').value.trim();
     if (!name || !owner) { alert('Please fill in Company name and Owner name.'); return; }
-    const newT = {
-      ...S.tenantForm,
-      name, owner,
-      city:    modal.querySelector('#mf-city').value,
-      plan:    modal.querySelector('#mf-plan').value,
-      region:  modal.querySelector('#mf-region').value,
-      users:   parseInt(modal.querySelector('#mf-users').value)||0,
-      invoice: modal.querySelector('#mf-invoice').value,
-      adminEmail: modal.querySelector('#mf-admin-email').value,
-      adminPhone: modal.querySelector('#mf-admin-phone').value,
-      adminPassword: modal.querySelector('#mf-admin-pw').value,
+
+    const adminEmail = modal.querySelector('#mf-admin-email').value.trim();
+    const adminPhone = modal.querySelector('#mf-admin-phone').value.trim();
+    const adminPw    = modal.querySelector('#mf-admin-pw').value;
+    const city   = modal.querySelector('#mf-city').value;
+    const plan   = modal.querySelector('#mf-plan').value;
+    const region = modal.querySelector('#mf-region').value;
+    const users  = parseInt(modal.querySelector('#mf-users').value) || 0;
+    const invoice= modal.querySelector('#mf-invoice').value;
+
+    // Show any inline error message on the modal footer.
+    const showError = (msg) => {
+      let err = modal.querySelector('.modal-error');
+      if (!err) {
+        err = document.createElement('div');
+        err.className = 'modal-error';
+        err.style.cssText = 'padding:10px 14px;background:#FEF0EE;border:1px solid #FDA29B;color:#B42318;font-size:12.5px;font-weight:700;border-radius:8px;margin:8px 20px 0';
+        modal.querySelector('.modal-footer').parentNode.insertBefore(err, modal.querySelector('.modal-footer'));
+      }
+      err.textContent = msg;
     };
-    if (S.tenantModalMode === 'create') {
-      S.tenants.unshift(newT);
-      S.licenses[newT.id] = { pharmacy:false, financials:true, crm:false, hr:false, pos:false, university:false, hotel:false, hospital:false };
-    } else {
-      const idx = S.tenants.findIndex(t=>t.id===newT.id);
-      if (idx>=0) S.tenants[idx] = newT;
+
+    btn.disabled = true;
+    const origText = btn.textContent;
+    btn.textContent = S.tenantModalMode === 'create' ? 'Creating…' : 'Saving…';
+
+    try {
+      if (S.tenantModalMode === 'create') {
+        // 1) Create the company in the backend DB
+        const company = await api('/companies', {
+          method: 'POST',
+          body: { name, phone: adminPhone, address: '', city, country: 'Somalia', status: 'active' },
+        });
+
+        // 2) Auto-create the Company Admin user tied to the new company_id
+        if (adminEmail) {
+          try {
+            await api('/users', {
+              method: 'POST',
+              body: {
+                name: owner,
+                email: adminEmail,
+                phone: adminPhone,
+                password: adminPw,
+                company_id: company.id,
+                status: 'active',
+              },
+            });
+          } catch (userErr) {
+            // Company created but user create failed — log it visibly rather than silently.
+            console.warn('User create failed:', userErr);
+            showError(`Company saved but admin user failed: ${userErr.message}`);
+          }
+        }
+
+        // 3) Reflect in local S.tenants so the table updates immediately
+        S.tenants.unshift({
+          id: 'TN-' + String(company.id).padStart(4, '0'),
+          companyId: company.id,
+          name, city, owner, plan, users, invoice: invoice || '0', region,
+          since: new Date().toLocaleDateString('en-US', { month:'short', year:'numeric' }),
+          adminEmail, adminPhone, adminStatus: 'invited', lastSignInAt: null,
+          pendingReset: null,
+        });
+        S.licenses[S.tenants[0].id] = { pharmacy:false, financials:true, crm:false, hr:false, pos:false, university:false, hotel:false, hospital:false };
+      } else {
+        // EDIT — send the changed fields to PUT /companies/{id}
+        const companyId = S.tenantForm.companyId;
+        if (companyId) {
+          await api(`/companies/${companyId}`, {
+            method: 'PUT',
+            body: { name, phone: adminPhone, city, country: 'Somalia', status: 'active' },
+          });
+        }
+        const idx = S.tenants.findIndex(t => t.id === S.tenantForm.id);
+        if (idx >= 0) S.tenants[idx] = { ...S.tenants[idx], name, city, owner, plan, users, invoice, region, adminEmail, adminPhone };
+      }
+
+      modal.remove();
+      S.tenantModalMode = null;
+      render();
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = origText;
+      showError(err.message || 'Something went wrong. Try again.');
     }
-    modal.remove(); S.tenantModalMode=null; render();
   });
 }
 
@@ -2007,9 +2118,15 @@ function renderWorkspace() {
   const div = document.createElement('div');
   div.style.minHeight = '100vh';
 
-  // Build module cards for Shifo's licenses (use TN-0042)
-  const licenses = S.licenses['TN-0042'] || {};
-  const modules = MODULES_DEF.map(m => ({ ...m, on: !!licenses[m.key] }));
+  // Only Retail POS is live. Every other module is Coming Soon.
+  const LIVE_MODULE = 'pos';
+
+  const modules = MODULES_DEF.map(m => ({
+    ...m,
+    live: m.key === LIVE_MODULE,
+  }));
+
+  const modEmoji = { pharmacy:'\ud83d\udc8a', financials:'\ud83d\udcb0', crm:'\ud83d\udcca', hr:'\ud83d\udc65', pos:'\ud83d\uded2', university:'\ud83c\udf93', hotel:'\ud83c\udfe8', hospital:'\ud83c\udfe5' };
 
   div.innerHTML = `
     <header class="workspace-header">
@@ -2027,40 +2144,78 @@ function renderWorkspace() {
         <button class="btn btn-outline btn-sm" id="btn-ws-logout" style="color:#FFF;border-color:rgba(255,255,255,0.3);background:rgba(255,255,255,0.1)">Sign out</button>
       </div>
     </header>
+
     <div style="padding:40px;background:var(--bg-page);min-height:calc(100vh - 74px)">
       <div style="max-width:1200px;margin:0 auto">
-        <div style="margin-bottom:28px">
-          <div class="label-md" style="color:#F5C411;background:#2D1859;display:inline-block;padding:4px 10px;border-radius:6px;margin-bottom:8px">Cor Curdun</div>
+
+        <!-- Header -->
+        <div style="margin-bottom:32px">
+          <div class="label-md" style="color:#F5C411;background:#2D1859;display:inline-block;padding:4px 10px;border-radius:6px;margin-bottom:10px">Cor Curdun</div>
           <h1 style="font-size:26px;font-weight:900;letter-spacing:-0.5px">Your systems</h1>
-          <div style="font-size:14px;color:var(--text-muted);margin-top:4px">${modules.filter(m=>m.on).length} active modules · click Launch to open</div>
+          <div style="font-size:14px;color:var(--text-muted);margin-top:4px">
+            <span class="pill pill-green" style="margin-right:8px">&#9679; 1 module live</span>
+            More modules launching soon — stay tuned.
+          </div>
         </div>
+
+        <!-- Module grid -->
         <div class="workspace-modules-grid">
-          ${modules.map(m=>`
-            <div class="ws-module-card ${m.on?'active':'inactive'}">
-              <span class="ws-module-badge ${m.on?'active':'inactive'}">● ${m.on?'Ready':'Locked'}</span>
-              <div style="font-size:28px;margin-top:8px">${{pharmacy:'💊',financials:'💰',crm:'📊',hr:'👥',pos:'🛒',university:'🎓',hotel:'🏨',hospital:'🏥'}[m.key]||'⚙️'}</div>
-              <div class="ws-module-title ${m.on?'active':'inactive'}">${m.name}</div>
-              <div class="ws-module-desc ${m.on?'active':'inactive'}">${m.desc}</div>
-              <div class="ws-module-foot ${m.on?'active':'inactive'}">${m.on?(m.users+' users · '+(m.branches||'ready')):'Not on your plan'}</div>
-              <button class="ws-launch-btn ${m.on?'active':'inactive'}" data-launch="${m.key}">
-                ${m.on?`Launch ${m.name} →`:'Request access'}
-              </button>
+          ${modules.map(m => `
+            <div class="ws-module-card ${m.live ? 'active' : 'ws-cs-card'}">
+
+              ${m.live ? `
+                <!-- LIVE badge -->
+                <span class="ws-module-badge active" style="background:rgba(34,197,94,0.15);color:#0F7A3A;border:1px solid rgba(34,197,94,0.3)">&#9679;&nbsp;Live</span>
+              ` : `
+                <!-- COMING SOON badge -->
+                <span class="ws-cs-badge">
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                  Coming Soon
+                </span>
+              `}
+
+              <div style="font-size:32px;margin-top:12px;margin-bottom:4px">${modEmoji[m.key] || '\u2699\ufe0f'}</div>
+              <div class="ws-module-title ${m.live ? 'active' : 'inactive'}">${m.name}</div>
+              <div class="ws-module-desc ${m.live ? 'active' : 'inactive'}">${m.desc}</div>
+              <div class="ws-module-foot ${m.live ? 'active' : 'inactive'}">
+                ${m.live ? (m.users + ' users \u00b7 ' + (m.branches || 'ready')) : 'In development'}
+              </div>
+
+              ${m.live ? `
+                <button class="ws-launch-btn active" data-launch="${m.key}">Launch ${m.name} \u2192</button>
+              ` : `
+                <button class="ws-cs-btn" disabled>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                  Coming soon
+                </button>
+              `}
             </div>
           `).join('')}
         </div>
+
+        <!-- Roadmap note -->
+        <div class="ws-roadmap-note">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span>Pharmacy, Hospital, University, Hotel &amp; Booking, and Finance modules are actively in development and will be released in upcoming updates. Contact <strong>support@curdun.so</strong> to join the early access list.</span>
+        </div>
+
       </div>
     </div>
   `;
 
-  div.querySelector('#btn-ws-logout').addEventListener('click', ()=>{ S.view='login'; render(); });
+  div.querySelector('#btn-ws-logout').addEventListener('click', () => { S.view = 'login'; render(); });
+
+  // Only the POS launch button does anything
   div.querySelectorAll('[data-launch]').forEach(btn => {
-    btn.addEventListener('click', ()=>{
+    btn.addEventListener('click', () => {
       const key = btn.dataset.launch;
-      const mod = modules.find(m=>m.key===key);
-      if (!mod || !mod.on) return;
-      if (key==='pharmacy') { S.view='pharmacy'; S.pharmTab='dash'; render(); return; }
-      if (key==='pos') { S.view='pos'; S.posTab='dash'; S.posCart=[]; S.posReceiptVisible=false; render(); return; }
-      alert(mod.name+' module — full dashboard coming soon!');
+      if (key === 'pos') {
+        S.view = 'pos';
+        S.posTab = 'dash';
+        S.posCart = [];
+        S.posReceiptVisible = false;
+        render();
+      }
     });
   });
 

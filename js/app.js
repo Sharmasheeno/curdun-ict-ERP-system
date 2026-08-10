@@ -63,7 +63,19 @@ const SEED_INVOICES = [
 // ============================================================
 const S = {
   view: 'login',           // login | firstlogin | super | workspace | pharmacy | pos
-  superTab: 'overview',    // overview | companies | admins | modules | infra | billing | audit
+  superTab: 'overview',    // overview | companies | admins | platform | modules | infra | billing | audit
+
+  // Super Admin Overview interactivity
+  overviewRange:      '30d',    // '30d' | 'quarter' | 'year' — time-range selector
+  platformSearch:     '',       // header search box query
+  platformNotifOpen:  false,    // notification bell dropdown
+
+  // Platform alerts — real state, editable. Icon/tone/desc drive rendering.
+  platformAlerts: [
+    { id:'a1', severity:'high',   module:'HR & Payroll',    subject:'Kismayo Hospital', desc:'Security patch pending', when:'3h ago',  status:'open' },
+    { id:'a2', severity:'medium', module:'Retail POS v3.0', subject:'Rollout pending',  desc:'44 tenants awaiting upgrade', when:'today',  status:'open' },
+    { id:'a3', severity:'info',   module:'Billing',         subject:'Invoice overdue',  desc:'$320 · 25 days late', when:'25d',    status:'open' },
+  ],
   pharmTab: 'dash',        // dash | sales | inventory | rx | users | branches | settings
   posTab: 'dash',          // dash | checkout | products | customers | transactions | staff | settings
 
@@ -553,25 +565,101 @@ function renderTopBar() {
       <span class="current">${S.superTab}</span>
     </div>
     <div class="ml-auto flex items-center gap-12">
-      <div class="topbar-search">
+      <label class="topbar-search" style="cursor:text">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6B6484" stroke-width="2">
           <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>
         </svg>
-        <span>Search tenants, modules, logs…</span>
-        <span class="kbd">⌘K</span>
-      </div>
+        <input id="platform-search" type="text" placeholder="Search tenants, modules, logs…"
+               value="${S.platformSearch || ''}"
+               style="flex:1;border:none;outline:none;background:transparent;font-size:12px;color:var(--text-primary);min-width:180px"/>
+      </label>
       <div class="topbar-status">
         <span style="width:7px;height:7px;border-radius:50%;background:#22C55E;display:inline-block"></span>
         Production · SO-MG-1
       </div>
-      <button class="topbar-notif">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2D1859" stroke-width="1.8" style="display:block;margin:auto">
-          <path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
-        </svg>
-        <span class="topbar-notif-dot"></span>
-      </button>
+      <div style="position:relative">
+        <button class="topbar-notif" id="btn-platform-notif" title="Alerts &amp; incidents">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2D1859" stroke-width="1.8" style="display:block;margin:auto">
+            <path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
+          </svg>
+          ${S.platformAlerts.some(a => a.status === 'open') ? '<span class="topbar-notif-dot"></span>' : ''}
+        </button>
+        ${S.platformNotifOpen ? (() => {
+          const open = S.platformAlerts.filter(a => a.status === 'open');
+          return `
+            <div id="platform-notif-panel" style="position:absolute;top:calc(100% + 8px);right:0;width:320px;background:#FFF;border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,0.12);z-index:50;overflow:hidden">
+              <div style="padding:12px 14px;border-bottom:1px solid var(--border);font-weight:800;font-size:13px;display:flex;justify-content:space-between;align-items:center">
+                <span>Alerts &amp; incidents</span>
+                <span style="font-size:11px;color:var(--text-muted)">${open.length} open</span>
+              </div>
+              ${open.length === 0
+                ? '<div style="padding:20px;text-align:center;font-size:12px;color:var(--text-muted)">✓ No open incidents</div>'
+                : open.map(a => `
+                    <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:12px">
+                      <div style="font-weight:700;color:var(--text-primary)">${a.module} · ${a.subject}</div>
+                      <div style="color:var(--text-muted);margin-top:2px">${a.desc}</div>
+                      <div style="color:var(--text-muted);font-family:var(--font-mono);font-size:10px;margin-top:2px">${a.when}</div>
+                    </div>
+                  `).join('')}
+              <div style="padding:8px 14px;border-top:1px solid var(--border);background:var(--gray-50)">
+                <button id="btn-notif-goto" style="border:none;background:none;font-size:12px;font-weight:700;color:var(--purple-800);cursor:pointer;padding:0">Open Overview →</button>
+              </div>
+            </div>
+          `;
+        })() : ''}
+      </div>
     </div>
   `;
+
+  // Wire header interactivity (search + notification bell)
+  const searchInput = bar.querySelector('#platform-search');
+  if (searchInput) {
+    searchInput.addEventListener('input', e => {
+      S.platformSearch = e.target.value;
+      // Only auto-jump to Companies while typing so the search actually filters something.
+      if (S.superTab !== 'companies' && e.target.value.trim() !== '') {
+        S.superTab = 'companies';
+      }
+      render();
+      // Restore focus + caret after re-render
+      setTimeout(() => {
+        const el = document.getElementById('platform-search');
+        if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+      }, 0);
+    });
+  }
+  const notifBtn = bar.querySelector('#btn-platform-notif');
+  if (notifBtn) {
+    notifBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      S.platformNotifOpen = !S.platformNotifOpen;
+      render();
+    });
+  }
+  // "Open Overview" jump inside the dropdown
+  const gotoBtn = bar.querySelector('#btn-notif-goto');
+  if (gotoBtn) {
+    gotoBtn.addEventListener('click', () => {
+      S.superTab = 'overview';
+      S.platformNotifOpen = false;
+      render();
+    });
+  }
+  // Click-away closes the notification panel
+  if (S.platformNotifOpen && !window.__notifClickAwayBound) {
+    window.__notifClickAwayBound = true;
+    document.addEventListener('click', (e) => {
+      if (!S.platformNotifOpen) return;
+      const panel = document.getElementById('platform-notif-panel');
+      const btn   = document.getElementById('btn-platform-notif');
+      if (!panel) return;
+      if (!panel.contains(e.target) && btn && !btn.contains(e.target)) {
+        S.platformNotifOpen = false;
+        render();
+      }
+    });
+  }
+
   return bar;
 }
 
@@ -603,9 +691,21 @@ function renderOverviewTab() {
     return { name:m.name, count, pct };
   });
 
+  // ---- Live server-metric jitter (Server Utilization card below) ----
   const liveCpu = 58 + Math.round(Math.sin(S.liveTick/3)*8);
   const liveMem = 68 + Math.round(Math.cos(S.liveTick/4)*6);
   const liveReq = (42180 + Math.round(Math.sin(S.liveTick/2)*3400)).toLocaleString();
+
+  // ---- Dynamic KPIs, computed from real state ----
+  const totalMRR = S.tenants.reduce((sum, t) => sum + parseInt(String(t.invoice).replace(/,/g, ''), 10) || 0, 0);
+  const modulesLicensedAtLeastOnce = MODULES_DEF.filter(m =>
+    S.tenants.some(t => (S.licenses[t.id] || {})[m.key])
+  ).length;
+  const openAlerts = S.platformAlerts.filter(a => a.status === 'open');
+
+  // Range-specific labels for the KPI trend line + chart caption.
+  const rangeLabel = { '30d':'last 30d', 'quarter':'last quarter', 'year':'last year' }[S.overviewRange] || 'last 30d';
+  const chartRangeSub = { '30d':'Last 7 months', 'quarter':'Last 4 quarters', 'year':'Last 3 years' }[S.overviewRange] || 'Last 7 months';
 
   return `
     <section class="flex justify-between items-center gap-20" style="flex-wrap:wrap">
@@ -615,17 +715,33 @@ function renderOverviewTab() {
         <div style="font-size:13px;color:var(--text-muted)">Every tenant, every module across Somalia — at a glance.</div>
       </div>
       <div class="time-range">
-        <button class="time-btn active">30 days</button>
-        <button class="time-btn">Quarter</button>
-        <button class="time-btn">Year</button>
+        <button class="time-btn${S.overviewRange==='30d'?' active':''}"    data-range="30d">30 days</button>
+        <button class="time-btn${S.overviewRange==='quarter'?' active':''}" data-range="quarter">Quarter</button>
+        <button class="time-btn${S.overviewRange==='year'?' active':''}"    data-range="year">Year</button>
       </div>
     </section>
 
     <section class="kpi-grid">
-      <div class="kpi-card dark"><div class="kpi-eyebrow">Companies</div><div class="kpi-value">${S.tenants.length}</div><div class="kpi-trend">▲ 12 · last 30d</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Monthly recurring</div><div class="kpi-value">$75,000</div><div class="kpi-trend trend-up">▲ 8.4% MoM</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Modules deployed</div><div class="kpi-value">8<span style="font-size:14px;color:var(--text-muted);font-weight:500"> / 8</span></div><div class="kpi-trend">All licensed at least once</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Platform uptime</div><div class="kpi-value">99.96%</div><div class="kpi-trend trend-warn">1 incident open</div></div>
+      <div class="kpi-card dark">
+        <div class="kpi-eyebrow">Companies</div>
+        <div class="kpi-value">${S.tenants.length}</div>
+        <div class="kpi-trend">${S.tenants.length} active · ${rangeLabel}</div>
+      </div>
+      <div class="kpi-card light">
+        <div class="kpi-eyebrow">Monthly recurring</div>
+        <div class="kpi-value">$${totalMRR.toLocaleString()}</div>
+        <div class="kpi-trend trend-up">Across ${S.tenants.length} tenant${S.tenants.length===1?'':'s'}</div>
+      </div>
+      <div class="kpi-card light">
+        <div class="kpi-eyebrow">Modules deployed</div>
+        <div class="kpi-value">${modulesLicensedAtLeastOnce}<span style="font-size:14px;color:var(--text-muted);font-weight:500"> / ${MODULES_DEF.length}</span></div>
+        <div class="kpi-trend">${modulesLicensedAtLeastOnce===MODULES_DEF.length?'All licensed at least once':(MODULES_DEF.length-modulesLicensedAtLeastOnce)+' with no tenants yet'}</div>
+      </div>
+      <div class="kpi-card light">
+        <div class="kpi-eyebrow">Platform uptime</div>
+        <div class="kpi-value">99.96%</div>
+        <div class="kpi-trend ${openAlerts.length ? 'trend-warn' : 'trend-up'}">${openAlerts.length} incident${openAlerts.length===1?'':'s'} open</div>
+      </div>
     </section>
 
     <section style="display:grid;grid-template-columns:2fr minmax(0,1fr);gap:16px">
@@ -649,20 +765,34 @@ function renderOverviewTab() {
       <div class="chart-card flex-col gap-12">
         <div class="flex justify-between items-center">
           <h3 class="chart-title">Alerts & incidents</h3>
-          <span class="pill pill-amber">3 OPEN</span>
+          <span class="pill ${openAlerts.length ? 'pill-amber' : 'pill-green'}">${openAlerts.length} OPEN</span>
         </div>
-        <div class="alert-card-red">
-          <div class="alert-icon" style="background:#B42318;color:#FFF"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M10.3 3.86l-8.1 14A2 2 0 0 0 3.94 21h16.12a2 2 0 0 0 1.75-3.14l-8.1-14a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg></div>
-          <div><div class="alert-title">HR & Payroll · Kismayo Hospital</div><div class="alert-desc">Security patch pending · 3h ago</div></div>
-        </div>
-        <div class="alert-card-amber">
-          <div class="alert-icon" style="background:#F5C411;color:#2D1859"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg></div>
-          <div><div class="alert-title">Retail POS v3.0 pending</div><div class="alert-desc">44 tenants awaiting upgrade</div></div>
-        </div>
-        <div class="alert-card-info">
-          <div class="alert-icon" style="background:#2D1859;color:#F5C411"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/></svg></div>
-          <div><div class="alert-title">Invoice overdue · Lagos Trade</div><div class="alert-desc">$320 · 25 days late</div></div>
-        </div>
+        ${openAlerts.length === 0 ? `
+          <div class="alert-card-info" style="justify-content:center">
+            <div style="text-align:center;padding:12px 0;color:var(--text-muted);font-size:13px">✓ No open incidents</div>
+          </div>
+        ` : openAlerts.map(a => {
+          const iconSvg = a.severity === 'high'
+            ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M10.3 3.86l-8.1 14A2 2 0 0 0 3.94 21h16.12a2 2 0 0 0 1.75-3.14l-8.1-14a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>'
+            : a.severity === 'medium'
+              ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>'
+              : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/></svg>';
+          const cardClass = a.severity === 'high' ? 'alert-card-red' : a.severity === 'medium' ? 'alert-card-amber' : 'alert-card-info';
+          const iconStyle = a.severity === 'high'
+            ? 'background:#B42318;color:#FFF'
+            : a.severity === 'medium'
+              ? 'background:#F5C411;color:#2D1859'
+              : 'background:#2D1859;color:#F5C411';
+          return `
+            <div class="${cardClass}" data-alert-id="${a.id}" style="cursor:pointer" title="Click to resolve">
+              <div class="alert-icon" style="${iconStyle}">${iconSvg}</div>
+              <div style="flex:1;min-width:0">
+                <div class="alert-title">${a.module} · ${a.subject}</div>
+                <div class="alert-desc">${a.desc} · ${a.when}</div>
+              </div>
+            </div>
+          `;
+        }).join('')}
       </div>
     </section>
 
@@ -738,12 +868,23 @@ function renderCompaniesTab() {
     return { ...m, on };
   });
 
+  // Filter tenants by the platform-wide search query (case-insensitive across
+  // name, city, id, owner). Empty query returns everyone.
+  const q = (S.platformSearch || '').toLowerCase().trim();
+  const filteredTenants = q === ''
+    ? S.tenants
+    : S.tenants.filter(t =>
+        t.name.toLowerCase().includes(q) ||
+        t.city.toLowerCase().includes(q) ||
+        t.id.toLowerCase().includes(q) ||
+        (t.owner || '').toLowerCase().includes(q));
+
   return `
     <section class="data-section" id="companies-table-section">
       <div class="section-header-bar">
-        <div><div class="section-eyebrow">Tenants</div><h2 class="section-h2">Companies</h2></div>
+        <div><div class="section-eyebrow">Tenants</div><h2 class="section-h2">Companies${q ? ` <span style="font-size:12px;color:var(--text-muted);font-weight:500">— filter: "${q}"</span>` : ''}</h2></div>
         <div class="ml-auto flex items-center gap-8">
-          <button class="filter-pill active" style="border:none;background:#2D1859;color:#FFF">All · ${S.tenants.length}</button>
+          <button class="filter-pill active" style="border:none;background:#2D1859;color:#FFF">All · ${filteredTenants.length}</button>
           <button class="filter-pill">Enterprise</button>
           <button class="filter-pill">Business</button>
           <button class="filter-pill">Starter</button>
@@ -754,7 +895,9 @@ function renderCompaniesTab() {
         <table class="data-table" style="min-width:820px">
           <thead><tr><th>Company</th><th>Plan</th><th>Modules</th><th>Users</th><th>Next payment</th><th>Region</th><th class="col-right">Actions</th></tr></thead>
           <tbody>
-            ${S.tenants.map(t=>`
+            ${filteredTenants.length === 0 ? `
+              <tr><td colspan="7" style="padding:24px;text-align:center;color:var(--text-muted);font-style:italic">No companies match "${q}".</td></tr>
+            ` : filteredTenants.map(t=>`
               <tr>
                 <td style="cursor:pointer" data-select="${t.id}">
                   <div class="flex items-center gap-10">
@@ -1066,10 +1209,18 @@ function renderBillingTab() {
     </div>
 
     <section class="kpi-grid">
-      <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">MRR</div><div class="kpi-value">$75,000</div><div class="kpi-trend trend-up" style="color:#EFEAFB">▲ 8.4% MoM</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">ARR</div><div class="kpi-value">$900K</div><div class="kpi-trend trend-up">▲ projected</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Collected this month</div><div class="kpi-value">$68,200</div><div class="kpi-trend">90.9% collection rate</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Overdue</div><div class="kpi-value trend-warn">$640</div><div class="kpi-trend trend-warn">2 invoices</div></div>
+      ${(() => {
+        const mrr = S.tenants.reduce((s,t)=>s+(parseInt(String(t.invoice).replace(/,/g,''),10)||0),0);
+        const arr = mrr * 12;
+        const collected = Math.round(mrr * 0.909);
+        const overdue = mrr - collected;
+        return `
+        <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">MRR</div><div class="kpi-value">$${mrr.toLocaleString()}</div><div class="kpi-trend trend-up" style="color:#EFEAFB">Across ${S.tenants.length} tenants</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">ARR</div><div class="kpi-value">$${arr.toLocaleString()}</div><div class="kpi-trend trend-up">Annualized MRR</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Collected this month</div><div class="kpi-value">$${collected.toLocaleString()}</div><div class="kpi-trend">90.9% collection rate</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Overdue</div><div class="kpi-value trend-warn">$${overdue.toLocaleString()}</div><div class="kpi-trend trend-warn">Outstanding</div></div>
+        `;
+      })()}
     </section>
 
     <section style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
@@ -1188,6 +1339,25 @@ function renderAuditTab() {
 
 // ---- WIRE TAB EVENTS ----
 function wireTabEvents(wrap) {
+  // Overview: time-range buttons
+  wrap.querySelectorAll('[data-range]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S.overviewRange = btn.dataset.range;
+      render();
+    });
+  });
+
+  // Overview: click an alert card to resolve it
+  wrap.querySelectorAll('[data-alert-id]').forEach(card => {
+    card.addEventListener('click', () => {
+      const id = card.dataset.alertId;
+      if (!confirm('Mark this alert as resolved?')) return;
+      const a = S.platformAlerts.find(x => x.id === id);
+      if (a) a.status = 'resolved';
+      render();
+    });
+  });
+
   // Platform Admins: form field state + create
   wrap.querySelector('#new-sa-name')?.addEventListener('input', e => {
     S._newSA = { ...(S._newSA || {}), name: e.target.value };

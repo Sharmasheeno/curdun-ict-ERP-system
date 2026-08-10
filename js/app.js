@@ -31,24 +31,15 @@ const MODULES_DEF = [
 // used both for sign-in and for reset-password emails), adminStatus,
 // lastSignInAt (ISO string or null if never), and pendingReset (populated
 // when the Super Admin generates a reset token from the Admins table).
+// Only companies that are actually registered on the Curdun platform.
+// Add real entries here as new customers are onboarded.
 const SEED_TENANTS = [
-  { id:'TN-0042', name:'Shifo Pharmacy Group',    city:'Mogadishu', owner:'Ahmed Yusuf',    since:'May 2024', plan:'Enterprise', users:62,  invoice:'3,200', region:'SO-MG-1', adminEmail:'admin@shifo.so',          adminStatus:'active',    lastSignInAt:'2026-08-10T14:22:00', pendingReset:null },
-  { id:'TN-0117', name:'Jamhuriya University',    city:'Hargeisa',  owner:'Fadumo Ibrahim', since:'Oct 2023', plan:'Enterprise', users:214, invoice:'4,500', region:'SO-HL-1', adminEmail:'admin@jamhuriya.so',      adminStatus:'active',    lastSignInAt:'2026-08-09T09:15:00', pendingReset:null },
-  { id:'TN-0208', name:'Bosaso Retail Co-op',     city:'Bosaso',    owner:'Yusuf Kahin',    since:'Feb 2025', plan:'Business',   users:34,  invoice:'1,100', region:'SO-BO-1', adminEmail:'admin@bosasoretail.so',   adminStatus:'active',    lastSignInAt:'2026-08-09T18:40:00', pendingReset:null },
-  { id:'TN-0091', name:'Kismayo General Hospital',city:'Kismayo',   owner:'Sahra Ali',      since:'Mar 2024', plan:'Enterprise', users:118, invoice:'3,600', region:'SO-KI-1', adminEmail:'admin@kismayohospital.so',adminStatus:'suspended', lastSignInAt:'2026-08-08T11:03:00', pendingReset:null },
-  { id:'TN-0155', name:'Baidoa Grand Hotel',      city:'Baidoa',    owner:'Omar Sharif',    since:'Nov 2024', plan:'Business',   users:22,  invoice:'850',   region:'SO-BA-1', adminEmail:'admin@baidoagrand.so',    adminStatus:'active',    lastSignInAt:'2026-08-08T16:20:00', pendingReset:null },
-  { id:'TN-0173', name:'Halane School System',    city:'Mogadishu', owner:'Zeinab Warsame', since:'Jul 2025', plan:'Business',   users:47,  invoice:'1,300', region:'SO-MG-1', adminEmail:'admin@halane.so',         adminStatus:'active',    lastSignInAt:'2026-08-08T08:55:00', pendingReset:null },
-  { id:'TN-0201', name:'Mogadishu Livestock Ltd', city:'Mogadishu', owner:'Bashir Mohamud', since:'Jan 2025', plan:'Starter',    users:9,   invoice:'320',   region:'SO-MG-1', adminEmail:'admin@moglivestock.so',   adminStatus:'invited',   lastSignInAt:null,                  pendingReset:null },
+  { id:'TN-0042', name:'Shifo Retail Group', city:'Mogadishu', owner:'Ahmed Yusuf', since:'Aug 2026', plan:'Business', users:18, invoice:'1,100', region:'SO-MG-1', adminEmail:'admin@shifo.so', adminStatus:'active', lastSignInAt:'2026-08-10T14:22:00', pendingReset:null },
 ];
 
 const SEED_LICENSES = {
-  'TN-0042': { pharmacy:true, financials:true, crm:true, hr:false, pos:true, university:false, hotel:false, hospital:false },
-  'TN-0117': { pharmacy:false, financials:true, crm:true, hr:true, pos:false, university:true, hotel:false, hospital:false },
-  'TN-0208': { pharmacy:false, financials:true, crm:true, hr:false, pos:true, university:false, hotel:false, hospital:false },
-  'TN-0091': { pharmacy:true, financials:true, crm:true, hr:true, pos:false, university:false, hotel:false, hospital:true },
-  'TN-0155': { pharmacy:false, financials:true, crm:true, hr:false, pos:false, university:false, hotel:true, hospital:false },
-  'TN-0173': { pharmacy:false, financials:true, crm:true, hr:true, pos:false, university:true, hotel:false, hospital:false },
-  'TN-0201': { pharmacy:false, financials:true, crm:true, hr:false, pos:false, university:false, hotel:false, hospital:false },
+  // Only Retail POS is live — only pos:true for registered companies.
+  'TN-0042': { pharmacy:false, financials:false, crm:false, hr:false, pos:true, university:false, hotel:false, hospital:false },
 };
 
 const SEED_INVOICES = [
@@ -1756,12 +1747,36 @@ function renderTenantModal() {
             </div>
           </div>
 
-          <!-- Module licenses -->
+          <!-- Module licenses: only live modules are selectable; others locked -->
           <div style="grid-column:1/span 2;padding:16px 18px;background:#FFFCEF;border:1px dashed rgba(245,196,17,0.6);border-radius:12px">
             <div class="label-xs" style="color:#8B5A00">Step 3 · Modules the admin can open</div>
-            <div style="font-size:12.5px;color:var(--text-secondary);margin:3px 0 10px">Only ticked systems appear on their dashboard.</div>
+            <div style="font-size:12.5px;color:var(--text-secondary);margin:3px 0 10px">Only live modules can be assigned. More modules coming soon.</div>
             <div class="module-license-grid">
-              ${MODULES_DEF.map(m=>`<label class="module-license-label"><input type="checkbox" style="accent-color:#F5C411"/> ${m.name}</label>`).join('')}
+
+              <!-- ✅ Retail POS — LIVE, selectable -->
+              <label class="module-license-label" style="border:1.5px solid rgba(34,197,94,0.4);background:rgba(34,197,94,0.06);border-radius:8px;padding:7px 10px">
+                <input type="checkbox" id="mf-mod-pos" style="accent-color:#F5C411" checked/>
+                <span>🛒 Retail POS</span>
+                <span style="font-size:10px;color:#0F7A3A;font-weight:700;margin-left:4px">&#9679; Live</span>
+              </label>
+
+              <!-- 🔒 All other modules — coming soon, disabled -->
+              ${[
+                ['💊','Pharmacy'],
+                ['💰','Financials'],
+                ['📊','CRM &amp; Sales'],
+                ['👥','HR &amp; Payroll'],
+                ['🎓','University'],
+                ['🏨','Hotel &amp; Booking'],
+                ['🏥','Hospital'],
+              ].map(([emoji, name]) => `
+                <label class="module-license-label" style="opacity:0.5;cursor:not-allowed;border:1.5px dashed var(--border);border-radius:8px;padding:7px 10px">
+                  <input type="checkbox" disabled style="accent-color:#ccc"/>
+                  <span>${emoji} ${name}</span>
+                  <span style="font-size:10px;color:#7A5FB8;font-weight:700;margin-left:4px">🔒 Soon</span>
+                </label>
+              `).join('')}
+
             </div>
           </div>
         </div>
@@ -1857,7 +1872,7 @@ function renderTenantModal() {
           adminEmail, adminPhone, adminStatus: 'invited', lastSignInAt: null,
           pendingReset: null,
         });
-        S.licenses[S.tenants[0].id] = { pharmacy:false, financials:true, crm:false, hr:false, pos:false, university:false, hotel:false, hospital:false };
+        // Default license: only Retail POS is live; all other modules coming soon.\n        S.licenses[S.tenants[0].id] = { pharmacy:false, financials:false, crm:false, hr:false, pos:true, university:false, hotel:false, hospital:false };
       } else {
         // EDIT — send the changed fields to PUT /companies/{id}
         const companyId = S.tenantForm.companyId;

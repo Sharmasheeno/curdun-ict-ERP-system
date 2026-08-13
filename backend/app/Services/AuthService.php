@@ -14,17 +14,20 @@ class AuthService
     private Session $session;
     private Auth $auth;
     private AuditLogRepository $auditLogRepository;
+    private DeliveryService $delivery;
 
     public function __construct(
         UserRepository $userRepository,
         Session $session,
         Auth $auth,
-        AuditLogRepository $auditLogRepository
+        AuditLogRepository $auditLogRepository,
+        DeliveryService $delivery
     ) {
         $this->userRepository = $userRepository;
         $this->session = $session;
         $this->auth = $auth;
         $this->auditLogRepository = $auditLogRepository;
+        $this->delivery = $delivery;
     }
 
     public function login(string $email, string $password, string $ip, string $userAgent): array
@@ -85,17 +88,17 @@ class AuthService
         $this->session->remove("login_last_attempt_{$ip}");
 
         // 8. Load user roles and permissions
-        $roles = $this->userRepository->getUserRoles($user['id']);
-        $permissions = $this->userRepository->getUserPermissions($user['id']);
+        $context = $this->userRepository->getAuthContext((int)$user['id']);
+        if (!$context) {
+            throw new Exception('Unable to load authenticated user.', 500);
+        }
 
         // 9. Regenerate session
         $this->session->regenerate();
 
         // 10. Store in session
-        unset($user['password']);
-        $this->session->set('user', $user);
-        $this->session->set('roles', $roles);
-        $this->session->set('permissions', $permissions);
+        $this->session->set('user', $context);
+        $this->session->set('auth_method', 'password');
 
         // 11. Audit log
         $this->auditLogRepository->create([
@@ -108,9 +111,9 @@ class AuthService
         ]);
 
         return [
-            'user' => $user,
-            'roles' => $roles,
-            'permissions' => $permissions
+            'user' => $context,
+            'roles' => $context['roles'],
+            'permissions' => $context['permissions']
         ];
     }
 
@@ -130,10 +133,10 @@ class AuthService
      *
      * Rate limits per IP (5 attempts / 5 min) the same way email login does.
      */
-    public function pinLogin(string $pin, ?int $branchId, string $ip, string $userAgent): array
+    public function pinLogin(string $pin, ?int $branchId, ?int $userId, string $ip, string $userAgent): array
     {
-        if (!preg_match('/^\d{4,8}$/', $pin)) {
-            throw new Exception('PIN must be 4-8 digits.', 400);
+        if (!preg_match('/^\d{4}$/', $pin)) {
+            throw new Exception('PIN must contain exactly 4 digits.', 400);
         }
 
         $key = "pin_login_attempts_{$ip}";
@@ -143,7 +146,10 @@ class AuthService
             throw new Exception('Too many PIN attempts. Please try again later.', 429);
         }
 
-        $candidates = $this->userRepository->findPinCandidatesByBranch($branchId);
+        if ($userId === null || $userId <= 0) {
+            throw new Exception('Select a staff account before entering a PIN.', 400);
+        }
+        $candidates = $this->userRepository->findPinCandidatesByBranch($branchId, $userId);
         $matched = null;
         foreach ($candidates as $u) {
             if (!empty($u['pin_hash']) && password_verify($pin, $u['pin_hash'])) {
@@ -168,14 +174,13 @@ class AuthService
             'last_login_ip' => $ip,
         ]);
 
-        $roles       = $this->userRepository->getUserRoles((int)$matched['id']);
-        $permissions = $this->userRepository->getUserPermissions((int)$matched['id']);
+        $context = $this->userRepository->getAuthContext((int)$matched['id']);
+        if (!$context) {
+            throw new Exception('Unable to load authenticated user.', 500);
+        }
 
         $this->session->regenerate();
-        unset($matched['pin_hash']);
-        $this->session->set('user', $matched);
-        $this->session->set('roles', $roles);
-        $this->session->set('permissions', $permissions);
+        $this->session->set('user', $context);
         $this->session->set('auth_method', 'pin');
 
         $this->auditLogRepository->create([
@@ -188,9 +193,79 @@ class AuthService
         ]);
 
         return [
-            'user'        => $matched,
-            'roles'       => $roles,
-            'permissions' => $permissions,
+            'user'        => $context,
+            'roles'       => $context['roles'],
+            'permissions' => $context['permissions'],
+        ];
+    }
+
+    /**
+     * Verify a Manager+ PIN for approval overlays (Refund, Cash Out, close
+     * with variance, etc.) WITHOUT altering the current session. The calling
+     * cashier stays signed in; we just record who approved what and why.
+     * Returns the manager's { id, name, role } on success.
+     */
+    public function verifyManagerPin(string $pin, string $action, string $reason, ?int $branchId, string $ip): array
+    {
+        if (!preg_match('/^\d{4}$/', $pin)) {
+            throw new Exception('PIN must contain exactly 4 digits.', 400);
+        }
+        if ($reason === '') {
+            throw new Exception('A reason is required for the audit log.', 400);
+        }
+
+        // Same brute-force gate the cashier PIN uses.
+        $key = "mgr_approve_attempts_{$ip}";
+        $attempts = $this->session->get($key) ?? 0;
+        $last     = $this->session->get("{$key}_last") ?? 0;
+        if ($attempts >= 5 && (time() - $last) < 300) {
+            throw new Exception('Too many approval attempts. Please try again later.', 429);
+        }
+
+        $candidates = $this->userRepository->findManagerPinCandidates($branchId);
+        $manager = null;
+        foreach ($candidates as $u) {
+            if (!empty($u['pin_hash']) && password_verify($pin, $u['pin_hash'])) {
+                $manager = $u;
+                break;
+            }
+        }
+
+        if (!$manager) {
+            $this->session->set($key, $attempts + 1);
+            $this->session->set("{$key}_last", time());
+            throw new Exception('That PIN does not match any Store Manager or Admin.', 401);
+        }
+
+        $this->session->remove($key);
+        $this->session->remove("{$key}_last");
+
+        // Non-mutating action — just an audit line, no session swap.
+        $cashier = $this->session->get('user');
+        $this->auditLogRepository->create([
+            'user_id'    => $cashier['id'] ?? null,
+            'module'     => 'POS',
+            'action'     => 'MANAGER_APPROVAL',
+            'record_id'  => $manager['id'],
+            'ip_address' => $ip,
+            'new_values' => json_encode([
+                'approved_action' => $action,
+                'approved_by_id'  => $manager['id'],
+                'approved_by'     => $manager['name'] ?? null,
+                'requested_by_id' => $cashier['id'] ?? null,
+                'reason'          => $reason,
+            ]),
+            'created_at' => date('Y-m-d H:i:s'),
+        ]);
+
+        return [
+            'approved_by' => [
+                'id'    => (int)$manager['id'],
+                'name'  => $manager['name'] ?? '',
+                'role'  => $manager['role_name'] ?? '',
+            ],
+            'action' => $action,
+            'reason' => $reason,
         ];
     }
 
@@ -210,27 +285,40 @@ class AuthService
         return $this->session->get('user');
     }
 
-    public function forgotPassword(string $email): string
+    public function forgotPassword(string $email): array
     {
         $user = $this->userRepository->findByEmail($email);
         if (!$user) {
             // Silently return token to prevent email enumeration
-            return bin2hex(random_bytes(32));
+            return ['status'=>'accepted'];
         }
 
         $token = bin2hex(random_bytes(32));
         $expires = date('Y-m-d H:i:s', time() + 3600);
         
-        $this->userRepository->storePasswordReset($email, $token, $expires);
-        
+        $this->userRepository->storePasswordReset($email, $token, $expires, 'email');
+        $delivery = $this->delivery->sendResetEmail($user, $token);
+        return ['status'=>'accepted','delivery'=>$delivery];
+    }
+
+    public function verifyResetOtp(string $email, string $otp): string
+    {
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || !preg_match('/^\d{6}$/', $otp)) {
+            throw new Exception('Enter a valid email and 6-digit OTP.', 422);
+        }
+        $token = $this->userRepository->verifyPasswordResetOtp($email, $otp);
+        if (!$token) throw new Exception('The OTP is invalid, expired, or has too many failed attempts.', 400);
         return $token;
     }
 
     public function resetPassword(string $token, string $newPassword): void
     {
+        if (strlen($newPassword) < 10 || !preg_match('/[A-Z]/', $newPassword) || !preg_match('/\d/', $newPassword)) {
+            throw new Exception('Password must be at least 10 characters and include an uppercase letter and a number.', 422);
+        }
         $reset = $this->userRepository->findPasswordResetByToken($token);
         
-        if (!$reset || strtotime($reset['expires_at']) < time() || $reset['is_used']) {
+        if (!$reset || strtotime($reset['expires_at']) < time() || !empty($reset['used_at'])) {
             throw new Exception('Invalid or expired password reset token.', 400);
         }
         
@@ -240,7 +328,10 @@ class AuthService
         }
         
         $hashedPassword = password_hash($newPassword, PASSWORD_DEFAULT);
-        $this->userRepository->update($user['id'], ['password' => $hashedPassword]);
+        $this->userRepository->update($user['id'], [
+            'password' => $hashedPassword,
+            'must_change_password' => 0,
+        ]);
         
         $this->userRepository->markPasswordResetAsUsed($token);
         
@@ -250,5 +341,26 @@ class AuthService
             'action' => 'PASSWORD_RESET',
             'created_at' => date('Y-m-d H:i:s')
         ]);
+    }
+
+    public function changeOwnPassword(int $userId, string $newPassword): array
+    {
+        if (strlen($newPassword) < 10 || !preg_match('/[A-Z]/', $newPassword) || !preg_match('/\d/', $newPassword)) {
+            throw new Exception('Password must be at least 10 characters and include an uppercase letter and a number.', 422);
+        }
+        $this->userRepository->update($userId, [
+            'password' => password_hash($newPassword, PASSWORD_DEFAULT),
+            'must_change_password' => 0,
+        ]);
+        $context = $this->userRepository->getAuthContext($userId);
+        $this->session->set('user', $context);
+        $this->auditLogRepository->create([
+            'user_id' => $userId,
+            'company_id' => $context['company_id'] ?? null,
+            'module' => 'AUTH',
+            'action' => 'PASSWORD_CHANGE',
+            'created_at' => date('Y-m-d H:i:s'),
+        ]);
+        return $context;
     }
 }

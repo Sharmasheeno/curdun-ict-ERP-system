@@ -3054,6 +3054,75 @@ const POS_ROLES = {
   'Admin':         ['dash', 'checkout', 'transactions', 'sessions', 'payments', 'products', 'customers', 'reports', 'notifications', 'staff', 'settings'],
 };
 
+// ============================================================
+// POS PERMISSIONS — action-level ACL enforced on top of role tabs.
+// True  → allowed silently.
+// 'pin' → allowed but requires a Manager+ PIN approval overlay.
+// False → hidden / disabled entirely.
+// Anyone above the level in the table inherits the same permission.
+// ============================================================
+const POS_PERMISSIONS = {
+  Cashier: {
+    sell: true, smallDiscount: true, largeDiscount: 'pin',
+    refund: 'pin', voidOrder: false,
+    cashInOut: 'pin', openRegister: false, closeRegister: false,
+    viewMargin: false, editProducts: false, manageStaff: false, settings: false,
+  },
+  'Senior Cashier': {
+    sell: true, smallDiscount: true, largeDiscount: 'pin',
+    refund: true, voidOrder: 'pin',
+    cashInOut: true, openRegister: true, closeRegister: true,
+    viewMargin: false, editProducts: false, manageStaff: false, settings: false,
+  },
+  'Store Manager': {
+    sell: true, smallDiscount: true, largeDiscount: true,
+    refund: true, voidOrder: true,
+    cashInOut: true, openRegister: true, closeRegister: true,
+    viewMargin: true, editProducts: true, manageStaff: true, settings: false,
+  },
+  Admin: {
+    sell: true, smallDiscount: true, largeDiscount: true,
+    refund: true, voidOrder: true,
+    cashInOut: true, openRegister: true, closeRegister: true,
+    viewMargin: true, editProducts: true, manageStaff: true, settings: true,
+  },
+};
+
+/**
+ * posCan(action, user?)
+ *   → true    : allowed silently
+ *   → 'pin'   : allowed only after a Manager PIN approval overlay
+ *   → false   : not allowed at all
+ * Falls back to the current cashier (S.posActiveUser). Unknown roles are
+ * treated as Cashier (least privilege).
+ */
+function posCan(action, user) {
+  const u = user || S.posActiveUser;
+  const role = u?.role || 'Cashier';
+  const perms = POS_PERMISSIONS[role] || POS_PERMISSIONS.Cashier;
+  return perms[action] ?? false;
+}
+
+/**
+ * requireManagerApproval(action, options, onApproved)
+ *   Renders a Manager PIN modal. On PIN match (against a user with role
+ *   Store Manager or Admin in POS_STAFF), calls onApproved({ manager }).
+ *   Cancels silently on close/×.
+ */
+function requireManagerApproval(action, options, onApproved) {
+  S.posRegisterModal = {
+    mode: 'manager-approval',
+    action,
+    label: options.label || action,
+    reason: options.reason || '',
+    onApproved,
+    pin: '',
+    error: '',
+    busy: false,
+  };
+  render();
+}
+
 function renderPOSLogin() {
   const pin = S.posLoginPin || '';
   const dots = [0,1,2,3].map(i =>
@@ -3127,17 +3196,41 @@ function renderPOSLogin() {
       </form>
     `;
   } else if (!selectedStaff) {
-    // Staff grid + admin link
+    // Staff grid + (optional) admin escape hatch.
+    //
+    // The "Sign in as Admin (email)" link is ONLY useful when the operator
+    // arrived at the POS station without a valid backoffice session (fresh
+    // terminal) and needs to prove they're the tenant Admin.
+    //
+    // If the user is ALREADY signed in as Company Admin at the account level
+    // (S.activeCompanyAdmin is set), asking them to re-enter email + password
+    // is confusing and redundant. Instead, we show a subtle context banner
+    // making the two-tier auth model explicit: they still need to identify
+    // WHICH cashier they are operating as for this POS session.
+    const alreadyAdmin = !!S.activeCompanyAdmin;
+    const identityBanner = alreadyAdmin ? `
+      <div style="background:var(--gray-50);border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:14px;text-align:left">
+        <div style="font-size:11px;color:var(--text-muted);letter-spacing:1px;text-transform:uppercase;font-weight:700">Signed in · account</div>
+        <div style="font-weight:800;font-size:14px;color:var(--purple-800);margin-top:2px">${esc(S.activeCompanyAdmin.name)} <span style="font-size:11px;color:var(--text-muted);font-weight:600;letter-spacing:0.5px">· ${esc(S.activeCompanyAdmin.role || 'Admin')}</span></div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;line-height:1.5">
+          Choose the cashier identity for this POS session. Every sale is stamped with the cashier's PIN — a register can rotate through multiple cashiers during one open session.
+        </div>
+      </div>
+    ` : '';
     body = `
+      ${identityBanner}
       <div class="pos-login-staff-grid" id="login-staff-grid">
         ${staffList}
       </div>
-      <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);text-align:center">
-        <button type="button" class="btn-linklike" id="btn-open-admin-login"
-          style="background:none;border:none;color:var(--purple-800);font-weight:700;font-size:13px;cursor:pointer;text-decoration:underline;padding:6px 10px">
-          Sign in as Admin (email)
-        </button>
-      </div>
+      ${alreadyAdmin ? '' : `
+        <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);text-align:center">
+          <button type="button" class="btn-linklike" id="btn-open-admin-login"
+            style="background:none;border:none;color:var(--purple-800);font-weight:700;font-size:13px;cursor:pointer;text-decoration:underline;padding:6px 10px">
+            Sign in as Admin (email)
+          </button>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px">Use this if you don't have a POS PIN yet.</div>
+        </div>
+      `}
     `;
   } else {
     // PIN entry for selected staff
@@ -3323,6 +3416,30 @@ function renderRegisterModal() {
       <button class="btn btn-ghost" data-rc-close>Cancel</button>
       <button class="btn btn-primary" id="rc-cash-submit" ${m.busy?'disabled':''}>${m.busy?'Recording…':'Record'}</button>
     `;
+  } else if (m.mode === 'manager-approval') {
+    // Manager PIN overlay — a cashier tried an action that needs approval.
+    title = 'Manager approval required';
+    body = `
+      <div style="display:flex;align-items:center;gap:12px;padding:12px;background:var(--gray-50);border-radius:10px;margin-bottom:14px">
+        <div class="avatar" style="width:44px;height:44px;background:var(--gold);color:var(--purple-800);font-size:14px;font-weight:900">!</div>
+        <div>
+          <div style="font-weight:800;font-size:14px">${esc(m.label)}</div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:2px">
+            Requested by <strong>${esc(cashierName)}</strong>. A Store Manager or Admin PIN is needed to approve.
+          </div>
+        </div>
+      </div>
+      <label class="form-label">Manager PIN</label>
+      <input class="form-input mono" id="rc-mgr-pin" type="password" inputmode="numeric" maxlength="8"
+             placeholder="••••" value="${m.pin || ''}" autofocus/>
+      <label class="form-label" style="margin-top:12px">Reason (audit)</label>
+      <input class="form-input" id="rc-mgr-reason" placeholder="e.g. Customer changed mind — 2 items returned" value="${esc(m.reason || '')}"/>
+      ${err}
+    `;
+    footer = `
+      <button class="btn btn-ghost" data-rc-close>Cancel</button>
+      <button class="btn btn-primary" id="rc-mgr-submit" ${m.busy?'disabled':''}>${m.busy?'Approving…':'Approve'}</button>
+    `;
   } else if (m.mode === 'closed-summary') {
     // Post-close receipt / summary shown after successful close.
     title = 'Register closed';
@@ -3423,6 +3540,27 @@ function wireRegisterModal() {
       render();
     } catch (err) {
       m.busy = false; m.error = err.message || 'Could not close the register.';
+      render();
+    }
+  });
+
+  // Manager PIN approval — server-side check against Manager+ users.
+  // The cashier's session stays intact; we only record the approval.
+  document.getElementById('rc-mgr-submit')?.addEventListener('click', async () => {
+    const pin = (document.getElementById('rc-mgr-pin')?.value || '').trim();
+    const reason = (document.getElementById('rc-mgr-reason')?.value || '').trim();
+    if (!/^\d{4}$/.test(pin)) { m.error = 'Enter the 4-digit manager PIN.'; render(); return; }
+    if (!reason) { m.error = 'A reason is required for the audit log.'; render(); return; }
+    m.busy = true; m.error = ''; render();
+    try {
+      const result = await posVerifyManagerPin(pin, m.action || 'unknown', reason, S.posActiveUser?.branchId || null);
+      const cb = m.onApproved;
+      S.posRegisterModal = null;
+      render();
+      try { cb?.({ approved_by: result.approved_by, reason }); } catch (e) { alert(e.message || String(e)); }
+    } catch (err) {
+      m.busy = false;
+      m.error = err.message || 'That PIN does not match any Store Manager or Admin.';
       render();
     }
   });
@@ -5316,10 +5454,27 @@ function wirePOSEvents() {
     openRegisterModal('open');
   });
   // Cash In / Cash Out (modal, replaces prompt()).
-  document.getElementById('btn-cash-in')?.addEventListener('click',  () => openCashMovementModal('IN'));
-  document.getElementById('btn-cash-out')?.addEventListener('click', () => openCashMovementModal('OUT'));
-  // Closing Control (modal with full variance breakdown, replaces prompt()).
-  document.getElementById('btn-session-close')?.addEventListener('click', () => openRegisterModal('close'));
+  // Gated: Cashiers need Manager approval; Senior Cashier and above pass silently.
+  const doCashMovement = (direction) => {
+    const perm = posCan('cashInOut');
+    if (perm === true)  return openCashMovementModal(direction);
+    if (perm === 'pin') return requireManagerApproval('cashInOut', {
+      label: `Cash ${direction === 'IN' ? 'In' : 'Out'} — needs Senior Cashier or Manager`,
+    }, () => openCashMovementModal(direction));
+    alert('Your role cannot record cash movements.');
+  };
+  document.getElementById('btn-cash-in') ?.addEventListener('click', () => doCashMovement('IN'));
+  document.getElementById('btn-cash-out')?.addEventListener('click', () => doCashMovement('OUT'));
+
+  // Closing Control — gated: Cashier cannot close. Senior/Manager/Admin pass.
+  document.getElementById('btn-session-close')?.addEventListener('click', () => {
+    const perm = posCan('closeRegister');
+    if (perm === true)  return openRegisterModal('close');
+    if (perm === 'pin') return requireManagerApproval('closeRegister', {
+      label: 'Close register — Manager approval required',
+    }, () => openRegisterModal('close'));
+    alert('Only a Senior Cashier or above can close the register.');
+  });
   const closeStaffCredentials=()=>{S.staffCredentialResult=null;render();};
   document.getElementById('btn-staff-credentials-done')?.addEventListener('click',closeStaffCredentials);
   document.getElementById('btn-staff-credentials-done-2')?.addEventListener('click',closeStaffCredentials);
@@ -5528,6 +5683,17 @@ function wirePOSEvents() {
     } else if (type === 'transaction') {
       const transaction = POS_TRANSACTIONS.find(item=>item.id===id);
       if (!transaction?._backendId) throw new Error('Transaction record is unavailable.');
+      // Refund permission — Cashier needs Manager PIN; Senior+ passes silently.
+      const perm = posCan('refund');
+      if (perm === false) { alert('Your role cannot issue refunds.'); return; }
+      const runRefund = () => posVoidTransaction(transaction._backendId).then(()=>{ S.confirmDeleteModal = null; render(); }).catch(err=>alert(err.message));
+      if (perm === 'pin') {
+        S.confirmDeleteModal = null; // close the delete modal first so the PIN overlay isn't sandwiched
+        requireManagerApproval('refund', {
+          label: `Refund order #${transaction._backendId}`,
+        }, () => runRefund());
+        return;
+      }
       await posVoidTransaction(transaction._backendId);
     }
     S.confirmDeleteModal = null; render();

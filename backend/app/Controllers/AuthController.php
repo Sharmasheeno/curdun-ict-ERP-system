@@ -4,8 +4,6 @@ namespace App\Controllers;
 
 use Core\Request;
 use Core\Response;
-use Core\Auth;
-use Core\Session;
 use App\Services\AuthService;
 
 class AuthController extends BaseController
@@ -35,6 +33,7 @@ class AuthController extends BaseController
         $data     = $request->getBody();
         $pin      = (string)($data['pin'] ?? '');
         $branchId = isset($data['branch_id']) ? (int)$data['branch_id'] : null;
+        $userId   = isset($data['user_id']) ? (int)$data['user_id'] : null;
 
         if ($pin === '') {
             Response::error('PIN is required.', ['pin' => 'Required'], 400);
@@ -44,8 +43,26 @@ class AuthController extends BaseController
         $ip        = $request->getIp();
         $userAgent = $request->getUserAgent();
 
-        $result = $this->authService->pinLogin($pin, $branchId, $ip, $userAgent);
+        $result = $this->authService->pinLogin($pin, $branchId, $userId, $ip, $userAgent);
         Response::success('PIN login successful.', $result);
+    }
+
+    public function verifyManagerPin(Request $request): void
+    {
+        $data     = $request->getBody();
+        $pin      = (string)($data['pin'] ?? '');
+        $action   = (string)($data['action'] ?? '');
+        $reason   = trim((string)($data['reason'] ?? ''));
+        $branchId = isset($data['branch_id']) ? (int)$data['branch_id'] : null;
+
+        if ($pin === '' || $action === '') {
+            Response::error('PIN and action are required.', ['pin'=>'Required','action'=>'Required'], 400);
+            return;
+        }
+
+        $ip = $request->getIp();
+        $result = $this->authService->verifyManagerPin($pin, $action, $reason, $branchId, $ip);
+        Response::success('Manager approval recorded.', $result);
     }
 
     public function logout(Request $request): void
@@ -59,6 +76,17 @@ class AuthController extends BaseController
     {
         $user = $this->authService->me();
         Response::success('Authenticated user retrieved.', $user);
+    }
+
+    public function changePassword(Request $request): void
+    {
+        $password = (string)$request->getBodyParam('password', '');
+        $confirm = (string)$request->getBodyParam('password_confirmation', '');
+        if ($password === '' || $password !== $confirm) {
+            Response::validationError(['password_confirmation' => ['Passwords do not match.']]);
+        }
+        $user = $this->authService->changeOwnPassword((int)$this->getAuthUserId(), $password);
+        Response::success('Password changed successfully.', $user);
     }
 
     public function forgotPassword(Request $request): void
@@ -90,5 +118,13 @@ class AuthController extends BaseController
 
         $this->authService->resetPassword($token, $password);
         Response::success('Password reset successfully.');
+    }
+
+    public function verifyResetOtp(Request $request): void
+    {
+        $email = strtolower(trim((string)$request->getBodyParam('email', '')));
+        $otp = trim((string)$request->getBodyParam('otp', ''));
+        $token = $this->authService->verifyResetOtp($email, $otp);
+        Response::success('OTP verified.', ['token'=>$token]);
     }
 }

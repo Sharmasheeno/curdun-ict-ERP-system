@@ -57,7 +57,7 @@ const SEED_INVOICES = [
 // APP STATE
 // ============================================================
 const S = {
-  view: 'login',           // login | firstlogin | super | workspace | pharmacy | pos
+  view: new URLSearchParams(window.location.search).get('reset') ? 'passwordreset' : 'login',
   superTab: 'overview',    // overview | companies | admins | platform | modules | infra | billing | audit
 
   // Super Admin Overview interactivity
@@ -69,6 +69,12 @@ const S = {
   //   step 'confirm' → shows admin details and delivery options
   //   step 'sent'    → shows the generated reset token + copy-paste link
   resetAdminModal: null,   // { tenantId, step, sendEmail, sendSMS, token, link }
+  companyAdminStatus: 'all',
+  companyAdminModal: null, // { type:'edit'|'assign', tenantId, error? }
+  platformAdminQuery: '',
+  platformAdminStatus: 'all',
+  platformAdminModal: null, // { type:'edit'|'reset'|'remove', id, step?, token?, link? }
+  platformAdminError: '',
 
   // Platform alerts — real state, editable. Icon/tone/desc drive rendering.
   platformAlerts: [
@@ -79,8 +85,17 @@ const S = {
   pharmTab: 'dash',        // dash | sales | inventory | rx | users | branches | settings
   posTab: 'dash',          // dash | checkout | products | customers | transactions | staff | settings
 
+  // Odoo-style POS architecture state
+  posView: 'selector',      // 'selector' | 'backoffice' | 'session'
+  posStoreType: null,       // null | 'retail' | 'bakery' | 'clothes' | 'furniture' | 'restaurant' | 'electronics'
+  posBackofficeTab: 'dashboard', // dashboard | orders | sessions | payments | customers | products | categories | combos | reports-orders | reports-sales | reports-session | reports-stock | config-settings | config-payments | config-staff | config-currencies
+  posNavDropdown: null,     // null | 'orders' | 'products' | 'reporting' | 'configuration'
+
   // Auth
   loginEmail: '', loginPassword: '', loginError: false,
+  recoveryModal: false, recoveryMode: 'email', recoveryEmail: '', recoveryOtp: '', recoveryMessage: '', recoveryError: '',
+  resetToken: new URLSearchParams(window.location.search).get('reset') || '',
+  resetPassword: '', resetPasswordConfirm: '', resetPasswordError: '',
 
   // Active identities after sign-in (mutually exclusive)
   activeSuperAdmin:   null,   // set when a Platform Super Admin signs in
@@ -88,7 +103,7 @@ const S = {
   pwUser:             null,   // pending user during first-login password change
 
   // Retail POS store settings — editable from POS → Settings tab.
-  // Persists in memory for this session; wiring to backend comes later.
+  // Loaded from and saved to the tenant-scoped POS settings API.
   storeSettings: {
     storeName:       'Shifo Retail Group',
     taxRate:         5,
@@ -96,7 +111,10 @@ const S = {
     receiptHeader:   'SHIFO RETAIL GROUP',
     receiptFooter:   'Thank you for shopping at Shifo!',
     showBarcodeOnReceipt: true,
-    payments:        { Cash: true, 'EVC Plus': true, Zaad: true, Sahal: true },
+    cashControl: true,
+    openingControl: true,
+    maximumDifference: 20,
+    payments:        { Cash: true, 'EVC Plus': true, eDahab: true, ZAAD: true, Sahal: true, Deyn: true },
   },
   _settingsSaved: false,      // ephemeral flag for "Saved!" toast
 
@@ -149,6 +167,7 @@ const S = {
   // POS — CRUD modals
   crudModal: null,       // null | { type:'product'|'customer'|'staff', mode:'add'|'edit', id:null|number }
   crudForm: {},          // live form field values
+  staffCredentialResult: null, // one-time staff email/password/PIN confirmation
   viewModal: null,       // { type:'transaction', id:string } — for read detail
   confirmDeleteModal: null, // { type:'product'|'customer'|'staff'|'transaction', id:any }
 
@@ -160,6 +179,15 @@ const S = {
 
   // POS — debt (Buugga Deynta)
   posDebtCustomerId: null,
+
+  // POS — management reports and stock notifications
+  posReportFrom: new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10),
+  posReportTo: new Date().toISOString().slice(0, 10),
+  posReportSection: 'sales',
+  posReportData: null,
+  posReportLoading: false,
+  posReportError: '',
+  posStockAlerts: [],
 
   // POS — offline
   isOffline: false,
@@ -175,6 +203,17 @@ const S = {
   posLoginPin: '',         // digits typed so far (max 4)
   posShiftActive: false,   // cashier shift start/stop
   posShiftStart: null,     // Date object
+  posConfig: null,
+  posSession: null,
+  posSessionSummary: null,
+  posSessions: [],
+
+  // Register control modal (replaces browser prompt() calls) — Odoo-style flow.
+  //   { mode: 'open' | 'close' | 'cash-in' | 'cash-out' | 'closed-summary',
+  //     amount, note, counted, managerPin, error, result }
+  posRegisterModal: null,
+  posPayments: [],
+  posPendingOrderId: null,
 
   // POS — Admin login mode ('staff' = PIN grid, 'admin' = email/password, 'force-change' = new-password screen)
   posLoginMode: 'staff',
@@ -203,6 +242,21 @@ const el = (tag, attrs={}, ...children) => {
   return e;
 };
 const html = (str) => { const t = document.createElement('div'); t.innerHTML = str; return t.firstElementChild; };
+const esc = (value) => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
+
+function copyInputValue(inputId, button) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  input.select();
+  const fallback = () => { try { document.execCommand('copy'); } catch (_) {} };
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(input.value).catch(fallback);
+  else fallback();
+  if (button) {
+    const label = button.textContent;
+    button.textContent = '✓ Copied';
+    setTimeout(() => { if (button.isConnected) button.textContent = label; }, 1500);
+  }
+}
 
 function initials(name) {
   return (name||'').split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
@@ -219,12 +273,20 @@ function initials(name) {
  */
 async function api(path, opts = {}) {
   const url = path.startsWith('http') ? path : `/api/v1${path}`;
-  const res = await fetch(url, {
-    method:      opts.method || 'GET',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
-    body: opts.body != null ? JSON.stringify(opts.body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(url, {
+      method:      opts.method || 'GET',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+      body: opts.body != null ? JSON.stringify(opts.body) : undefined,
+    });
+  } catch (_) {
+    const locationHint = location.protocol === 'file:'
+      ? ' Open the application from http://127.0.0.1:8000/app.html, not as a local file.'
+      : ' Confirm the Curdun PHP server is running, then refresh this page.';
+    throw new Error(`The backend server is unavailable.${locationHint}`);
+  }
   let payload = null;
   try { payload = await res.json(); } catch (_) {}
   if (!res.ok || (payload && payload.success === false)) {
@@ -299,12 +361,23 @@ function render() {
 
   switch(S.view) {
     case 'login':      root.appendChild(renderLogin());     break;
+    case 'passwordreset': root.appendChild(renderPasswordReset()); break;
     case 'firstlogin': root.appendChild(renderFirstLogin()); break;
     case 'super':      root.appendChild(renderSuper());     break;
     case 'workspace':  root.appendChild(renderWorkspace()); break;
     case 'pharmacy':   root.appendChild(renderPharmacy());  break;
     case 'pos':        root.appendChild(renderPOS());       break;
   }
+
+  // Modal HTML is composed inside each feature view so its event handlers stay
+  // close to that feature. Move the finished overlay to the application root
+  // after wiring; otherwise an animated content container's transform makes a
+  // position:fixed modal start after the sidebar and overflow the viewport.
+  setTimeout(() => {
+    root.querySelectorAll('.crud-overlay').forEach(overlay => {
+      if (overlay.parentElement !== root) root.appendChild(overlay);
+    });
+  }, 0);
 }
 
 // ============================================================
@@ -358,7 +431,7 @@ function renderLogin() {
       <div class="form-group">
         <div class="flex justify-between items-center" style="margin-bottom:5px">
           <label class="form-label" for="login-pw" style="margin:0">Password</label>
-          <a href="#" style="font-size:12px; font-weight:700; color:var(--purple-800)">Forgot?</a>
+          <button type="button" id="btn-forgot-help" style="font-size:12px;font-weight:700;color:var(--purple-800);background:none;border:0;cursor:pointer">Forgot?</button>
         </div>
         ${pwField({ id:'login-pw', className:'form-input mono', placeholder:'••••••••', style:'letter-spacing:2px' })}
       </div>
@@ -374,16 +447,104 @@ function renderLogin() {
 
       <div class="login-footer-note">SSO · SAML · Passkey — © 2026 Curdun ICT Solution</div>
     </div>
+    ${renderRecoveryModal()}
   `;
 
   div.querySelector('#btn-signin').addEventListener('click', doSignIn);
+  div.querySelector('#btn-forgot-help').addEventListener('click', () => {
+    S.recoveryModal = true; S.recoveryEmail = S.loginEmail || ''; S.recoveryMessage = ''; S.recoveryError = ''; render();
+  });
+  div.querySelectorAll('[data-recovery-close]').forEach(element => element.addEventListener('click', event => {
+    if (event.target === element) { S.recoveryModal = false; render(); }
+  }));
+  div.querySelectorAll('[data-recovery-mode]').forEach(button => button.addEventListener('click', () => {
+    S.recoveryMode = button.dataset.recoveryMode; S.recoveryMessage = ''; S.recoveryError = ''; render();
+  }));
+  div.querySelector('#recovery-email')?.addEventListener('input', event => { S.recoveryEmail = event.target.value; });
+  div.querySelector('#recovery-otp')?.addEventListener('input', event => { S.recoveryOtp = event.target.value.replace(/\D/g,'').slice(0,6); });
+  div.querySelector('#btn-recovery-submit')?.addEventListener('click', async event => {
+    const email = (S.recoveryEmail || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { S.recoveryError='Enter a valid account email.'; render(); return; }
+    event.currentTarget.disabled=true; event.currentTarget.textContent=S.recoveryMode==='sms'?'Verifying…':'Sending…';
+    try {
+      if (S.recoveryMode === 'sms') {
+        if (!/^\d{6}$/.test(S.recoveryOtp)) throw new Error('Enter the 6-digit OTP sent to your phone.');
+        const result = await api('/auth/verify-reset-otp',{method:'POST',body:{email,otp:S.recoveryOtp}});
+        S.resetToken=result.token; S.resetPassword=''; S.resetPasswordConfirm=''; S.recoveryModal=false; S.view='passwordreset'; render();
+      } else {
+        await api('/auth/forgot-password',{method:'POST',body:{email}});
+        S.recoveryMessage='If this account exists, a secure reset link has been sent to its email address.'; S.recoveryError=''; render();
+      }
+    } catch (error) { S.recoveryError=error.message; render(); }
+  });
   div.querySelector('#login-email').addEventListener('input', e => { S.loginEmail = e.target.value; S.loginError = false; });
+  div.querySelector('#login-pw').addEventListener('input', () => {
+    if (S.loginError) { S.loginError = false; document.querySelector('.form-error')?.remove(); }
+  });
   div.querySelector('#login-pw').addEventListener('keydown', e => { if(e.key==='Enter') doSignIn(); });
 
   return div;
 }
 
-function doSignIn() {
+function renderRecoveryModal() {
+  if (!S.recoveryModal) return '';
+  return `<div class="crud-overlay" data-recovery-close>
+    <div class="crud-modal" style="max-width:500px" onclick="event.stopPropagation()">
+      <div class="crud-modal-header"><h3>Recover your account</h3><button class="crud-close-btn" data-recovery-close>×</button></div>
+      <div class="crud-modal-body">
+        <div class="filter-pills" style="margin-bottom:18px">
+          <button class="filter-pill ${S.recoveryMode==='email'?'active':''}" data-recovery-mode="email">Email reset link</button>
+          <button class="filter-pill ${S.recoveryMode==='sms'?'active':''}" data-recovery-mode="sms">Use SMS OTP</button>
+        </div>
+        <div class="form-group"><label class="form-label">Account email</label><input class="form-input" id="recovery-email" type="email" value="${esc(S.recoveryEmail || '')}" placeholder="admin@company.so"/></div>
+        ${S.recoveryMode==='sms' ? `<div class="form-group"><label class="form-label">6-digit OTP</label><input class="form-input mono" id="recovery-otp" inputmode="numeric" maxlength="6" value="${esc(S.recoveryOtp || '')}" placeholder="000000" style="letter-spacing:5px;font-size:18px"/><div class="cred-hint">Use the OTP sent by Curdun after your Company Admin reset was requested.</div></div>` : `<div style="font-size:12px;color:var(--text-muted);line-height:1.55">We will send a one-time link to the registered email. For security, we never reveal whether an email is registered.</div>`}
+        ${S.recoveryMessage ? `<div style="margin-top:14px;padding:11px;border-radius:9px;background:#ECFDF3;color:#166534;font-size:12px">${esc(S.recoveryMessage)}</div>` : ''}
+        ${S.recoveryError ? `<div style="margin-top:14px;padding:11px;border-radius:9px;background:#FEE4E2;color:#B42318;font-size:12px">${esc(S.recoveryError)}</div>` : ''}
+      </div>
+      <div class="crud-modal-footer"><button class="btn btn-ghost" data-recovery-close>Cancel</button><button class="btn btn-primary" id="btn-recovery-submit">${S.recoveryMode==='sms'?'Verify OTP':'Send reset link'}</button></div>
+    </div>
+  </div>`;
+}
+
+function renderPasswordReset() {
+  const div = document.createElement('div');
+  div.className = 'first-login-bg';
+  div.innerHTML = `
+    <div class="first-login-box" style="max-width:520px">
+      <div class="first-login-header">
+        <div class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
+        <div><div class="eyebrow">Curdun account recovery</div><h2>Set a new password</h2></div>
+      </div>
+      <div class="first-login-body">
+        <div class="first-login-info">This one-time link expires after 60 minutes and cannot be reused.</div>
+        <div class="flex-col gap-14">
+          <div class="form-group"><label class="form-label" for="reset-pw1">New password</label>${pwField({id:'reset-pw1',placeholder:'At least 10 characters',autocomplete:'new-password'})}</div>
+          <div class="form-group"><label class="form-label" for="reset-pw2">Confirm new password</label>${pwField({id:'reset-pw2',placeholder:'Type it again',autocomplete:'new-password'})}</div>
+          ${S.resetPasswordError ? `<div class="form-error">${S.resetPasswordError}</div>` : ''}
+          <button class="btn btn-primary w-full" id="btn-complete-reset">Save new password</button>
+          <button class="btn btn-ghost w-full" id="btn-reset-back">Back to sign in</button>
+        </div>
+      </div>
+    </div>`;
+  div.querySelector('#reset-pw1').addEventListener('input', event => { S.resetPassword=event.target.value; S.resetPasswordError=''; });
+  div.querySelector('#reset-pw2').addEventListener('input', event => { S.resetPasswordConfirm=event.target.value; S.resetPasswordError=''; });
+  div.querySelector('#btn-reset-back').addEventListener('click', () => { history.replaceState({},'',location.pathname); S.view='login'; render(); });
+  div.querySelector('#btn-complete-reset').addEventListener('click', async event => {
+    if (S.resetPassword.length < 10 || !/[A-Z]/.test(S.resetPassword) || !/\d/.test(S.resetPassword)) {
+      S.resetPasswordError='Use at least 10 characters, one uppercase letter, and one number.'; render(); return;
+    }
+    if (S.resetPassword !== S.resetPasswordConfirm) { S.resetPasswordError='The passwords do not match.'; render(); return; }
+    event.currentTarget.disabled=true; event.currentTarget.textContent='Saving…';
+    try {
+      await api('/auth/reset-password',{method:'POST',body:{token:S.resetToken,password:S.resetPassword,password_confirmation:S.resetPasswordConfirm}});
+      history.replaceState({},'',location.pathname);
+      S.resetToken=''; S.resetPassword=''; S.resetPasswordConfirm=''; S.loginError='Password reset complete. Sign in with your new password.'; S.view='login'; render();
+    } catch (error) { S.resetPasswordError=error.message; render(); }
+  });
+  return div;
+}
+
+async function doSignIn() {
   const email = (S.loginEmail || $('login-email')?.value || '').toLowerCase().trim();
   const pw    = ($('login-pw')?.value || '');
   S.loginEmail = email;
@@ -394,62 +555,78 @@ function doSignIn() {
     return;
   }
 
-  // 1. Try Platform Super Admin.
-  const sa = SUPER_ADMINS.find(a => a.email.toLowerCase() === email);
-  if (sa && sa.password === pw) {
-    if (sa.mustChangePassword) {
-      // Newly-provisioned super admin must set their own password first.
-      S.pwUser = sa;                    // referenced by renderFirstLogin
-      S.newPw1 = ''; S.newPw2 = ''; S.pwError = '';
-      S.view = 'firstlogin';
-      S.loginError = false;
-      render();
-      return;
-    }
-    S.activeSuperAdmin = sa;
-    S.view = 'super';
-    S.loginError = false;
+  const button = $('btn-signin');
+  if (button) { button.disabled = true; button.textContent = 'Signing in…'; }
+  try {
+    const result = await api('/auth/login', { method:'POST', body:{ email, password:pw } });
+    await handleAuthenticatedUser(result.user || result);
+  } catch (error) {
+    S.loginError = error.message || 'Invalid email or password.';
     render();
-    return;
   }
+}
 
-  // 2. Try Company Admin (temporary or saved workspace password).
-  const ca = COMPANY_ADMINS.find(a => a.email.toLowerCase() === email);
-  if (ca) {
-    // Core workspace accepts the temporary password forever, and any
-    // module-level password the admin has set. The force-change-on-first-use
-    // rule fires later inside each active module (POS handles this today).
-    if (pw === ca.tempPassword || pw === ca.posPassword) {
-      S.currentCompany = ca.company;
-      S.activeCompanyAdmin = ca;
-      // Reflect sign-in on the tenant row shown to the Super Admin.
-      const tRow = S.tenants.find(t => (t.adminEmail || '').toLowerCase() === email);
-      if (tRow) {
-        tRow.lastSignInAt = new Date().toISOString();
-        tRow.adminStatus  = 'active';
-      }
-      S.view = 'workspace';
-      S.loginError = false;
-      render();
-      return;
-    }
-  }
-
-  // 3. Newly-provisioned company admins whose tenant lives in S.tenants
-  //    (created via Super Admin "New Company") flow through first-login.
-  const tenant = S.tenants.find(t => (t.adminEmail || '').toLowerCase() === email);
-  if (tenant && pw === tenant.adminTempPassword) {
-    S.currentCompany = tenant.name;
-    S.pwUser = { email, tenantId: tenant.id };
+async function handleAuthenticatedUser(user, restoring = false) {
+  if (!user || !user.id) return;
+  const roles = Array.isArray(user.roles) ? user.roles : String(user.roles || '').split(',');
+  const isSuper = roles.includes('superadmin');
+  S.loginError = false;
+  S.currentCompany = user.company_name || 'Curdun ICT Solutions';
+  if (user.must_change_password) {
+    S.pwUser = user;
     S.newPw1 = ''; S.newPw2 = ''; S.pwError = '';
     S.view = 'firstlogin';
-    S.loginError = false;
     render();
     return;
   }
+  if (isSuper) {
+    S.activeSuperAdmin = { ...user, role:'Super Admin' };
+    S.activeCompanyAdmin = null;
+    S.view = 'super';
+    await loadPlatformData();
+  } else {
+    S.activeCompanyAdmin = { ...user, role:posRoleLabel(roles[0]) };
+    S.activeSuperAdmin = null;
+    S.view = 'workspace';
+  }
+  if (!restoring || S.view !== 'login') render();
+}
 
-  S.loginError = 'Invalid email or password.';
-  render();
+function posRoleLabel(role) {
+  return { admin:'Admin', store_manager:'Store Manager', senior_cashier:'Senior Cashier', cashier:'Cashier' }[role] || 'Cashier';
+}
+
+async function loadPlatformData() {
+  if (!S.activeSuperAdmin) return;
+  try {
+    const [overview, companies, users] = await Promise.all([
+      api('/platform/overview'), api('/platform/companies'), api('/platform/users')
+    ]);
+    S.platformOverview = overview;
+    S.platformUsers = users;
+    const platformAdmins = users.filter(user => String(user.roles || '').split(',').includes('superadmin'));
+    SUPER_ADMINS.splice(0, SUPER_ADMINS.length, ...platformAdmins.map(user => ({
+      id:Number(user.id), name:user.name, email:user.email, role:'Super Admin',
+      phone:user.phone || '', status:user.status || 'inactive',
+      mustChangePassword:Boolean(Number(user.must_change_password)), createdAt:(user.created_at || '').slice(0,10),
+      lastLoginAt:user.last_login_at || null,
+    })));
+    S.tenants = companies.map(company => ({
+      id:`TN-${String(company.id).padStart(4,'0')}`, companyId:Number(company.id), name:company.name,
+      city:company.city || '—', owner:company.admin_name || 'Not assigned', since:(company.created_at || '').slice(0,7),
+      plan:'Business', users:Number(company.user_count || 0), invoice:'0', region:'SO', adminEmail:company.admin_email || '',
+      adminId:company.admin_id ? Number(company.admin_id) : null, adminStatus:company.admin_status || 'inactive',
+      adminPhone:company.admin_phone || '', adminMustChangePassword:Boolean(Number(company.admin_must_change_password)),
+      lastSignInAt:company.admin_last_login_at || null, deliveryChannel:company.admin_delivery_channel || null,
+      deliveryStatus:company.admin_delivery_status || null, deliveryAt:company.admin_delivery_at || null, pendingReset:null,
+    }));
+    S.licenses = {};
+    companies.forEach(company => { S.licenses[`TN-${String(company.id).padStart(4,'0')}`] = { pharmacy:false,financials:false,crm:false,hr:false,pos:Boolean(Number(company.pos_enabled)),university:false,hotel:false,hospital:false }; });
+    if (S.tenants.length && !S.tenants.some(item => item.id === S.selectedTenantId)) S.selectedTenantId = S.tenants[0].id;
+  } catch (error) {
+    console.error('Platform data load failed:', error);
+    S.platformLoadError = error.message;
+  }
 }
 
 // ============================================================
@@ -479,13 +656,13 @@ function renderFirstLogin() {
       </div>
       <div class="first-login-body">
         <div class="first-login-info">
-          Welcome <b style="color:var(--purple-800)">Hodan Warsame</b>. You signed in with the temporary password Curdun sent by SMS.<br>
+          Welcome <b style="color:var(--purple-800)">${S.pwUser?.name || 'User'}</b>. You signed in with a temporary password.<br>
           Before you enter your workspace, please set a personal password that only you know.
         </div>
         <div class="flex-col gap-14">
           <div class="form-group">
             <label class="form-label">Your account</label>
-            <div class="form-input mono" style="color:var(--purple-800)">hodan@baraka.so</div>
+            <div class="form-input mono" style="color:var(--purple-800)">${S.pwUser?.email || ''}</div>
           </div>
           <div class="form-group">
             <label class="form-label" for="pw1">New password</label>
@@ -512,12 +689,22 @@ function renderFirstLogin() {
 
   div.querySelector('#pw1').addEventListener('input', e => { S.newPw1=e.target.value; S.pwError=''; renderPartialPwRules(div); });
   div.querySelector('#pw2').addEventListener('input', e => { S.newPw2=e.target.value; S.pwError=''; renderPartialPwRules(div); });
-  div.querySelector('#btn-setpw').addEventListener('click', () => {
+  div.querySelector('#btn-setpw').addEventListener('click', async (event) => {
     if (!S.newPw1 || S.newPw1.length < 10) { S.pwError='Password must be at least 10 characters.'; render(); return; }
     if (!/[A-Z]/.test(S.newPw1)) { S.pwError='Add at least one uppercase letter.'; render(); return; }
     if (!/[0-9]/.test(S.newPw1)) { S.pwError='Add at least one number.'; render(); return; }
     if (S.newPw1 !== S.newPw2)   { S.pwError='The two passwords do not match.'; render(); return; }
-    S.view = 'workspace'; render();
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = 'Saving…';
+    try {
+      const user = await api('/auth/change-password', { method:'POST', body:{ password:S.newPw1, password_confirmation:S.newPw2 } });
+      S.pwUser = null;
+      await handleAuthenticatedUser(user);
+    } catch (error) {
+      S.pwError = error.message || 'Unable to change password.';
+      render();
+    }
   });
   return div;
 }
@@ -555,6 +742,7 @@ function renderSuper() {
 
 function renderSidebar() {
   const aside = document.createElement('aside');
+  const operatorName = S.activeSuperAdmin?.name || 'Platform Administrator';
   aside.className = 'sidebar';
   aside.innerHTML = `
     <div class="sidebar-header">
@@ -589,9 +777,9 @@ function renderSidebar() {
     </nav>
     <div class="sidebar-spacer"></div>
     <div class="sidebar-user">
-      <div class="avatar-pill">AK</div>
+      <div class="avatar-pill">${esc(initials(operatorName))}</div>
       <div class="sidebar-user-info">
-        <div class="sidebar-user-name">Adamu Kaduna</div>
+        <div class="sidebar-user-name">${esc(operatorName)}</div>
         <div class="sidebar-user-role">Global Super Admin</div>
       </div>
       <button class="sidebar-logout" id="btn-logout" title="Sign out">
@@ -860,8 +1048,8 @@ function renderOverviewTab() {
           <div class="flex items-center gap-12" style="padding:12px 20px;border-top:1px solid #F0EEF7">
             <div style="width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#2D1859,#4A2B8A);color:#F5C411;display:grid;place-items:center;font-weight:900;font-size:12px;flex-shrink:0">${initials(c.name)}</div>
             <div style="flex:1;min-width:0">
-              <div style="font-weight:700;color:var(--text-primary);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${c.name}</div>
-              <div style="font-size:11px;color:var(--text-muted)">${c.city} · ${c.plan} · ${grantedCount(c.id)} modules</div>
+              <div style="font-weight:700;color:var(--text-primary);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(c.name)}</div>
+              <div style="font-size:11px;color:var(--text-muted)">${esc(c.city)} · ${esc(c.plan)} · ${grantedCount(c.id)} modules</div>
             </div>
             <div style="text-align:right"><div style="font-weight:800;font-size:13px">$ ${c.invoice}</div><div style="font-size:10px;color:var(--text-muted)">${c.users} users</div></div>
           </div>
@@ -956,7 +1144,7 @@ function renderCompaniesTab() {
                 <td style="cursor:pointer" data-select="${t.id}">
                   <div class="flex items-center gap-10">
                     <div style="width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#2D1859,#4A2B8A);color:#F5C411;display:grid;place-items:center;font-weight:900;font-size:11px;flex-shrink:0">${initials(t.name)}</div>
-                    <div><div style="font-weight:700;color:var(--text-primary)">${t.name}</div><div style="font-size:11px;color:var(--text-muted)">${t.city} · Owner ${t.owner}</div></div>
+                    <div><div style="font-weight:700;color:var(--text-primary)">${esc(t.name)}</div><div style="font-size:11px;color:var(--text-muted)">${esc(t.city)} · Owner ${esc(t.owner)}</div></div>
                   </div>
                 </td>
                 <td><span style="font-size:11px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase;padding:4px 10px;border-radius:999px;background:#F5C41133;color:#8B5A00">${t.plan}</span></td>
@@ -981,8 +1169,8 @@ function renderCompaniesTab() {
       <div class="tenant-drilldown-avatar">${initials(tenant.name)}</div>
       <div>
         <div class="tenant-id">Tenant · ${tenant.id}</div>
-        <h2 class="tenant-name">${tenant.name}</h2>
-        <div class="tenant-meta">${tenant.city} · Owner: ${tenant.owner} · Since ${tenant.since}</div>
+        <h2 class="tenant-name">${esc(tenant.name)}</h2>
+        <div class="tenant-meta">${esc(tenant.city)} · Owner: ${esc(tenant.owner)} · Since ${esc(tenant.since)}</div>
       </div>
       <div class="ml-auto flex gap-10" style="flex-wrap:wrap">
         <span class="pill pill-green">● Active</span>
@@ -1004,7 +1192,7 @@ function renderCompaniesTab() {
           <div class="module-grant-card ${m.on?'on':'off'}">
             <div class="flex justify-between items-center">
               <div class="grant-icon-wrap">${m.icon}</div>
-              <button class="toggle-wrap ${m.on?'on':''}" data-toggle="${m.key}"><span class="toggle-knob"></span></button>
+              <button class="toggle-wrap ${m.on?'on':''}" data-toggle="${m.key}" ${m.key!=='pos'?'disabled title="Coming soon"':''}><span class="toggle-knob"></span></button>
             </div>
             <div class="grant-title ${m.on?'on':'off'}">${m.name}</div>
             <div class="grant-meta">${m.on?'GRANTED · '+m.v:'NOT LICENSED'}</div>
@@ -1024,75 +1212,81 @@ function renderCompaniesTab() {
 
 // ---- ADMINS TAB ----
 function renderAdminsTab() {
-  // Real counts from state (was previously hardcoded).
-  const total     = S.tenants.length;
-  const active    = S.tenants.filter(t => t.adminStatus === 'active').length;
-  const invited   = S.tenants.filter(t => t.adminStatus === 'invited').length;
-  const suspended = S.tenants.filter(t => t.adminStatus === 'suspended').length;
-  const suspendedName = S.tenants.find(t => t.adminStatus === 'suspended')?.name || '—';
-
-  // Status pill config per state
-  const statusPill = {
-    active:    { cls:'pill-green', label:'● Active' },
-    suspended: { cls:'pill-red',   label:'● Suspended' },
-    invited:   { cls:'pill-amber', label:'● Invited' },
-  };
-
-  // Optional filter from the platform-wide header search
+  const admins = S.tenants.filter(t => t.adminId);
+  const statusOf = t => ['suspended','inactive'].includes(t.adminStatus) ? 'suspended' : (t.adminMustChangePassword ? 'invited' : 'active');
+  const total = admins.length;
+  const active = admins.filter(t => statusOf(t)==='active').length;
+  const invited = admins.filter(t => statusOf(t)==='invited').length;
+  const suspended = admins.filter(t => statusOf(t)==='suspended').length;
   const q = (S.platformSearch || '').toLowerCase().trim();
-  const rows = q === ''
-    ? S.tenants
-    : S.tenants.filter(t =>
+  const filter = S.companyAdminStatus || 'all';
+  const rows = admins.filter(t =>
+      (filter === 'all' || statusOf(t) === filter) &&
+      (!q ||
         t.name.toLowerCase().includes(q) ||
         t.owner.toLowerCase().includes(q) ||
-        (t.adminEmail || '').toLowerCase().includes(q));
+        (t.adminEmail || '').toLowerCase().includes(q) ||
+        (t.adminPhone || '').toLowerCase().includes(q)));
+  const statusPill = {
+    active:{cls:'pill-green',label:'● Active'}, invited:{cls:'pill-amber',label:'● Invited'}, suspended:{cls:'pill-red',label:'● Suspended'},
+  };
+  const deliveryLabel = t => {
+    if (!t.deliveryStatus) return '<span style="color:var(--text-muted)">No delivery yet</span>';
+    const color = t.deliveryStatus === 'sent' ? '#0F7A3A' : (t.deliveryStatus === 'preview' ? '#B45309' : '#B42318');
+    const channel = t.deliveryChannel === 'sms' ? 'SMS' : 'Email';
+    return `<span style="color:${color};font-weight:700">${channel} · ${esc(t.deliveryStatus)}</span><div style="font-size:10px;color:var(--text-muted);margin-top:2px">${formatRelativeTime(t.deliveryAt)}</div>`;
+  };
 
   return `
     <div class="page-title-bar">
       <div>
         <div class="page-title-eyebrow">Access Control</div>
         <h1 class="page-title">Company Admins</h1>
-        <div class="page-subtitle">Each company you add to Cor gets <b style="color:#2D1859">one login</b> — the Company Admin. They receive the credentials by SMS/email, sign in, and from there they create their own staff. You do <b>not</b> create staff for them.</div>
+        <div class="page-subtitle">Every registered company has one primary administrator. Invitations and password recovery are delivered automatically by email or secure SMS OTP and recorded for audit.</div>
       </div>
       <button class="btn btn-gold" id="btn-invite-admin">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-        Invite a new admin
+        Add company & admin
       </button>
     </div>
     <section class="admins-stat-grid">
-      <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Total admins</div><div class="kpi-value">${total}</div><div class="kpi-trend" style="color:#EFEAFB">One per company</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Active</div><div class="kpi-value" style="color:#0F7A3A">${active}</div><div class="kpi-trend">Signed in recently</div></div>
+      <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Total admins</div><div class="kpi-value">${total}</div><div class="kpi-trend" style="color:#EFEAFB">Real assigned accounts</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Active</div><div class="kpi-value" style="color:#0F7A3A">${active}</div><div class="kpi-trend">Setup completed</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Invited</div><div class="kpi-value" style="color:#B45309">${invited}</div><div class="kpi-trend">Pending first sign-in</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Suspended</div><div class="kpi-value" style="color:#B42318">${suspended}</div><div class="kpi-trend">${suspended ? suspendedName : 'None'}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Suspended</div><div class="kpi-value" style="color:#B42318">${suspended}</div><div class="kpi-trend">Access currently blocked</div></div>
     </section>
     <section class="data-section">
       <div class="section-header-bar">
-        <h3 class="chart-title">All company admins${q ? ` <span style="font-size:12px;color:var(--text-muted);font-weight:500">— filter: "${q}"</span>` : ''}</h3>
+        <h3 class="chart-title" style="margin-right:auto">All company admins${q ? ` <span style="font-size:12px;color:var(--text-muted);font-weight:500">— “${esc(q)}”</span>` : ''}</h3>
+        <select class="form-input" id="company-admin-filter" style="width:auto;min-width:150px"><option value="all" ${filter==='all'?'selected':''}>All statuses</option><option value="active" ${filter==='active'?'selected':''}>Active</option><option value="invited" ${filter==='invited'?'selected':''}>Invited</option><option value="suspended" ${filter==='suspended'?'selected':''}>Suspended</option></select>
       </div>
       <div class="overflow-x-auto">
-        <table class="data-table" style="min-width:700px">
-          <thead><tr><th>Admin</th><th>Company</th><th>Plan</th><th>Last sign-in</th><th>Status</th><th class="col-right">Actions</th></tr></thead>
+        <table class="data-table" style="min-width:930px">
+          <thead><tr><th>Admin</th><th>Company</th><th>Last sign-in</th><th>Last delivery</th><th>Status</th><th class="col-right">Actions</th></tr></thead>
           <tbody>
             ${rows.length === 0 ? `
-              <tr><td colspan="6" style="padding:24px;text-align:center;color:var(--text-muted);font-style:italic">No admins match "${q}".</td></tr>
+              <tr><td colspan="6" style="padding:30px;text-align:center;color:var(--text-muted)">No assigned company administrators match this view.</td></tr>
             ` : rows.map(t => {
-              const s = statusPill[t.adminStatus] || statusPill.active;
-              const pending = t.pendingReset ? ` <span title="Reset link generated" style="font-size:11px;color:var(--amber);margin-left:6px">↺ reset pending</span>` : '';
+              const state = statusOf(t);
+              const s = statusPill[state];
               return `<tr>
                 <td>
                   <div class="flex items-center gap-10">
                     <div style="width:32px;height:32px;border-radius:50%;background:#2D1859;color:#F5C411;display:grid;place-items:center;font-weight:900;font-size:11px;flex-shrink:0">${initials(t.owner)}</div>
                     <div>
-                      <div style="font-weight:700">${t.owner}</div>
-                      <div style="font-size:11px;color:var(--text-muted)">${t.adminEmail || '—'}</div>
+                      <div style="font-weight:700">${esc(t.owner)}</div>
+                      <div style="font-size:11px;color:var(--text-muted)">${esc(t.adminEmail || '—')}</div>
+                      <div style="font-size:10px;color:var(--text-muted)">${esc(t.adminPhone || 'No phone registered')}</div>
                     </div>
                   </div>
                 </td>
-                <td style="font-weight:600">${t.name}${pending}</td>
-                <td><span style="font-size:11px;font-weight:800;padding:3px 8px;border-radius:999px;background:#F5C41133;color:#8B5A00">${t.plan}</span></td>
+                <td style="font-weight:600">${esc(t.name)}<div style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono)">${esc(t.id)}</div></td>
                 <td style="color:var(--text-muted);font-size:12px">${formatRelativeTime(t.lastSignInAt)}</td>
+                <td style="font-size:11px">${deliveryLabel(t)}</td>
                 <td><span class="pill ${s.cls}">${s.label}</span></td>
                 <td class="col-right">
+                  <button class="btn btn-outline btn-xs" data-edit-company-admin="${t.id}">Edit</button>
+                  <button class="btn btn-outline btn-xs" data-toggle-admin="${t.id}">${state==='suspended'?'Activate':'Suspend'}</button>
                   <button class="btn btn-outline btn-xs" data-reset-admin="${t.id}">Reset password</button>
                 </td>
               </tr>`;
@@ -1103,6 +1297,7 @@ function renderAdminsTab() {
     </section>
 
     ${renderResetAdminModal()}
+    ${renderCompanyAdminModal()}
   `;
 }
 
@@ -1119,23 +1314,22 @@ function renderResetAdminModal() {
   if (!t) return '';
 
   if (m.step === 'sent') {
+    const delivery = m.delivery || {};
+    const isSuccess = ['sent','preview'].includes(delivery.status);
     return `
       <div class="crud-overlay" data-modal-close>
         <div class="crud-modal" style="max-width:520px" onclick="event.stopPropagation()">
           <div class="crud-modal-header">
-            <h3>Reset link generated</h3>
+            <h3>${isSuccess ? 'Password reset delivered' : 'Delivery needs attention'}</h3>
             <button class="crud-close-btn" data-modal-close>×</button>
           </div>
           <div class="crud-modal-body">
-            <div style="padding:14px;background:#DEF7EC;border:1px solid #86EFAC;border-radius:10px;margin-bottom:16px;font-size:13px;color:#065F46">
-              ✓ Sent to <b>${t.adminEmail}</b>${m.sendSMS ? ' and via SMS' : ''}. The admin has 60 minutes to use the link.
+            <div style="padding:14px;background:${isSuccess?'#DEF7EC':'#FEE4E2'};border:1px solid ${isSuccess?'#86EFAC':'#FDA29B'};border-radius:10px;margin-bottom:16px;font-size:13px;color:${isSuccess?'#065F46':'#B42318'}">
+              ${isSuccess?'✓':'⚠'} ${esc(delivery.message || 'Delivery could not be completed.')}<br><b>${esc(delivery.destination || (m.channel==='sms'?t.adminPhone:t.adminEmail))}</b>
             </div>
-            <label class="form-label">Reset link (share only if the admin didn't receive the email)</label>
-            <div style="display:flex;gap:8px;margin-top:4px">
-              <input class="form-input mono" id="reset-link-input" value="${m.link}" readonly onfocus="this.select()" style="font-size:12px"/>
-              <button class="btn btn-primary btn-sm" id="btn-copy-reset-link" style="flex-shrink:0">Copy</button>
-            </div>
-            <div style="font-size:11px;color:var(--text-muted);margin-top:6px">Token: <span class="mono">${m.token}</span> · expires in 60 min</div>
+            ${delivery.preview_link ? `<label class="form-label">Local preview link</label><div style="display:flex;gap:8px;margin-top:4px"><input class="form-input mono" id="reset-link-input" value="${esc(delivery.preview_link)}" readonly onfocus="this.select()" style="font-size:12px"/><button class="btn btn-primary btn-sm" id="btn-copy-reset-link">Copy</button></div>` : ''}
+            ${delivery.preview_otp ? `<label class="form-label">Local preview OTP</label><div style="display:flex;gap:8px;margin-top:4px"><input class="form-input mono" id="reset-otp-input" value="${esc(delivery.preview_otp)}" readonly style="font-size:20px;letter-spacing:6px"/><button class="btn btn-primary btn-sm" id="btn-copy-reset-otp">Copy</button></div>` : ''}
+            <div style="font-size:11px;color:var(--text-muted);margin-top:10px">${m.channel==='sms'?'OTP expires in 10 minutes and allows 5 attempts.':'Email link expires in 60 minutes.'} ${delivery.status==='preview'?'Configure the production provider in backend/.env before deployment.':''}</div>
           </div>
           <div class="crud-modal-footer">
             <button class="btn btn-primary" data-modal-close>Done</button>
@@ -1157,45 +1351,98 @@ function renderResetAdminModal() {
           <div style="display:flex;align-items:center;gap:12px;padding:14px;background:var(--gray-50);border-radius:10px;margin-bottom:16px">
             <div style="width:44px;height:44px;border-radius:50%;background:#2D1859;color:#F5C411;display:grid;place-items:center;font-weight:900;font-size:14px">${initials(t.owner)}</div>
             <div>
-              <div style="font-weight:800;font-size:15px">${t.owner}</div>
-              <div style="font-size:12px;color:var(--text-muted)">${t.adminEmail} · ${t.name}</div>
+              <div style="font-weight:800;font-size:15px">${esc(t.owner)}</div>
+              <div style="font-size:12px;color:var(--text-muted)">${esc(t.adminEmail)} · ${esc(t.name)}</div>
             </div>
           </div>
           <div style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:16px">
-            A one-time reset link will be generated. The admin can use it to set a new password (valid for 60 minutes).
-            The old password stops working the moment they open the link.
+            Choose how the administrator should receive password recovery. The existing password remains active until recovery is completed.
           </div>
           <div class="form-group">
-            <label class="form-label">Delivery channels</label>
-            <label style="display:flex;align-items:center;gap:8px;font-size:13px;padding:6px 0"><input type="checkbox" id="reset-email" checked/> Send by email <span style="color:var(--text-muted)">(${t.adminEmail})</span></label>
-            <label style="display:flex;align-items:center;gap:8px;font-size:13px;padding:6px 0"><input type="checkbox" id="reset-sms"/> Send by SMS (Hormuud)</label>
+            <label class="form-label">Delivery channel</label>
+            <div class="filter-pills" style="margin-top:6px">
+              <button class="filter-pill ${m.channel==='email'?'active':''}" data-reset-channel="email">Email reset link</button>
+              <button class="filter-pill ${m.channel==='sms'?'active':''}" data-reset-channel="sms" ${!t.adminPhone?'disabled title="Add a phone number first"':''}>SMS OTP</button>
+            </div>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:9px">${m.channel==='sms' ? esc(t.adminPhone || 'No phone number registered') : esc(t.adminEmail)}</div>
+            ${m.error ? `<div style="margin-top:12px;color:var(--red);font-size:12px">${esc(m.error)}</div>` : ''}
           </div>
         </div>
         <div class="crud-modal-footer">
           <button class="btn btn-ghost" data-modal-close>Cancel</button>
-          <button class="btn btn-primary" id="btn-send-reset">Generate &amp; send reset link</button>
+          <button class="btn btn-primary" id="btn-send-reset">Send ${m.channel==='sms'?'OTP':'reset email'}</button>
         </div>
       </div>
     </div>
   `;
 }
 
+function renderCompanyAdminModal() {
+  const modal = S.companyAdminModal;
+  if (!modal || modal.type !== 'edit') return '';
+  const tenant = S.tenants.find(item => item.id === modal.tenantId);
+  if (!tenant?.adminId) return '';
+  return `<div class="crud-overlay" data-company-admin-close>
+    <div class="crud-modal" style="max-width:560px" onclick="event.stopPropagation()">
+      <div class="crud-modal-header"><h3>Edit Company Admin</h3><button class="crud-close-btn" data-company-admin-close>×</button></div>
+      <div class="crud-modal-body">
+        <div style="padding:11px 13px;background:var(--gray-50);border-radius:9px;margin-bottom:15px;font-size:12px"><b>${esc(tenant.name)}</b> · Primary Company Admin</div>
+        <div class="form-group"><label class="form-label">Full name *</label><input class="form-input" id="company-admin-name" value="${esc(tenant.owner)}"/></div>
+        <div class="form-group"><label class="form-label">Email *</label><input class="form-input" id="company-admin-email" type="email" value="${esc(tenant.adminEmail)}"/></div>
+        <div class="form-group"><label class="form-label">Phone</label><input class="form-input" id="company-admin-phone" type="tel" value="${esc(tenant.adminPhone || '')}" placeholder="+252 61 000 0000"/><div class="cred-hint">Required when delivering password resets by SMS OTP.</div></div>
+        ${modal.error ? `<div style="color:var(--red);font-size:12px">${esc(modal.error)}</div>` : ''}
+      </div>
+      <div class="crud-modal-footer"><button class="btn btn-ghost" data-company-admin-close>Cancel</button><button class="btn btn-primary" id="btn-save-company-admin">Save changes</button></div>
+    </div>
+  </div>`;
+}
+
 // ---- PLATFORM ADMINS TAB (Curdun-level super admins) ----
 function renderPlatformAdminsTab() {
-  const rows = SUPER_ADMINS.map(a => `
+  const query = (S.platformAdminQuery || '').trim().toLowerCase();
+  const filter = S.platformAdminStatus || 'all';
+  const currentId = Number(S.activeSuperAdmin?.id || 0);
+  const statusOf = admin => admin.status !== 'active' ? admin.status : (admin.mustChangePassword ? 'pending' : 'active');
+  const visibleAdmins = SUPER_ADMINS.filter(admin => {
+    const matchesText = !query || `${admin.name} ${admin.email} ${admin.phone}`.toLowerCase().includes(query);
+    return matchesText && (filter === 'all' || statusOf(admin) === filter);
+  });
+  const counts = {
+    active: SUPER_ADMINS.filter(a => a.status === 'active').length,
+    pending: SUPER_ADMINS.filter(a => a.status === 'active' && a.mustChangePassword).length,
+    suspended: SUPER_ADMINS.filter(a => a.status === 'suspended').length,
+  };
+  const badge = admin => {
+    const status = statusOf(admin);
+    const labels = { active:'Active', pending:'Pending first sign-in', suspended:'Suspended', inactive:'Inactive' };
+    const classes = { active:'pill-green', pending:'pill-amber', suspended:'pill-red', inactive:'' };
+    return `<span class="pill ${classes[status] || ''}">${labels[status] || esc(status)}</span>`;
+  };
+  const rows = visibleAdmins.map(a => `
     <tr>
       <td style="padding:12px 16px">
         <div style="display:flex;align-items:center;gap:10px">
           <div class="avatar avatar-sm" style="background:var(--purple-800);color:var(--gold)">${initials(a.name)}</div>
           <div>
-            <div style="font-weight:700">${a.name}</div>
-            <div style="font-size:12px;color:var(--text-muted)">${a.email}</div>
+            <div style="font-weight:700">${esc(a.name)} ${a.id === currentId ? '<span class="pill pill-purple" style="font-size:9px;padding:2px 7px;margin-left:5px">YOU</span>' : ''}</div>
+            <div style="font-size:12px;color:var(--text-muted)">${esc(a.email)}</div>
+            ${a.phone ? `<div style="font-size:11px;color:var(--text-muted)">${esc(a.phone)}</div>` : ''}
           </div>
         </div>
       </td>
-      <td style="padding:12px 16px"><span class="role-tag role-pharmacist">${a.role}</span></td>
-      <td style="padding:12px 16px;font-size:12px;color:var(--text-muted)">${a.mustChangePassword ? 'Pending first sign-in' : 'Active'}</td>
+      <td style="padding:12px 16px">${badge(a)}</td>
+      <td style="padding:12px 16px;font-size:12px;color:var(--text-muted)">${formatRelativeTime(a.lastLoginAt)}</td>
       <td style="padding:12px 16px;font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${a.createdAt || '—'}</td>
+      <td style="padding:12px 16px">
+        <div class="crud-actions">
+          <button class="crud-btn crud-btn-edit" data-platform-edit="${a.id}" title="Edit profile">✎</button>
+          <button class="crud-btn" data-platform-reset="${a.id}" title="Generate password reset link">↻</button>
+          ${a.id === currentId ? '' : `
+            <button class="crud-btn" data-platform-status="${a.id}" title="${a.status === 'active' ? 'Suspend' : 'Activate'} account">${a.status === 'active' ? '⊘' : '✓'}</button>
+            <button class="crud-btn crud-btn-delete" data-platform-remove="${a.id}" title="Remove account">⌫</button>
+          `}
+        </div>
+      </td>
     </tr>
   `).join('');
 
@@ -1208,20 +1455,36 @@ function renderPlatformAdminsTab() {
       </div>
     </div>
 
+    <section class="kpi-grid">
+      <div class="kpi-card dark"><div class="kpi-eyebrow">Total operators</div><div class="kpi-value">${SUPER_ADMINS.length}</div><div class="kpi-trend">Root-level accounts</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Active</div><div class="kpi-value">${counts.active}</div><div class="kpi-trend trend-up">Can access the platform</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Pending setup</div><div class="kpi-value">${counts.pending}</div><div class="kpi-trend">Awaiting first sign-in</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Suspended</div><div class="kpi-value">${counts.suspended}</div><div class="kpi-trend ${counts.suspended ? 'trend-warn' : 'trend-up'}">Access blocked</div></div>
+    </section>
+
     <section class="two-col-grid">
       <div class="data-section">
         <div class="section-header-bar">
-          <div><div class="section-eyebrow">Operators</div><h2 class="section-h2">${SUPER_ADMINS.length} active</h2></div>
+          <div style="margin-right:auto"><div class="section-eyebrow">Operators</div><h2 class="section-h2">${visibleAdmins.length} shown</h2></div>
+          <input class="form-input" id="platform-admin-search" type="search" placeholder="Search name, email or phone…" value="${esc(S.platformAdminQuery || '')}" style="width:min(260px,100%)"/>
+          <select class="form-input" id="platform-admin-filter" style="width:auto;min-width:150px">
+            <option value="all" ${filter==='all'?'selected':''}>All statuses</option>
+            <option value="active" ${filter==='active'?'selected':''}>Active</option>
+            <option value="pending" ${filter==='pending'?'selected':''}>Pending setup</option>
+            <option value="suspended" ${filter==='suspended'?'selected':''}>Suspended</option>
+            <option value="inactive" ${filter==='inactive'?'selected':''}>Inactive</option>
+          </select>
         </div>
         <div class="overflow-x-auto">
-          <table class="data-table">
+          <table class="data-table" style="min-width:820px">
             <thead><tr>
               <th style="padding:12px 16px;text-align:left">Name / email</th>
-              <th style="padding:12px 16px;text-align:left">Role</th>
               <th style="padding:12px 16px;text-align:left">Status</th>
+              <th style="padding:12px 16px;text-align:left">Last sign-in</th>
               <th style="padding:12px 16px;text-align:left">Created</th>
+              <th style="padding:12px 16px;text-align:right">Actions</th>
             </tr></thead>
-            <tbody>${rows}</tbody>
+            <tbody>${rows || `<tr><td colspan="5" style="padding:34px;text-align:center;color:var(--text-muted)">No platform administrators match this filter.</td></tr>`}</tbody>
           </table>
         </div>
       </div>
@@ -1233,26 +1496,32 @@ function renderPlatformAdminsTab() {
         </div>
         <div class="form-group">
           <label class="form-label" style="color:#FFF">Full name</label>
-          <input class="form-input" id="new-sa-name" placeholder="e.g. Amina Hassan" value="${S._newSA?.name || ''}"/>
+          <input class="form-input" id="new-sa-name" placeholder="e.g. Amina Hassan" value="${esc(S._newSA?.name || '')}"/>
         </div>
         <div class="form-group">
           <label class="form-label" style="color:#FFF">Email</label>
-          <input class="form-input" id="new-sa-email" type="email" placeholder="operator@curdun.so" value="${S._newSA?.email || ''}"/>
+          <input class="form-input" id="new-sa-email" type="email" placeholder="operator@curdun.so" value="${esc(S._newSA?.email || '')}"/>
         </div>
+        <div class="form-group">
+          <label class="form-label" style="color:#FFF">Phone <span style="font-weight:500;opacity:.75">(optional)</span></label>
+          <input class="form-input" id="new-sa-phone" type="tel" placeholder="+252 61 000 0000" value="${esc(S._newSA?.phone || '')}"/>
+        </div>
+        ${S.platformAdminError ? `<div style="padding:10px 12px;border-radius:9px;background:#FEE4E2;color:#B42318;font-size:12px">${esc(S.platformAdminError)}</div>` : ''}
         ${S._newSAResult ? `
           <div class="cred-box" style="grid-column:auto">
             <div class="cred-box-header">
               <div>
                 <div class="cred-eyebrow">CREATED</div>
-                <div class="cred-title">${S._newSAResult.name}</div>
-                <div class="cred-subtitle">${S._newSAResult.email}</div>
+                <div class="cred-title">${esc(S._newSAResult.name)}</div>
+                <div class="cred-subtitle">${esc(S._newSAResult.email)}</div>
               </div>
             </div>
             <div>
               <div class="cred-field-label">Temporary password</div>
-              <input class="cred-input pw" value="${S._newSAResult.tempPassword}" readonly onfocus="this.select()"/>
+              <div style="display:flex;gap:8px"><input class="cred-input pw" id="new-sa-password" value="${esc(S._newSAResult.tempPassword)}" readonly onfocus="this.select()"/><button class="btn btn-primary btn-sm" id="btn-copy-sa-password">Copy</button></div>
               <div class="cred-hint">Share once. They'll be forced to change it on first sign-in.</div>
             </div>
+            <button class="btn btn-outline btn-sm" id="btn-dismiss-sa-result" style="margin-top:10px">Dismiss credentials</button>
           </div>
         ` : `
           <div class="cred-hint" style="color:#EFEAFB">No password to show yet.</div>
@@ -1260,7 +1529,62 @@ function renderPlatformAdminsTab() {
         <button class="btn btn-primary" id="btn-create-sa">Create admin</button>
       </div>
     </section>
+    ${renderPlatformAdminModal()}
   `;
+}
+
+function renderPlatformAdminModal() {
+  const modal = S.platformAdminModal;
+  if (!modal) return '';
+  const admin = SUPER_ADMINS.find(item => item.id === Number(modal.id));
+  if (!admin) return '';
+
+  if (modal.type === 'edit') return `
+    <div class="crud-overlay" data-platform-modal-close>
+      <div class="crud-modal" style="max-width:560px" onclick="event.stopPropagation()">
+        <div class="crud-modal-header"><h3>Edit Platform Admin</h3><button class="crud-close-btn" data-platform-modal-close>×</button></div>
+        <div class="crud-modal-body">
+          <div class="form-group"><label class="form-label">Full name *</label><input class="form-input" id="platform-edit-name" value="${esc(admin.name)}"/></div>
+          <div class="form-group"><label class="form-label">Email *</label><input class="form-input" id="platform-edit-email" type="email" value="${esc(admin.email)}"/></div>
+          <div class="form-group"><label class="form-label">Phone</label><input class="form-input" id="platform-edit-phone" type="tel" value="${esc(admin.phone || '')}" placeholder="+252 61 000 0000"/></div>
+          <div style="padding:12px;background:var(--gray-50);border-radius:10px;font-size:12px;color:var(--text-muted)">Role: <strong style="color:var(--text-primary)">Super Admin</strong> · Access to every company and platform setting.</div>
+          ${modal.error ? `<div style="color:var(--red);font-size:12px;margin-top:12px">${esc(modal.error)}</div>` : ''}
+        </div>
+        <div class="crud-modal-footer"><button class="btn btn-ghost" data-platform-modal-close>Cancel</button><button class="btn btn-primary" id="btn-save-platform-admin">Save changes</button></div>
+      </div>
+    </div>`;
+
+  if (modal.type === 'reset' && modal.step === 'sent') return `
+    <div class="crud-overlay" data-platform-modal-close>
+      <div class="crud-modal" style="max-width:560px" onclick="event.stopPropagation()">
+        <div class="crud-modal-header"><h3>Reset link ready</h3><button class="crud-close-btn" data-platform-modal-close>×</button></div>
+        <div class="crud-modal-body">
+          <div style="padding:12px;background:${modal.delivery?.status==='failed'?'#FEE4E2':'#ECFDF3'};border:1px solid ${modal.delivery?.status==='failed'?'#FDA29B':'#86EFAC'};border-radius:10px;color:${modal.delivery?.status==='failed'?'#B42318':'#166534'};font-size:13px;margin-bottom:16px">${esc(modal.delivery?.message || 'Password reset delivery processed.')} <strong>${esc(modal.delivery?.destination || admin.email)}</strong></div>
+          ${modal.delivery?.preview_link ? `<label class="form-label">Local preview link</label><div style="display:flex;gap:8px;margin-top:5px"><input class="form-input mono" id="platform-reset-link" value="${esc(modal.delivery.preview_link)}" readonly onfocus="this.select()"/><button class="btn btn-primary btn-sm" id="btn-copy-platform-reset">Copy</button></div>` : ''}
+          <div style="font-size:11px;color:var(--text-muted);margin-top:8px">Valid for 60 minutes. The current password remains valid until this link is completed.</div>
+        </div>
+        <div class="crud-modal-footer"><button class="btn btn-primary" data-platform-modal-close>Done</button></div>
+      </div>
+    </div>`;
+
+  if (modal.type === 'reset') return `
+    <div class="crud-overlay" data-platform-modal-close>
+      <div class="crud-modal" style="max-width:500px" onclick="event.stopPropagation()">
+        <div class="crud-modal-header"><h3>Reset password</h3><button class="crud-close-btn" data-platform-modal-close>×</button></div>
+        <div class="crud-modal-body"><p style="font-size:13px;line-height:1.6;color:var(--text-secondary)">Generate a secure, one-time reset link for <strong>${esc(admin.name)}</strong> (${esc(admin.email)}). This action is recorded in the audit trail.</p>${modal.error ? `<div style="color:var(--red);font-size:12px;margin-top:12px">${esc(modal.error)}</div>` : ''}</div>
+        <div class="crud-modal-footer"><button class="btn btn-ghost" data-platform-modal-close>Cancel</button><button class="btn btn-primary" id="btn-generate-platform-reset">Generate link</button></div>
+      </div>
+    </div>`;
+
+  return `
+    <div class="crud-overlay" data-platform-modal-close>
+      <div class="crud-confirm" onclick="event.stopPropagation()">
+        <div class="crud-confirm-icon">⚠️</div><h3>Remove Platform Admin?</h3>
+        <p><strong>${esc(admin.name)}</strong> will immediately lose all platform access. This cannot be undone from this screen.</p>
+        ${modal.error ? `<div style="color:var(--red);font-size:12px;margin-bottom:14px">${esc(modal.error)}</div>` : ''}
+        <div class="crud-confirm-actions"><button class="btn btn-ghost" data-platform-modal-close>Cancel</button><button class="btn-danger" id="btn-confirm-platform-remove">Remove admin</button></div>
+      </div>
+    </div>`;
 }
 
 // ---- MODULES CATALOG TAB ----
@@ -1528,22 +1852,47 @@ function wireTabEvents(wrap) {
       S.resetAdminModal = {
         tenantId: btn.dataset.resetAdmin,
         step: 'confirm',
-        sendEmail: true,
-        sendSMS: false,
+        channel: 'email',
         token: null,
-        link: null,
+        delivery: null,
       };
       render();
     });
   });
+  wrap.querySelectorAll('[data-toggle-admin]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const tenant = S.tenants.find(item => item.id === btn.dataset.toggleAdmin);
+      if (!tenant?.adminId) return;
+      const status = tenant.adminStatus === 'active' ? 'inactive' : 'active';
+      if (status === 'inactive' && !confirm(`Suspend ${tenant.owner}? They will immediately lose access to ${tenant.name}.`)) return;
+      try {
+        await api(`/platform/users/${tenant.adminId}`, { method:'PUT', body:{status} });
+        await loadPlatformData();
+        render();
+      } catch (error) { alert(error.message); }
+    });
+  });
   wrap.querySelector('#btn-invite-admin')?.addEventListener('click', () => {
-    // Opens the existing "Add company" flow — creating a company auto-provisions
-    // its Company Admin with a temp password (see the tenant-create modal).
-    S.tenantModalMode = 'add';
-    S.tenantForm = { name:'', city:'', plan:'Business', adminName:'', adminEmail:'' };
-    S.superTab = 'companies';
-    render();
-    setTimeout(() => document.getElementById('btn-add-company')?.click(), 50);
+    openCreate();
+  });
+  wrap.querySelector('#company-admin-filter')?.addEventListener('change', event => { S.companyAdminStatus=event.target.value; render(); });
+  wrap.querySelectorAll('[data-edit-company-admin]').forEach(button => button.addEventListener('click', () => {
+    S.companyAdminModal={type:'edit',tenantId:button.dataset.editCompanyAdmin}; render();
+  }));
+  wrap.querySelectorAll('[data-company-admin-close]').forEach(element => element.addEventListener('click', event => {
+    if (event.target === element) { S.companyAdminModal=null; render(); }
+  }));
+  wrap.querySelector('#btn-save-company-admin')?.addEventListener('click', async event => {
+    const modal=S.companyAdminModal;
+    const tenant=S.tenants.find(item=>item.id===modal?.tenantId);
+    if (!tenant?.adminId) return;
+    const name=(document.getElementById('company-admin-name')?.value||'').trim();
+    const email=(document.getElementById('company-admin-email')?.value||'').trim().toLowerCase();
+    const phone=(document.getElementById('company-admin-phone')?.value||'').trim();
+    if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { modal.error='A full name and valid email are required.'; render(); return; }
+    event.currentTarget.disabled=true; event.currentTarget.textContent='Saving…';
+    try { await api(`/platform/users/${tenant.adminId}`,{method:'PUT',body:{name,email,phone}}); S.companyAdminModal=null; await loadPlatformData(); render(); }
+    catch(error){ modal.error=error.message; render(); }
   });
 
   // Reset-password modal: close, generate, copy
@@ -1554,79 +1903,153 @@ function wireTabEvents(wrap) {
       if (e.target === el) { S.resetAdminModal = null; render(); }
     });
   });
+  wrap.querySelectorAll('[data-reset-channel]').forEach(button => button.addEventListener('click', () => {
+    if (button.disabled || !S.resetAdminModal) return;
+    S.resetAdminModal.channel=button.dataset.resetChannel; S.resetAdminModal.error=''; render();
+  }));
   wrap.querySelector('#btn-send-reset')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
     const m = S.resetAdminModal;
     if (!m) return;
-    m.sendEmail = document.getElementById('reset-email')?.checked ?? true;
-    m.sendSMS   = document.getElementById('reset-sms')?.checked ?? false;
-    if (!m.sendEmail && !m.sendSMS) { alert('Select at least one delivery channel.'); return; }
-
     const t = S.tenants.find(x => x.id === m.tenantId);
-    if (!t || !t.adminEmail) { alert('No admin email on file for this tenant.'); return; }
+    if (!t || !t.adminId) { alert('No administrator is assigned to this company.'); return; }
 
     btn.disabled = true;
     const origText = btn.textContent;
     btn.textContent = 'Generating…';
 
     try {
-      // Backend generates the token AND stores it in the password_resets table.
-      const data = await api('/auth/admin-reset', {
-        method: 'POST',
-        body:   { email: t.adminEmail },
-      });
+      const data = await api(`/platform/users/${t.adminId}/reset-password`, { method:'POST', body:{channel:m.channel} });
       m.token = data.token;
-      m.link  = `${location.origin}/app.html?reset=${data.token}`;
+      m.delivery = data.delivery;
       m.step  = 'sent';
-      t.pendingReset = { token: data.token, createdAt: new Date().toISOString(), expiresInMin: 60 };
+      t.pendingReset = { channel:m.channel, createdAt:new Date().toISOString(), expiresAt:data.expires_at };
+      t.deliveryStatus=data.delivery?.status; t.deliveryChannel=m.channel; t.deliveryAt=new Date().toISOString();
       render();
     } catch (err) {
-      btn.disabled = false;
-      btn.textContent = origText;
-      alert(`Failed to generate reset link: ${err.message}`);
+      m.error=err.message; render();
     }
   });
   wrap.querySelector('#btn-copy-reset-link')?.addEventListener('click', () => {
-    const input = document.getElementById('reset-link-input');
-    if (!input) return;
-    input.select();
-    navigator.clipboard.writeText(input.value).catch(() => document.execCommand('copy'));
-    const btn = document.getElementById('btn-copy-reset-link');
-    const orig = btn.textContent;
-    btn.textContent = '✓ Copied';
-    setTimeout(() => { btn.textContent = orig; }, 1500);
+    copyInputValue('reset-link-input', document.getElementById('btn-copy-reset-link'));
   });
+  wrap.querySelector('#btn-copy-reset-otp')?.addEventListener('click', () => copyInputValue('reset-otp-input', document.getElementById('btn-copy-reset-otp')));
 
   // Platform Admins: form field state + create
+  wrap.querySelector('#platform-admin-search')?.addEventListener('input', e => {
+    S.platformAdminQuery = e.target.value;
+    clearTimeout(S._platformSearchTimer);
+    S._platformSearchTimer = setTimeout(() => {
+      render();
+      const input = document.getElementById('platform-admin-search');
+      if (input) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+    }, 180);
+  });
+  wrap.querySelector('#platform-admin-filter')?.addEventListener('change', e => {
+    S.platformAdminStatus = e.target.value;
+    render();
+  });
   wrap.querySelector('#new-sa-name')?.addEventListener('input', e => {
     S._newSA = { ...(S._newSA || {}), name: e.target.value };
+    S.platformAdminError = '';
   });
   wrap.querySelector('#new-sa-email')?.addEventListener('input', e => {
     S._newSA = { ...(S._newSA || {}), email: e.target.value };
+    S.platformAdminError = '';
   });
-  wrap.querySelector('#btn-create-sa')?.addEventListener('click', () => {
+  wrap.querySelector('#new-sa-phone')?.addEventListener('input', e => {
+    S._newSA = { ...(S._newSA || {}), phone: e.target.value };
+    S.platformAdminError = '';
+  });
+  wrap.querySelector('#btn-create-sa')?.addEventListener('click', async event => {
     const f = S._newSA || {};
     const name  = (f.name || '').trim();
     const email = (f.email || '').trim().toLowerCase();
-    if (!name || !email) { alert('Name and email are required.'); return; }
+    const phone = (f.phone || '').trim();
+    if (!name || !email) { S.platformAdminError = 'Name and email are required.'; render(); return; }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { S.platformAdminError = 'Enter a valid email address.'; render(); return; }
     if (SUPER_ADMINS.some(a => a.email.toLowerCase() === email)) {
-      alert('A platform admin with that email already exists.'); return;
+      S.platformAdminError = 'A platform admin with that email already exists.'; render(); return;
     }
-    // Generate a temporary password — short human-readable prefix + 6 hex.
-    const rand = Math.random().toString(16).slice(2, 8).toUpperCase();
-    const tempPassword = `Cor-${rand}-26`;
-    const newSA = {
-      id: Math.max(...SUPER_ADMINS.map(a => a.id)) + 1,
-      name, email,
-      password: tempPassword,
-      role: 'Super Admin',
-      mustChangePassword: true,
-      createdAt: new Date().toISOString().slice(0, 10),
-    };
-    SUPER_ADMINS.push(newSA);
-    S._newSAResult = { name, email, tempPassword };   // shown in the panel
-    S._newSA = null;                                   // clear the form
+    const button = event.currentTarget;
+    button.disabled = true; button.textContent = 'Creating…';
+    try {
+      const data = await api('/platform/users', { method:'POST', body:{ name,email,phone,role:'superadmin',company_id:S.activeSuperAdmin?.company_id } });
+      const newSA = { id:data.user.id,name,email,phone,status:'active',role:'Super Admin',mustChangePassword:true,createdAt:new Date().toISOString().slice(0,10),lastLoginAt:null };
+      SUPER_ADMINS.push(newSA);
+      S._newSAResult = { name,email,tempPassword:data.temporary_password };
+      S._newSA = null;
+      S.platformAdminError = '';
+      await loadPlatformData();
+      render();
+    } catch (error) { S.platformAdminError = error.message; render(); }
+  });
+  wrap.querySelector('#btn-copy-sa-password')?.addEventListener('click', event => {
+    copyInputValue('new-sa-password', event.currentTarget);
+  });
+  wrap.querySelector('#btn-dismiss-sa-result')?.addEventListener('click', () => { S._newSAResult = null; render(); });
+
+  wrap.querySelectorAll('[data-platform-edit]').forEach(button => button.addEventListener('click', () => {
+    S.platformAdminModal = { type:'edit', id:Number(button.dataset.platformEdit) };
     render();
+  }));
+  wrap.querySelectorAll('[data-platform-reset]').forEach(button => button.addEventListener('click', () => {
+    S.platformAdminModal = { type:'reset', id:Number(button.dataset.platformReset), step:'confirm' };
+    render();
+  }));
+  wrap.querySelectorAll('[data-platform-remove]').forEach(button => button.addEventListener('click', () => {
+    S.platformAdminModal = { type:'remove', id:Number(button.dataset.platformRemove) };
+    render();
+  }));
+  wrap.querySelectorAll('[data-platform-status]').forEach(button => button.addEventListener('click', async () => {
+    const admin = SUPER_ADMINS.find(item => item.id === Number(button.dataset.platformStatus));
+    if (!admin) return;
+    const status = admin.status === 'active' ? 'suspended' : 'active';
+    if (status === 'suspended' && !confirm(`Suspend ${admin.name}? They will immediately lose platform access.`)) return;
+    button.disabled = true;
+    try {
+      await api(`/platform/users/${admin.id}`, { method:'PUT', body:{status} });
+      await loadPlatformData(); render();
+    } catch (error) { alert(error.message); button.disabled = false; }
+  }));
+
+  wrap.querySelectorAll('[data-platform-modal-close]').forEach(element => element.addEventListener('click', event => {
+    if (event.target === element) { S.platformAdminModal = null; render(); }
+  }));
+  wrap.querySelector('#btn-save-platform-admin')?.addEventListener('click', async event => {
+    const modal = S.platformAdminModal;
+    if (!modal) return;
+    const name = (document.getElementById('platform-edit-name')?.value || '').trim();
+    const email = (document.getElementById('platform-edit-email')?.value || '').trim().toLowerCase();
+    const phone = (document.getElementById('platform-edit-phone')?.value || '').trim();
+    if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { modal.error = 'A full name and valid email are required.'; render(); return; }
+    event.currentTarget.disabled = true; event.currentTarget.textContent = 'Saving…';
+    try {
+      await api(`/platform/users/${modal.id}`, { method:'PUT', body:{name,email,phone} });
+      S.platformAdminModal = null; await loadPlatformData(); render();
+    } catch (error) { modal.error = error.message; render(); }
+  });
+  wrap.querySelector('#btn-generate-platform-reset')?.addEventListener('click', async event => {
+    const modal = S.platformAdminModal;
+    if (!modal) return;
+    event.currentTarget.disabled = true; event.currentTarget.textContent = 'Generating…';
+    try {
+      const data = await api(`/platform/users/${modal.id}/reset-password`, { method:'POST', body:{channel:'email'} });
+      modal.step = 'sent'; modal.token = data.token; modal.delivery=data.delivery;
+      render();
+    } catch (error) { modal.error = error.message; render(); }
+  });
+  wrap.querySelector('#btn-copy-platform-reset')?.addEventListener('click', event => {
+    copyInputValue('platform-reset-link', event.currentTarget);
+  });
+  wrap.querySelector('#btn-confirm-platform-remove')?.addEventListener('click', async event => {
+    const modal = S.platformAdminModal;
+    if (!modal) return;
+    event.currentTarget.disabled = true; event.currentTarget.textContent = 'Removing…';
+    try {
+      await api(`/platform/users/${modal.id}`, { method:'DELETE' });
+      S.platformAdminModal = null; await loadPlatformData(); render();
+    } catch (error) { modal.error = error.message; render(); }
   });
 
   // Companies tab: select tenant
@@ -1635,12 +2058,18 @@ function wireTabEvents(wrap) {
   });
   // Toggle module license
   wrap.querySelectorAll('[data-toggle]').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const key = btn.dataset.toggle;
+      if (key !== 'pos') return;
       const id = S.selectedTenantId;
       if (!S.licenses[id]) S.licenses[id] = {};
-      S.licenses[id][key] = !S.licenses[id][key];
-      render();
+      const next = !S.licenses[id][key];
+      const tenant = getTenant(id);
+      try {
+        await api(`/platform/companies/${tenant.companyId}`, { method:'PUT', body:{ name:tenant.name, pos_enabled:next } });
+        S.licenses[id][key] = next;
+        render();
+      } catch (error) { alert(error.message); }
     });
   });
   // Delete tenant
@@ -1652,7 +2081,7 @@ function wireTabEvents(wrap) {
     btn.addEventListener('click', () => {
       const t = S.tenants.find(x=>x.id===btn.dataset.edit) || {};
       S.tenantModalMode = 'edit';
-      S.tenantForm = { ...t, adminEmail: t.adminEmail||'', adminPhone: t.adminPhone||'', adminPassword: t.adminPassword||'Cor-XXXXX-24', sendSms:true, sendEmail:true };
+      S.tenantForm = { ...t, adminEmail:t.adminEmail||'', adminPhone:t.adminPhone||'', deliveryChannel:t.deliveryChannel||'email' };
       renderTenantModal();
     });
   });
@@ -1665,9 +2094,6 @@ function wireTabEvents(wrap) {
   // Open invoice
   const openInv = wrap.querySelector('#btn-open-invoice');
   if (openInv) openInv.addEventListener('click', () => { S.invoiceModal = true; renderInvoiceModal(); });
-  // Invite admin
-  const invAdmin = wrap.querySelector('#btn-invite-admin');
-  if (invAdmin) invAdmin.addEventListener('click', openCreate);
   // Time range buttons
   wrap.querySelectorAll('.time-btn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -1694,8 +2120,7 @@ function openCreate() {
     id: 'TN-' + String(Math.floor(1000+Math.random()*9000)),
     name:'', city:'Mogadishu', owner:'', plan:'Business', users:0,
     invoice:'0', region:'SO-MG-1', since:'Jul 2026',
-    adminEmail:'', adminPhone:'+252 ', sendSms:true, sendEmail:true,
-    adminPassword:'Cor-'+Math.random().toString(36).slice(2,8).toUpperCase()+'-24',
+    adminEmail:'', adminPhone:'+252 ', deliveryChannel:'email',
   };
   renderTenantModal();
 }
@@ -1714,34 +2139,33 @@ function renderTenantModal() {
           <button class="modal-close" id="btn-close-tenant">×</button>
         </div>
         <div class="modal-body" style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
-          <div style="grid-column:1/span 2" class="form-group"><label class="form-label">Company name *</label><input class="form-input" id="mf-name" placeholder="e.g. Marka Coastal Trading" value="${f.name||''}"/></div>
-          <div class="form-group"><label class="form-label">Owner name *</label><input class="form-input" id="mf-owner" placeholder="e.g. Deqa Abdirahman" value="${f.owner||''}"/></div>
+          <div style="grid-column:1/span 2" class="form-group"><label class="form-label">Company name *</label><input class="form-input" id="mf-name" placeholder="e.g. Marka Coastal Trading" value="${esc(f.name||'')}"/></div>
+          <div class="form-group"><label class="form-label">Owner name *</label><input class="form-input" id="mf-owner" placeholder="e.g. Deqa Abdirahman" value="${esc(f.owner||'')}"/></div>
           <div class="form-group"><label class="form-label">City</label><select class="form-select" id="mf-city">${['Mogadishu','Hargeisa','Bosaso','Kismayo','Baidoa','Garowe'].map(c=>`<option${c===f.city?' selected':''}>${c}</option>`).join('')}</select></div>
           <div class="form-group"><label class="form-label">Plan</label><select class="form-select" id="mf-plan">${['Starter','Business','Enterprise'].map(p=>`<option${p===f.plan?' selected':''}>${p}</option>`).join('')}</select></div>
           <div class="form-group"><label class="form-label">Server location</label><select class="form-select" id="mf-region">${['SO-MG-1','SO-HL-1','SO-BO-1','SO-KI-1','SO-BA-1'].map(r=>`<option${r===f.region?' selected':''}>${r}</option>`).join('')}</select></div>
           <div class="form-group"><label class="form-label">Number of users</label><input class="form-input" id="mf-users" type="number" min="0" placeholder="0" value="${f.users||0}"/></div>
-          <div class="form-group"><label class="form-label">Monthly fee (USD)</label><input class="form-input" id="mf-invoice" placeholder="e.g. 1,100" value="${f.invoice||''}"/></div>
+          <div class="form-group"><label class="form-label">Monthly fee (USD)</label><input class="form-input" id="mf-invoice" placeholder="e.g. 1,100" value="${esc(f.invoice||'')}"/></div>
 
           <!-- Credentials -->
           <div class="cred-box">
             <div class="cred-box-header">
               <div><div class="cred-eyebrow">Step 2 · Auto-created</div><div class="cred-title">Company Admin login</div><div class="cred-subtitle">Cor makes ONE admin account. They'll create their own staff after signing in.</div></div>
-              <button class="btn btn-gold btn-xs" id="btn-regen-pw">↻ Regenerate</button>
+              <span class="pill pill-green">Secure server generation</span>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-              <div class="form-group"><label class="cred-field-label">Admin email (login)</label><input class="cred-input" id="mf-admin-email" placeholder="admin@company.so" value="${f.adminEmail||''}"/></div>
-              <div class="form-group"><label class="cred-field-label">Phone (for SMS OTP)</label><input class="cred-input" id="mf-admin-phone" placeholder="+252 61 000 0000" value="${f.adminPhone||''}"/></div>
+              <div class="form-group"><label class="cred-field-label">Admin email (login)</label><input class="cred-input" id="mf-admin-email" placeholder="admin@company.so" value="${esc(f.adminEmail||'')}"/></div>
+              <div class="form-group"><label class="cred-field-label">Phone (for SMS OTP)</label><input class="cred-input" id="mf-admin-phone" placeholder="+252 61 000 0000" value="${esc(f.adminPhone||'')}"/></div>
               <div class="form-group" style="grid-column:1/span 2">
                 <label class="cred-field-label">Temporary password</label>
                 <div class="flex gap-6" style="margin-top:4px">
-                  <input class="cred-input pw" id="mf-admin-pw" value="${f.adminPassword||''}" style="flex:1"/>
-                  <button class="btn btn-outline btn-xs" id="btn-copy-pw" style="background:rgba(255,255,255,0.1);color:#FFF;border-color:rgba(255,255,255,0.2)">Copy</button>
+                  <input class="cred-input pw" id="mf-admin-pw" value="Generated after company is saved" readonly style="flex:1"/>
                 </div>
                 <div class="cred-hint">Admin must change this on first sign-in. Never shown again after this screen.</div>
               </div>
               <div style="grid-column:1/span 2" class="cred-checkboxes">
-                <label class="cred-checkbox"><input type="checkbox" ${f.sendSms?'checked':''} id="mf-sms"/> Send by SMS (Hormuud)</label>
-                <label class="cred-checkbox"><input type="checkbox" ${f.sendEmail?'checked':''} id="mf-email"/> Send by email</label>
+                <label class="cred-checkbox"><input type="radio" name="delivery-channel" value="email" ${(f.deliveryChannel||'email')==='email'?'checked':''}/> Send by email</label>
+                <label class="cred-checkbox"><input type="radio" name="delivery-channel" value="sms" ${f.deliveryChannel==='sms'?'checked':''}/> Send by SMS</label>
                 <label class="cred-checkbox" style="margin-left:auto"><input type="checkbox" checked/> Force change on first login</label>
               </div>
             </div>
@@ -1792,17 +2216,6 @@ function renderTenantModal() {
   modal.querySelector('#btn-close-tenant').addEventListener('click', close);
   modal.querySelector('#btn-close-tenant2').addEventListener('click', close);
   modal.querySelector('#modal-backdrop-tenant').addEventListener('click', e=>{ if(e.target.id==='modal-backdrop-tenant') close(); });
-  modal.querySelector('#btn-regen-pw').addEventListener('click', () => {
-    const pw = 'Cor-'+Math.random().toString(36).slice(2,8).toUpperCase()+'-24';
-    modal.querySelector('#mf-admin-pw').value = pw;
-    S.tenantForm.adminPassword = pw;
-  });
-  modal.querySelector('#btn-copy-pw').addEventListener('click', () => {
-    const pw = modal.querySelector('#mf-admin-pw').value;
-    try { navigator.clipboard.writeText(pw); } catch(e){}
-    modal.querySelector('#btn-copy-pw').textContent = 'Copied!';
-    setTimeout(()=>{ const b=modal.querySelector('#btn-copy-pw'); if(b) b.textContent='Copy'; },2000);
-  });
   modal.querySelector('#btn-save-tenant').addEventListener('click', async (e) => {
     const btn = e.currentTarget;
     const name  = modal.querySelector('#mf-name').value.trim();
@@ -1811,12 +2224,14 @@ function renderTenantModal() {
 
     const adminEmail = modal.querySelector('#mf-admin-email').value.trim();
     const adminPhone = modal.querySelector('#mf-admin-phone').value.trim();
-    const adminPw    = modal.querySelector('#mf-admin-pw').value;
     const city   = modal.querySelector('#mf-city').value;
     const plan   = modal.querySelector('#mf-plan').value;
     const region = modal.querySelector('#mf-region').value;
     const users  = parseInt(modal.querySelector('#mf-users').value) || 0;
     const invoice= modal.querySelector('#mf-invoice').value;
+    const deliveryChannel = modal.querySelector('input[name="delivery-channel"]:checked')?.value || 'email';
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail)) { alert('Enter a valid Company Admin email.'); return; }
+    if (deliveryChannel === 'sms' && adminPhone.replace(/\D/g,'').length < 8) { alert('Enter a valid phone number for SMS delivery.'); return; }
 
     // Show any inline error message on the modal footer.
     const showError = (msg) => {
@@ -1836,54 +2251,23 @@ function renderTenantModal() {
 
     try {
       if (S.tenantModalMode === 'create') {
-        // 1) Create the company in the backend DB
-        const company = await api('/companies', {
+        const result = await api('/platform/companies', {
           method: 'POST',
-          body: { name, phone: adminPhone, address: '', city, country: 'Somalia', status: 'active' },
+          body: { name, admin_name:owner, admin_email:adminEmail, admin_phone:adminPhone, phone:adminPhone, city, country:'Somalia', branch_name:'Main Store', status:'active', delivery_channel:deliveryChannel },
         });
-
-        // 2) Auto-create the Company Admin user tied to the new company_id
-        if (adminEmail) {
-          try {
-            await api('/users', {
-              method: 'POST',
-              body: {
-                name: owner,
-                email: adminEmail,
-                phone: adminPhone,
-                password: adminPw,
-                company_id: company.id,
-                status: 'active',
-              },
-            });
-          } catch (userErr) {
-            // Company created but user create failed — log it visibly rather than silently.
-            console.warn('User create failed:', userErr);
-            showError(`Company saved but admin user failed: ${userErr.message}`);
-          }
-        }
-
-        // 3) Reflect in local S.tenants so the table updates immediately
-        S.tenants.unshift({
-          id: 'TN-' + String(company.id).padStart(4, '0'),
-          companyId: company.id,
-          name, city, owner, plan, users, invoice: invoice || '0', region,
-          since: new Date().toLocaleDateString('en-US', { month:'short', year:'numeric' }),
-          adminEmail, adminPhone, adminStatus: 'invited', lastSignInAt: null,
-          pendingReset: null,
-        });
-        // Default license: only Retail POS is live; all other modules coming soon.\n        S.licenses[S.tenants[0].id] = { pharmacy:false, financials:false, crm:false, hr:false, pos:true, university:false, hotel:false, hospital:false };
+        await loadPlatformData();
+        showCompanyCreationResult(modal, {name,adminEmail,tempPassword:result.temporary_password,delivery:result.delivery});
+        return;
       } else {
         // EDIT — send the changed fields to PUT /companies/{id}
         const companyId = S.tenantForm.companyId;
         if (companyId) {
-          await api(`/companies/${companyId}`, {
+          await api(`/platform/companies/${companyId}`, {
             method: 'PUT',
             body: { name, phone: adminPhone, city, country: 'Somalia', status: 'active' },
           });
         }
-        const idx = S.tenants.findIndex(t => t.id === S.tenantForm.id);
-        if (idx >= 0) S.tenants[idx] = { ...S.tenants[idx], name, city, owner, plan, users, invoice, region, adminEmail, adminPhone };
+        await loadPlatformData();
       }
 
       modal.remove();
@@ -1895,6 +2279,23 @@ function renderTenantModal() {
       showError(err.message || 'Something went wrong. Try again.');
     }
   });
+}
+
+function showCompanyCreationResult(host, result) {
+  const delivery=result.delivery||{status:'failed',channel:'email',message:'No delivery result was returned.'};
+  const okay=['sent','preview'].includes(delivery.status);
+  host.innerHTML=`<div class="modal-backdrop">
+    <div class="modal-box" style="max-width:560px">
+      <div class="modal-header"><div class="modal-icon">✓</div><div style="flex:1"><div class="label-xs text-gold">Company created</div><div style="font-size:19px;font-weight:800">${esc(result.name)}</div></div></div>
+      <div class="modal-body">
+        <div style="padding:13px;border-radius:10px;background:${okay?'#ECFDF3':'#FEE4E2'};color:${okay?'#166534':'#B42318'};font-size:13px;margin-bottom:16px"><b>${esc(delivery.channel==='sms'?'SMS':'Email')} ${esc(delivery.status)}</b><br>${esc(delivery.message)} ${delivery.destination?`Destination: ${esc(delivery.destination)}.`:''}</div>
+        <div class="form-group"><label class="form-label">Admin login</label><input class="form-input" value="${esc(result.adminEmail)}" readonly/></div>
+        ${(delivery.status==='preview'||delivery.status==='failed')?`<div class="form-group"><label class="form-label">Temporary password — local/manual fallback</label><div style="display:flex;gap:8px"><input class="form-input mono" id="created-company-password" value="${esc(result.tempPassword)}" readonly/><button class="btn btn-primary btn-sm" id="btn-copy-company-password">Copy</button></div><div class="cred-hint">Shown because a production delivery provider is not active. Share securely and only once.</div></div>`:''}
+      </div>
+      <div class="modal-footer"><button class="btn btn-gold" id="btn-company-result-done">Done</button></div>
+    </div></div>`;
+  host.querySelector('#btn-copy-company-password')?.addEventListener('click',event=>copyInputValue('created-company-password',event.currentTarget));
+  host.querySelector('#btn-company-result-done').addEventListener('click',()=>{host.remove();S.tenantModalMode=null;S.superTab='admins';render();});
 }
 
 function renderDeleteModal() {
@@ -1919,12 +2320,15 @@ function renderDeleteModal() {
   const cancel = () => { S.confirmDeleteId=null; modal.remove(); };
   modal.querySelector('#btn-cancel-del').addEventListener('click', cancel);
   modal.querySelector('#modal-backdrop-delete').addEventListener('click', e=>{ if(e.target.id==='modal-backdrop-delete') cancel(); });
-  modal.querySelector('#btn-confirm-del').addEventListener('click', () => {
+  modal.querySelector('#btn-confirm-del').addEventListener('click', async () => {
     const id = S.confirmDeleteId;
-    S.tenants = S.tenants.filter(t=>t.id!==id);
-    delete S.licenses[id];
-    if (S.selectedTenantId === id) S.selectedTenantId = S.tenants[0]?.id || '';
-    S.confirmDeleteId=null; modal.remove(); render();
+    const tenant = getTenant(id);
+    try {
+      await api(`/platform/companies/${tenant.companyId}`, { method:'DELETE' });
+      await loadPlatformData();
+      if (S.selectedTenantId === id) S.selectedTenantId = S.tenants[0]?.id || '';
+      S.confirmDeleteId=null; modal.remove(); render();
+    } catch (error) { alert(error.message); }
   });
 }
 
@@ -2147,13 +2551,13 @@ function renderWorkspace() {
     <header class="workspace-header">
       <svg width="34" height="34" viewBox="0 0 64 64" fill="none"><rect x="2" y="2" width="60" height="60" rx="12" fill="#3B2170"/><path d="M22 20 L12 32 L22 44" stroke="#FFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><path d="M42 20 L52 32 L42 44" stroke="#FFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><rect x="30" y="14" width="4" height="36" rx="2" fill="#F5C411" transform="rotate(15 32 32)"/></svg>
       <div>
-        <div class="workspace-brand-name">${S.currentCompany}</div>
+        <div class="workspace-brand-name">${esc(S.currentCompany)}</div>
         <div class="workspace-brand-sub">Company workspace · Cor platform</div>
       </div>
       <div class="workspace-header-actions">
         <div class="workspace-user-pill">
-          <div style="width:26px;height:26px;border-radius:50%;background:#F5C411;color:#2D1859;display:grid;place-items:center;font-weight:900;font-size:10px">AY</div>
-          Ahmed Yusuf
+          <div style="width:26px;height:26px;border-radius:50%;background:#F5C411;color:#2D1859;display:grid;place-items:center;font-weight:900;font-size:10px">${initials(S.activeCompanyAdmin?.name || '')}</div>
+          ${esc(S.activeCompanyAdmin?.name || 'Company user')}
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
         </div>
         <button class="btn btn-outline btn-sm" id="btn-ws-logout" style="color:#FFF;border-color:rgba(255,255,255,0.3);background:rgba(255,255,255,0.1)">Sign out</button>
@@ -2218,18 +2622,23 @@ function renderWorkspace() {
     </div>
   `;
 
-  div.querySelector('#btn-ws-logout').addEventListener('click', () => { S.view = 'login'; render(); });
+  div.querySelector('#btn-ws-logout').addEventListener('click', () => posLogout());
 
   // Only the POS launch button does anything
   div.querySelectorAll('[data-launch]').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const key = btn.dataset.launch;
       if (key === 'pos') {
+        const role = posRoleName(S.activeCompanyAdmin || {});
+        S.posActiveUser = { ...mapStaff(S.activeCompanyAdmin || {}), role, access:POS_ROLES[role] || POS_ROLES.Cashier };
         S.view = 'pos';
-        S.posTab = 'dash';
+        // Route to store selector if no type chosen yet, else straight to back-office
+        S.posView = S.posStoreType ? 'backoffice' : 'selector';
+        S.posBackofficeTab = 'dashboard';
         S.posCart = [];
         S.posReceiptVisible = false;
         render();
+        try { await posBootstrap(); } catch (error) { S.posAuthError=error.message; render(); }
       }
     });
   });
@@ -2613,12 +3022,12 @@ const POS_TRANSACTIONS = [
 ];
 
 const POS_STAFF = [
-  { id:1, name:'Fartun Ali',     username:'fartun.a',  pin:'1234', role:'Senior Cashier',  store:'Bakaara Main',   shift:'Morning',  sales:186, status:'active', access:['dash','checkout','transactions'] },
-  { id:2, name:'Mohamed Farah',  username:'mohamed.f', pin:'5678', role:'Cashier',         store:'Hodan Store',    shift:'Morning',  sales:124, status:'active', access:['dash','checkout','transactions'] },
-  { id:3, name:'Ismail Omar',    username:'ismail.o',  pin:'9012', role:'Cashier',         store:'Wadajir Store',  shift:'Afternoon',sales:98,  status:'active', access:['dash','checkout','transactions'] },
-  { id:4, name:'Khadija Abdi',   username:'khadija.a', pin:'3456', role:'Store Manager',   store:'Bakaara Main',   shift:'Full day', sales:0,   status:'active', access:['dash','checkout','products','customers','transactions','staff'] },
-  { id:5, name:'Hassan Yusuf',   username:'hassan.y',  pin:'7890', role:'Cashier',         store:'Hamar Weyne',    shift:'Morning',  sales:72,  status:'active', access:['dash','checkout','transactions'] },
-  { id:6, name:'Nimco Ali',      username:'nimco.a',   pin:'2468', role:'Cashier',         store:'Hodan Store',    shift:'Afternoon',sales:45,  status:'break',  access:['dash','checkout','transactions'] },
+  { id:1, name:'Fartun Ali',     username:'fartun.a',  pin:'', role:'Senior Cashier',  store:'Bakaara Main',   shift:'Morning',  sales:186, status:'active', access:['dash','checkout','transactions'] },
+  { id:2, name:'Mohamed Farah',  username:'mohamed.f', pin:'', role:'Cashier',         store:'Hodan Store',    shift:'Morning',  sales:124, status:'active', access:['dash','checkout','transactions'] },
+  { id:3, name:'Ismail Omar',    username:'ismail.o',  pin:'', role:'Cashier',         store:'Wadajir Store',  shift:'Afternoon',sales:98,  status:'active', access:['dash','checkout','transactions'] },
+  { id:4, name:'Khadija Abdi',   username:'khadija.a', pin:'', role:'Store Manager',   store:'Bakaara Main',   shift:'Full day', sales:0,   status:'active', access:['dash','checkout','products','customers','transactions','reports','notifications','staff'] },
+  { id:5, name:'Hassan Yusuf',   username:'hassan.y',  pin:'', role:'Cashier',         store:'Hamar Weyne',    shift:'Morning',  sales:72,  status:'active', access:['dash','checkout','transactions'] },
+  { id:6, name:'Nimco Ali',      username:'nimco.a',   pin:'', role:'Cashier',         store:'Hodan Store',    shift:'Afternoon',sales:45,  status:'break',  access:['dash','checkout','transactions'] },
 ];
 
 // ============================================================
@@ -2628,50 +3037,21 @@ const POS_STAFF = [
 // Additional super admins can be created from the Super Admin console
 // ("Platform Admins" tab). New entries start with mustChangePassword:true
 // so the recipient is forced to set their own password on first sign-in.
-const SUPER_ADMINS = [
-  {
-    id: 1,
-    name: 'Curdun Platform Admin',
-    email: 'admin@curdun.so',
-    password: 'Admin@1234',              // default — change on first sign-in in production
-    role: 'Super Admin',
-    mustChangePassword: false,           // the platform-default admin is trusted
-    createdAt: '2026-01-01',
-  },
-];
+const SUPER_ADMINS = [];
 
 // Company Admins — auto-created when Cor Super Admin provisions a company.
 // Login flow:
 //  - Core workspace: tempPassword works (never forced to change here)
 //  - Any active module (Retail POS): tempPassword works ONCE; forces
 //    module password creation on first login
-const COMPANY_ADMINS = [
-  {
-    id: 101,
-    name: 'Ahmed Yusuf',
-    email: 'admin@shifo.so',
-    phone: '+252-61-234-5678',
-    role: 'Admin',
-    company: 'Shifo Pharmacy Group',
-    store: 'Bakaara Main',
-    tempPassword: 'Cor-7441GS-24',   // issued at company creation
-    posPassword: null,               // set on first POS login
-    mustChangePosPassword: true,     // toggled false after user sets posPassword
-    access: ['dash','checkout','products','customers','transactions','staff','settings'],
-    status: 'active',
-    sales: 0,
-    shift: 'Full day',
-  },
-];
-
 // ============================================================
 // POS ROLE-BASED ACCESS CONTROL
 // ============================================================
 const POS_ROLES = {
   'Cashier':       ['dash', 'checkout', 'transactions'],
   'Senior Cashier':['dash', 'checkout', 'transactions'],
-  'Store Manager': ['dash', 'checkout', 'products', 'customers', 'transactions', 'staff'],
-  'Admin':         ['dash', 'checkout', 'products', 'customers', 'transactions', 'staff', 'settings'],
+  'Store Manager': ['dash', 'checkout', 'transactions', 'sessions', 'payments', 'products', 'customers', 'reports', 'notifications', 'staff'],
+  'Admin':         ['dash', 'checkout', 'transactions', 'sessions', 'payments', 'products', 'customers', 'reports', 'notifications', 'staff', 'settings'],
 };
 
 function renderPOSLogin() {
@@ -2684,7 +3064,7 @@ function renderPOSLogin() {
     <button class="login-staff-btn" data-login-id="${s.id}">
       <div class="avatar avatar-sm" style="background:var(--purple-800);color:#FFF">${initials(s.name)}</div>
       <div>
-        <div style="font-weight:700;font-size:13px">${s.name}</div>
+        <div style="font-weight:700;font-size:13px">${esc(s.name)}</div>
         <div style="font-size:11px;color:var(--text-muted)">${s.role}</div>
       </div>
     </button>
@@ -2702,7 +3082,7 @@ function renderPOSLogin() {
       <div class="pos-login-who">
         <div class="avatar" style="background:var(--purple-800);color:#FFF;width:56px;height:56px;font-size:20px">${initials(a.name)}</div>
         <div>
-          <div style="font-weight:800;font-size:16px">${a.name}</div>
+          <div style="font-weight:800;font-size:16px">${esc(a.name)}</div>
           <div style="font-size:12px;color:var(--text-muted)">${a.role} · ${a.company}</div>
         </div>
       </div>
@@ -2714,7 +3094,7 @@ function renderPOSLogin() {
       <form id="pos-force-change-form" style="display:flex;flex-direction:column;gap:12px;text-align:left">
         <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted)">
           New password
-          ${pwField({ id:'pos-new-pw', placeholder:'At least 8 characters', autocomplete:'new-password', required:true })}
+          ${pwField({ id:'pos-new-pw', placeholder:'At least 10 characters', autocomplete:'new-password', required:true })}
         </label>
         <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted)">
           Confirm password
@@ -2744,9 +3124,6 @@ function renderPOSLogin() {
           ${pwField({ id:'pos-admin-pw', placeholder:'Temporary or POS password', autocomplete:'current-password', required:true })}
         </label>
         <button type="submit" class="btn btn-primary" style="margin-top:6px">Sign in</button>
-        <div style="font-size:11px;color:var(--text-muted);text-align:center;margin-top:2px">
-          Try <strong>admin@shifo.so</strong> / <strong>Cor-7441GS-24</strong>
-        </div>
       </form>
     `;
   } else if (!selectedStaff) {
@@ -2792,6 +3169,7 @@ function renderPOSLogin() {
         <div class="pos-login-title">Retail POS — Sign In</div>
         <div class="pos-login-sub">${S.currentCompany} · ${S.currentStore}</div>
         ${body}
+        <button type="button" class="btn-linklike" id="btn-exit-pos-station" style="margin-top:16px;background:none;border:none;color:var(--text-muted);font-size:12px;cursor:pointer;text-decoration:underline">Back to account sign-in</button>
       </div>
     </div>
   `;
@@ -2807,110 +3185,817 @@ function renderPOS() {
     return loginWrap;
   }
 
+  // Route to correct screen
+  return renderPOSRouter();
+}
+
+// ============================================================
+// POS — MASTER ROUTER (Odoo-style 3-screen architecture)
+// ============================================================
+function renderPOSRouter() {
+
   const wrap = document.createElement('div');
-  wrap.className = 'pos-layout';
+  wrap.style.minHeight = '100vh';
 
-  const sidebar = document.createElement('aside');
-  sidebar.className = 'pos-sidebar';
+  switch (S.posView) {
+    case 'selector': wrap.appendChild(renderPOSStoreSelector()); break;
+    case 'session':  wrap.appendChild(renderPOSSession());       break;
+    default:         wrap.appendChild(renderPOSBackoffice());    break;
+  }
 
-  // Filter tabs by current user's role
-  const allTabs = [
-    ['dash',         'Dashboard',    posIcon('dash')],
-    ['checkout',     'Checkout',     posIcon('checkout')],
-    ['products',     'Products',     posIcon('products')],
-    ['customers',    'Customers',    posIcon('customers')],
-    ['transactions', 'Transactions', posIcon('transactions')],
-    ['staff',        'Staff',        posIcon('staff')],
-    ['settings',     'Settings',     settingsIcon()],
+  // Register Control modal — Odoo-style Opening/Closing/Cash-in/Cash-out.
+  // Renders as a fixed overlay on top of any POS screen. State lives in
+  // S.posRegisterModal; wireRegisterModal() is called after paint.
+  if (S.posRegisterModal) {
+    const modalHost = document.createElement('div');
+    modalHost.innerHTML = renderRegisterModal();
+    wrap.appendChild(modalHost);
+    setTimeout(() => wireRegisterModal(), 0);
+  }
+  return wrap;
+}
+
+// ============================================================
+// REGISTER CONTROL — Opening, Closing, Cash In/Out modals
+// Replaces the browser prompt() opening-balance flow with a proper
+// Odoo-style Opening Control screen, and adds a full variance
+// breakdown to the closing side.
+// ============================================================
+function renderRegisterModal() {
+  const m = S.posRegisterModal;
+  if (!m) return '';
+  const summary = S.posSessionSummary || {};
+  const session = S.posSession || {};
+  const cashierName = S.posActiveUser?.name || '—';
+  const configName  = session.config_name || S.posConfig?.name || S.storeSettings?.storeName || 'Main Register';
+  const money = (n) => `$${Number(n || 0).toFixed(2)}`;
+  const err = m.error ? `<div class="pin-error" style="margin:12px 0 0">${esc(m.error)}</div>` : '';
+
+  let body = '', title = '', footer = '';
+
+  if (m.mode === 'open') {
+    // Opening Control
+    title = 'Opening Control';
+    const prev = Number(m.previousClosing || 0);
+    body = `
+      <div class="txn-detail-grid" style="margin-bottom:16px">
+        <div class="txn-detail-row"><span>Register</span><strong>${esc(configName)}</strong></div>
+        <div class="txn-detail-row"><span>Cashier</span><strong>${esc(cashierName)}</strong></div>
+        <div class="txn-detail-row"><span>Previous closing cash</span><strong>${money(prev)}</strong></div>
+      </div>
+      <label class="form-label">Opening cash (USD)</label>
+      <input class="form-input mono" id="rc-open-amount" type="number" min="0" step="0.01"
+             value="${m.amount ?? prev.toFixed(2)}" placeholder="0.00" autofocus/>
+      <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Cash physically in the register before the first sale.</div>
+      <label class="form-label" style="margin-top:14px">Note (optional)</label>
+      <textarea class="form-input" id="rc-open-note" rows="2" placeholder="e.g. Started morning shift with change from safe">${esc(m.note || '')}</textarea>
+      ${err}
+    `;
+    footer = `
+      <button class="btn btn-ghost" data-rc-close>Cancel</button>
+      <button class="btn btn-primary" id="rc-open-submit" ${m.busy?'disabled':''}>${m.busy?'Opening…':'Open Register'}</button>
+    `;
+  } else if (m.mode === 'close') {
+    // Closing Control with full variance breakdown
+    title = 'Closing Control';
+    const opening = Number(session.opening_cash || 0);
+    const cashSales   = Number(summary.cash_sales || summary.payment_methods?.find?.(p=>/cash/i.test(p.method))?.total || 0);
+    const cashRefunds = Number(summary.cash_refunds || 0);
+    const cashIn      = Number(summary.cash_movements?.in  || 0);
+    const cashOut     = Number(summary.cash_movements?.out || 0);
+    const expected    = Number(summary.expected_cash ?? (opening + cashSales - cashRefunds + cashIn - cashOut));
+    const counted     = Number(m.counted || 0);
+    const variance    = counted ? counted - expected : 0;
+    const maxDiff     = Number(S.storeSettings?.maximumDifference ?? 2);
+    const overLimit   = Math.abs(variance) > maxDiff;
+    const varianceCls = variance === 0 ? 'trend-up' : overLimit ? 'trend-warn' : '';
+    const varianceLabel = counted === 0 ? '—' : variance === 0 ? 'Perfect match' : variance > 0 ? `Over by ${money(variance)}` : `Short by ${money(Math.abs(variance))}`;
+    body = `
+      <div style="background:var(--gray-50);border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:14px;font-family:var(--font-mono);font-size:13px">
+        <div style="display:flex;justify-content:space-between;padding:3px 0"><span>Opening cash</span><strong>${money(opening)}</strong></div>
+        <div style="display:flex;justify-content:space-between;padding:3px 0;color:var(--green-dark)"><span>+ Cash sales</span><strong>${money(cashSales)}</strong></div>
+        <div style="display:flex;justify-content:space-between;padding:3px 0;color:var(--red)"><span>− Cash refunds</span><strong>${money(cashRefunds)}</strong></div>
+        <div style="display:flex;justify-content:space-between;padding:3px 0;color:var(--green-dark)"><span>+ Cash In</span><strong>${money(cashIn)}</strong></div>
+        <div style="display:flex;justify-content:space-between;padding:3px 0;color:var(--red)"><span>− Cash Out</span><strong>${money(cashOut)}</strong></div>
+        <hr style="border:0;border-top:1px dashed var(--border);margin:6px 0"/>
+        <div style="display:flex;justify-content:space-between;padding:3px 0;font-weight:800"><span>Expected cash</span><strong>${money(expected)}</strong></div>
+      </div>
+      <label class="form-label">Counted cash (USD)</label>
+      <input class="form-input mono" id="rc-close-counted" type="number" min="0" step="0.01"
+             value="${m.counted ?? ''}" placeholder="0.00" autofocus/>
+      ${counted !== 0 ? `
+        <div class="txn-detail-row" style="margin-top:10px;padding:10px 12px;background:var(--gray-50);border-radius:8px">
+          <span>Difference</span>
+          <strong class="${varianceCls}">${varianceLabel}</strong>
+        </div>
+        ${overLimit ? `
+          <label class="form-label" style="margin-top:14px;color:var(--red-dark)">Manager PIN required (|variance| &gt; ${money(maxDiff)})</label>
+          <input class="form-input mono" id="rc-close-manager-pin" type="password" inputmode="numeric"
+                 maxlength="4" placeholder="••••" value="${m.managerPin || ''}"/>
+        ` : ''}
+      ` : ''}
+      <label class="form-label" style="margin-top:14px">Closing note (optional)</label>
+      <textarea class="form-input" id="rc-close-note" rows="2" placeholder="e.g. Missing $2 — cashier informed">${esc(m.note || '')}</textarea>
+      ${err}
+    `;
+    footer = `
+      <button class="btn btn-ghost" data-rc-close>Cancel</button>
+      <button class="btn btn-primary" id="rc-close-submit" ${m.busy?'disabled':''}>${m.busy?'Closing…':'Close Register'}</button>
+    `;
+  } else if (m.mode === 'cash-in' || m.mode === 'cash-out') {
+    // Cash In / Cash Out
+    const label = m.mode === 'cash-in' ? 'Cash In' : 'Cash Out';
+    title = `${label} — record cash movement`;
+    body = `
+      <div class="txn-detail-grid" style="margin-bottom:16px">
+        <div class="txn-detail-row"><span>Register</span><strong>${esc(configName)}</strong></div>
+        <div class="txn-detail-row"><span>Cashier</span><strong>${esc(cashierName)}</strong></div>
+      </div>
+      <label class="form-label">Amount (USD)</label>
+      <input class="form-input mono" id="rc-cash-amount" type="number" min="0.01" step="0.01"
+             value="${m.amount || ''}" placeholder="0.00" autofocus/>
+      <label class="form-label" style="margin-top:12px">Reason</label>
+      <input class="form-input" id="rc-cash-reason" placeholder="${m.mode==='cash-in'?'e.g. Additional change money':'e.g. Store supplies'}" value="${esc(m.reason || '')}"/>
+      <div style="font-size:11px;color:var(--text-muted);margin-top:4px">This becomes part of the register's session ledger and shows on Closing Control.</div>
+      ${err}
+    `;
+    footer = `
+      <button class="btn btn-ghost" data-rc-close>Cancel</button>
+      <button class="btn btn-primary" id="rc-cash-submit" ${m.busy?'disabled':''}>${m.busy?'Recording…':'Record'}</button>
+    `;
+  } else if (m.mode === 'closed-summary') {
+    // Post-close receipt / summary shown after successful close.
+    title = 'Register closed';
+    const r = m.result || {};
+    body = `
+      <div style="background:#DEF7EC;color:#065F46;border:1px solid #86EFAC;padding:12px 14px;border-radius:8px;font-size:13px;font-weight:700;margin-bottom:12px">
+        ✓ Session closed and posted.
+      </div>
+      <div class="txn-detail-grid">
+        <div class="txn-detail-row"><span>Expected cash</span><strong>${money(r.expected_cash)}</strong></div>
+        <div class="txn-detail-row"><span>Counted cash</span><strong>${money(r.counted_cash)}</strong></div>
+        <div class="txn-detail-row"><span>Difference</span><strong class="${Number(r.variance)===0?'trend-up':'trend-warn'}">${money(r.variance)}</strong></div>
+      </div>
+    `;
+    footer = `<button class="btn btn-primary" data-rc-close>Done</button>`;
+  }
+
+  return `
+    <div class="crud-overlay" data-rc-close style="z-index:9999">
+      <div class="crud-modal" style="max-width:480px" onclick="event.stopPropagation()">
+        <div class="crud-modal-header">
+          <h3>${title}</h3>
+          <button class="crud-close-btn" data-rc-close>×</button>
+        </div>
+        <div class="crud-modal-body">${body}</div>
+        <div class="crud-modal-footer">${footer}</div>
+      </div>
+    </div>
+  `;
+}
+
+function wireRegisterModal() {
+  // Close on backdrop / cancel / × / Done
+  document.querySelectorAll('[data-rc-close]').forEach(el => {
+    el.addEventListener('click', (e) => {
+      if (e.target === el) { S.posRegisterModal = null; render(); }
+    });
+  });
+
+  const m = S.posRegisterModal;
+  if (!m) return;
+
+  // Live-update the counted field so the difference row + Manager PIN prompt
+  // appear the moment the cashier types a value — no submit round trip.
+  const countedInput = document.getElementById('rc-close-counted');
+  if (countedInput) {
+    countedInput.addEventListener('input', () => {
+      m.counted = countedInput.value === '' ? '' : Number(countedInput.value);
+      render();
+    });
+  }
+
+  // Open Register
+  document.getElementById('rc-open-submit')?.addEventListener('click', async () => {
+    const opening = Number(document.getElementById('rc-open-amount').value);
+    const note = (document.getElementById('rc-open-note')?.value || '').trim();
+    if (!Number.isFinite(opening) || opening < 0) { m.error = 'Enter a valid opening cash amount.'; render(); return; }
+    m.busy = true; m.error = ''; render();
+    try {
+      await posOpenSession(opening);      // note is a client-side field; backend will accept it later
+      await posBootstrap();
+      S.posRegisterModal = null;
+      render();
+    } catch (err) {
+      m.busy = false; m.error = err.message || 'Could not open the register.';
+      render();
+    }
+  });
+
+  // Close Register
+  document.getElementById('rc-close-submit')?.addEventListener('click', async () => {
+    const counted = Number(document.getElementById('rc-close-counted').value);
+    if (!Number.isFinite(counted) || counted < 0) { m.error = 'Enter a valid counted cash amount.'; render(); return; }
+
+    // Recompute variance guard here — the backend still owns the real check.
+    const expected = Number(S.posSessionSummary?.expected_cash ?? S.posSession?.opening_cash ?? 0);
+    const variance = counted - expected;
+    const maxDiff  = Number(S.storeSettings?.maximumDifference ?? 2);
+    let approve = false;
+    if (Math.abs(variance) > maxDiff) {
+      const pin = (document.getElementById('rc-close-manager-pin')?.value || '').trim();
+      if (!pin || pin.length !== 4) { m.error = 'Manager PIN is required to close with this difference.'; render(); return; }
+      approve = true;   // Backend will re-validate the manager PIN against the users table.
+    }
+
+    m.busy = true; m.error = ''; render();
+    try {
+      let result;
+      try {
+        result = await posCloseShift(Number(S.posSession?.opened_by || S.posActiveUser?.id), counted, approve);
+      } catch (err) {
+        if (err.status === 409 && /approve/i.test(err.message)) {
+          result = await posCloseShift(Number(S.posSession?.opened_by || S.posActiveUser?.id), counted, true);
+        } else { throw err; }
+      }
+      S.posRegisterModal = { mode: 'closed-summary', result };
+      await posBootstrap();
+      render();
+    } catch (err) {
+      m.busy = false; m.error = err.message || 'Could not close the register.';
+      render();
+    }
+  });
+
+  // Cash In / Cash Out
+  document.getElementById('rc-cash-submit')?.addEventListener('click', async () => {
+    const amount = Number(document.getElementById('rc-cash-amount').value);
+    const reason = (document.getElementById('rc-cash-reason').value || '').trim();
+    if (!Number.isFinite(amount) || amount <= 0) { m.error = 'Enter an amount greater than zero.'; render(); return; }
+    if (!reason) { m.error = 'A reason is required for cash movements (audit trail).'; render(); return; }
+    m.busy = true; m.error = ''; render();
+    try {
+      await posRecordCashMovement(m.mode === 'cash-in' ? 'IN' : 'OUT', amount, reason);
+      S.posRegisterModal = null;
+      render();
+    } catch (err) {
+      m.busy = false; m.error = err.message || 'Could not record the movement.';
+      render();
+    }
+  });
+}
+
+// Convenience openers used by buttons across POS surfaces.
+function openRegisterModal(mode)         { S.posRegisterModal = { mode, error:'', busy:false }; render(); }
+function openCashMovementModal(direction){ S.posRegisterModal = { mode: direction === 'IN' ? 'cash-in' : 'cash-out', error:'', busy:false }; render(); }
+
+// ============================================================
+// SCREEN 1 — STORE TYPE SELECTOR  ("Choose your store")
+// ============================================================
+function renderPOSStoreSelector() {
+  const div = document.createElement('div');
+  div.className = 'pos-selector-screen';
+
+  const storeTypes = [
+    { key:'retail',      icon:'🛒', name:'Retail',           desc:'Any shop · general merchandise' },
+    { key:'bakery',      icon:'🍞', name:'Bakery & Food',    desc:'Food, over the counter' },
+    { key:'clothes',     icon:'👕', name:'Clothes & Fashion',desc:'Multi sizes, colors, SKUs' },
+    { key:'furniture',   icon:'🪑', name:'Furniture & Home', desc:'Stock, discounts, configurator' },
+    { key:'restaurant',  icon:'🍽️', name:'Restaurant',       desc:'Tables, menus, kitchen display' },
+    { key:'electronics', icon:'📱', name:'Electronics',      desc:'Tech, serial numbers, warranty' },
   ];
-  const allowedTabs = POS_ROLES[S.posActiveUser.role] || POS_ROLES['Cashier'];
-  const tabs = allTabs.filter(([key]) => allowedTabs.includes(key));
 
-  // Reset posTab if current tab is no longer allowed
-  if (!allowedTabs.includes(S.posTab)) S.posTab = 'dash';
-
-  const roleColor = { Admin:'#F5C411', 'Store Manager':'#22C55E', 'Senior Cashier':'#7A5FB8', Cashier:'rgba(255,255,255,0.55)' };
-  sidebar.innerHTML = `
-    <div class="pos-sidebar-header">
-      <button class="pharm-back" id="btn-pos-back">
+  div.innerHTML = `
+    <div class="pos-selector-header">
+      <button class="pharm-back" id="btn-pos-sel-back" style="color:rgba(255,255,255,0.7)">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
         Back to workspace
       </button>
-      <div class="pharm-co-name">${S.posActiveUser?.company || S.currentCompany}</div>
-      <div class="pharm-co-sub">Retail POS · v3.0.0</div>
-    </div>
-    <nav class="pharm-nav">
-      ${tabs.map(([key,label,icon])=>`
-        <button class="pharm-nav-item${S.posTab===key?' active':''}" data-pos-tab="${key}">
-          ${icon} ${label}
-        </button>
-      `).join('')}
-    </nav>
-    <div class="pos-sidebar-user">
-      <div class="avatar avatar-sm" style="background:var(--gold);color:var(--purple-800);font-weight:900">${initials(S.posActiveUser.name)}</div>
-      <div style="flex:1;min-width:0">
-        <div style="font-weight:700;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${S.posActiveUser.name}</div>
-        <div style="font-size:10px;color:${roleColor[S.posActiveUser.role]||'rgba(255,255,255,0.5)'}">${S.posActiveUser.role}</div>
-      </div>
-      <button class="btn btn-ghost" id="btn-pos-logout" title="Sign out" style="padding:4px 8px;font-size:11px;color:rgba(255,255,255,0.5)">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-      </button>
-    </div>
-  `;
-  sidebar.querySelector('#btn-pos-back').addEventListener('click',()=>{ S.view='workspace'; render(); });
-  sidebar.querySelector('#btn-pos-logout').addEventListener('click',()=>{ S.posActiveUser=null; S.posLoginPin=''; S._loginSelectedId=null; S.posAuthError=''; S.posTab='dash'; S.posLoginMode='staff'; S.posAdminEmail=''; S.posPendingAdmin=null; render(); });
-  sidebar.querySelectorAll('[data-pos-tab]').forEach(btn=>{
-    btn.addEventListener('click',()=>{ S.posTab=btn.dataset.posTab; S.posReceiptVisible=false; render(); });
-  });
-
-  const main = document.createElement('div');
-  main.className = 'pos-main';
-  const labels = { dash:'Dashboard', checkout:'Checkout', products:'Products', customers:'Buugga Deynta', transactions:'Transactions', staff:'Staff', settings:'Settings' };
-
-  if (S.posTab === 'checkout') {
-    main.innerHTML = renderPOSCheckout();
-    if (S.posMobileMoneyModal) {
-      const overlay = document.createElement('div');
-      overlay.className = 'mm-modal-overlay';
-      overlay.innerHTML = renderMobileMoneyModal();
-      main.appendChild(overlay);
-    }
-  } else {
-    const offlineBanner = S.isOffline ? `<div class="pos-offline-banner"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 1l22 22M16.72 11.06A10.94 10.94 0 0 1 19 12.55M5 12.55a10.94 10.94 0 0 1 5.17-2.39M10.71 5.05A16 16 0 0 1 22.56 9M1.42 9a15.91 15.91 0 0 1 4.7-2.88M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/></svg> Offline \u2014 ${S.syncQueue} transaction${S.syncQueue!==1?'s':''} queued</div>` : '';
-    main.innerHTML = `
-      ${offlineBanner}
-      <div class="pharm-topbar">
-        <div class="pharm-tab-label">${labels[S.posTab]||'Dashboard'}</div>
-        <div class="ml-auto flex items-center gap-10">
-          <div style="font-size:12px;color:var(--text-muted);font-family:var(--font-mono)">${S.storeSettings.defaultStore} Store</div>
-          <span class="pill ${S.isOffline?'pill-red':'pill-green'}">${S.isOffline?'\u25cf Offline':'\u25cf Online'}</span>
+      <div style="display:flex;align-items:center;gap:10px">
+        <svg width="32" height="32" viewBox="0 0 64 64" fill="none"><rect x="2" y="2" width="60" height="60" rx="12" fill="#F5C411"/><path d="M22 20 L12 32 L22 44" stroke="#2D1859" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><path d="M42 20 L52 32 L42 44" stroke="#2D1859" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><rect x="30" y="14" width="4" height="36" rx="2" fill="#2D1859" transform="rotate(15 32 32)"/></svg>
+        <div>
+          <div style="font-weight:900;font-size:18px;color:#fff">Curdun Retail POS</div>
+          <div style="font-size:12px;color:rgba(255,255,255,0.6)">Point of Sale · v3.0</div>
         </div>
       </div>
-      <div class="pharm-content animate-fadein" id="pos-content">
-        ${renderPOSTab()}
+      <div style="font-size:13px;color:rgba(255,255,255,0.5)">${esc(S.currentCompany)}</div>
+    </div>
+
+    <div class="pos-selector-body">
+      <div class="pos-selector-title">
+        <h1>Choose your store type</h1>
+        <p>This configures available features, product layout, and receipt format for your POS.</p>
       </div>
-    `;
-  }
+      <div class="pos-store-grid">
+        ${storeTypes.map(t => `
+          <button class="pos-store-tile" data-store-type="${t.key}">
+            <div class="pos-store-tile-icon">${t.icon}</div>
+            <div class="pos-store-tile-name">${t.name}</div>
+            <div class="pos-store-tile-desc">${t.desc}</div>
+          </button>
+        `).join('')}
+      </div>
+    </div>
+  `;
 
-  wrap.appendChild(sidebar);
-  wrap.appendChild(main);
+  div.querySelector('#btn-pos-sel-back').addEventListener('click', () => { S.view = 'workspace'; render(); });
+  div.querySelectorAll('[data-store-type]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S.posStoreType = btn.dataset.storeType;
+      S.posView = 'backoffice';
+      S.posBackofficeTab = 'dashboard';
+      render();
+    });
+  });
 
-  setTimeout(()=> wirePOSEvents(), 0);
+  return div;
+}
+
+// ============================================================
+// SCREEN 2 — POS BACK-OFFICE  (Management / Admin view)
+// ============================================================
+function renderPOSBackoffice() {
+  const wrap = document.createElement('div');
+  wrap.className = 'pos-backoffice';
+
+  // ---- Top Navigation Bar ----
+  const nav = document.createElement('header');
+  nav.className = 'pos-topnav';
+  nav.innerHTML = renderPOSTopNav();
+  wrap.appendChild(nav);
+
+  // ---- Content Area ----
+  const content = document.createElement('main');
+  content.className = 'pos-backoffice-content animate-fadein';
+  content.id = 'pos-backoffice-content';
+  content.innerHTML = renderPOSBackofficeTab();
+  wrap.appendChild(content);
+
+  // ---- Wire events after DOM is built ----
+  setTimeout(() => {
+    wirePOSTopNav(wrap);
+    wirePOSEvents();
+  }, 0);
 
   return wrap;
 }
 
-function renderPOSTab() {
-  switch(S.posTab) {
-    case 'dash':         return renderPOSDash();
-    case 'products':     return renderPOSProducts();
-    case 'customers':    return renderPOSCustomers();
-    case 'transactions': return renderPOSTransactions();
-    case 'staff':        return renderPOSStaff();
-    case 'settings':     return renderPOSSettings();
-    default:             return renderPOSDash();
+function renderPOSTopNav() {
+  const u = S.posActiveUser;
+  const storeTypeLabel = {retail:'Retail',bakery:'Bakery & Food',clothes:'Clothes',furniture:'Furniture',restaurant:'Restaurant',electronics:'Electronics'}[S.posStoreType] || 'Retail';
+  const tab = S.posBackofficeTab;
+  const dd = S.posNavDropdown;
+  const isOpen = S.posSession?.state === 'OPENED';
+  const notifCount = (S.posStockAlerts||[]).filter(a=>Number(a.unread)).length;
+
+  const navItem = (key, label, hasChild) => {
+    const menuTabs = { orders:['orders','sessions','payments','customers'], products:['products','categories','combos'], reporting:['reports-orders','reports-sales','reports-session','reports-stock'], configuration:['config-settings','config-payments','config-staff','config-currencies'] };
+    const active = menuTabs[key]?.includes(tab) || tab === key;
+    return `
+      <div class="pos-topnav-item ${active?'active':''}" data-nav-menu="${key}">
+        ${label}
+        ${hasChild ? `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>` : ''}
+        ${hasChild && dd === key ? `<div class="pos-topnav-dropdown">
+          ${key === 'orders' ? `
+            <button class="pos-dd-item" data-bo-tab="orders">Orders</button>
+            <button class="pos-dd-item" data-bo-tab="sessions">Sessions</button>
+            <button class="pos-dd-item" data-bo-tab="payments">Payments</button>
+            <button class="pos-dd-item" data-bo-tab="customers">Customers</button>
+          ` : key === 'products' ? `
+            <button class="pos-dd-item" data-bo-tab="products">Products</button>
+            <button class="pos-dd-item" data-bo-tab="categories">Categories</button>
+            <button class="pos-dd-item" data-bo-tab="combos">Combo Choices</button>
+          ` : key === 'reporting' ? `
+            <button class="pos-dd-item" data-bo-tab="reports-orders">Orders</button>
+            <button class="pos-dd-item" data-bo-tab="reports-sales">Sales Details</button>
+            <button class="pos-dd-item" data-bo-tab="reports-session">Session Report</button>
+            <button class="pos-dd-item" data-bo-tab="reports-stock">Stock Report</button>
+          ` : `
+            <button class="pos-dd-item" data-bo-tab="config-settings">Settings</button>
+            <button class="pos-dd-item" data-bo-tab="config-payments">Payment Methods</button>
+            <button class="pos-dd-item" data-bo-tab="config-staff">Staff & Users</button>
+            <button class="pos-dd-item" data-bo-tab="config-currencies">Currencies</button>
+          `}
+        </div>` : ''}
+      </div>`;
+  };
+
+  return `
+    <div class="pos-topnav-left">
+      <button class="pos-topnav-brand" id="btn-pos-home">
+        <svg width="26" height="26" viewBox="0 0 64 64" fill="none"><rect x="2" y="2" width="60" height="60" rx="10" fill="#F5C411"/><path d="M22 20 L12 32 L22 44" stroke="#2D1859" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><path d="M42 20 L52 32 L42 44" stroke="#2D1859" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><rect x="30" y="14" width="4" height="36" rx="2" fill="#2D1859" transform="rotate(15 32 32)"/></svg>
+        <span>Point of Sale</span>
+        <span class="pos-topnav-store-type">${storeTypeLabel}</span>
+      </button>
+
+      <button class="pos-topnav-item${tab==='dashboard'?' active':''}" data-nav-direct="dashboard">Dashboard</button>
+      ${navItem('orders','Orders',true)}
+      ${navItem('products','Products',true)}
+      ${navItem('reporting','Reporting',true)}
+      ${navItem('configuration','Configuration',true)}
+    </div>
+
+    <div class="pos-topnav-right">
+      ${notifCount > 0 ? `<button class="pos-topnav-notif" data-nav-direct="reports-stock" title="Stock alerts">${notifCount}</button>` : ''}
+      <span class="pill ${isOpen?'pill-green':'pill-red'}" style="font-size:11px">${isOpen?'● Register open':'● Register closed'}</span>
+      <button class="btn btn-gold btn-sm" id="btn-open-session" style="font-size:12px;padding:7px 14px">
+        ${isOpen ? 'Close Register' : 'Open Register →'}
+      </button>
+      <div class="pos-topnav-user" id="btn-topnav-user">
+        <div class="avatar" style="width:28px;height:28px;font-size:11px;background:#7A5FB8;color:#fff">${initials(u?.name||'')}</div>
+        <span style="font-size:13px">${esc(u?.name||'')}</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+        ${dd === 'user' ? `
+          <div class="pos-topnav-dropdown" style="right:0;left:auto;min-width:160px">
+            <button class="pos-dd-item" id="btn-bo-back-ws">← Back to workspace</button>
+            <button class="pos-dd-item" id="btn-bo-lock">🔒 Lock (staff PIN)</button>
+            <hr style="margin:4px 0;border-color:var(--border)"/>
+            <button class="pos-dd-item" style="color:#e53e3e" id="btn-bo-logout">Sign out</button>
+          </div>
+        ` : ''}
+      </div>
+    </div>
+  `;
+}
+
+function wirePOSTopNav(wrap) {
+  // Dashboard direct link
+  wrap.querySelectorAll('[data-nav-direct]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      S.posBackofficeTab = btn.dataset.navDirect;
+      S.posNavDropdown = null;
+      render();
+    });
+  });
+
+  // Dropdown menus
+  wrap.querySelectorAll('[data-nav-menu]').forEach(item => {
+    item.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const key = item.dataset.navMenu;
+      S.posNavDropdown = S.posNavDropdown === key ? null : key;
+      render();
+    });
+  });
+
+  // Dropdown tab items
+  wrap.querySelectorAll('[data-bo-tab]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      S.posBackofficeTab = btn.dataset.boTab;
+      S.posNavDropdown = null;
+      render();
+    });
+  });
+
+  // User dropdown
+  wrap.querySelector('#btn-topnav-user')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    S.posNavDropdown = S.posNavDropdown === 'user' ? null : 'user';
+    render();
+  });
+
+  // Close dropdown when clicking outside
+  document.addEventListener('click', () => {
+    if (S.posNavDropdown) { S.posNavDropdown = null; render(); }
+  }, { once: true });
+
+  // POS brand → back to dashboard
+  wrap.querySelector('#btn-pos-home')?.addEventListener('click', () => {
+    S.posBackofficeTab = 'dashboard'; S.posNavDropdown = null; render();
+  });
+
+  // Open / Close Register — routes through the Odoo-style Register Control modal
+  // instead of showing a browser prompt or bouncing to the settings tab.
+  wrap.querySelector('#btn-open-session')?.addEventListener('click', () => {
+    openRegisterModal(S.posSession?.state === 'OPENED' ? 'close' : 'open');
+  });
+
+  // User menu actions
+  wrap.querySelector('#btn-bo-back-ws')?.addEventListener('click', () => { S.view = 'workspace'; render(); });
+
+  // "Lock" (Switch Cashier) — Session stays OPEN, only the cashier identity is
+  // dropped so someone else can PIN in. This matches Odoo: a register may
+  // keep going all day while cashiers rotate through it.
+  wrap.querySelector('#btn-bo-lock')?.addEventListener('click', () => {
+    if (typeof posLockRegister === 'function') { posLockRegister(); return; }
+    S.posActiveUser = null;    // back to PIN screen; do NOT touch S.posSession
+    render();
+  });
+
+  // "Sign out" — leaves the whole workspace. If a register is open, warn the
+  // operator so they don't accidentally abandon an open session with cash in it.
+  wrap.querySelector('#btn-bo-logout')?.addEventListener('click', () => {
+    if (S.posSession?.state === 'OPENED' &&
+        !confirm('The register is still open. Sign out anyway? (The session stays open and can be closed from another device.)')) {
+      return;
+    }
+    S.posActiveUser = null;
+    S.posView = 'selector';
+    S.posStoreType = null;
+    S.view = 'workspace';
+    render();
+  });
+}
+
+// ---- Back-office tab content router ----
+function renderPOSBackofficeTab() {
+  switch (S.posBackofficeTab) {
+    case 'dashboard':        return renderPOSDash();
+    case 'orders':           return renderPOSTransactions();
+    case 'sessions':         return renderPOSSessions();
+    case 'payments':         return renderPOSPayments();
+    case 'customers':        return renderPOSCustomers();
+    case 'products':         return renderPOSProducts();
+    case 'categories':       return renderPOSCategories();
+    case 'combos':           return renderPOSCombos();
+    case 'reports-orders':   return renderPOSReports();
+    case 'reports-sales':    return renderPOSReportSales();
+    case 'reports-session':  return renderPOSReportSession();
+    case 'reports-stock':    return renderPOSNotifications();
+    case 'config-settings':  return renderPOSSettings();
+    case 'config-payments':  return renderPOSConfigPayments();
+    case 'config-staff':     return renderPOSStaff();
+    case 'config-currencies':return renderPOSConfigCurrencies();
+    default:                 return renderPOSDash();
   }
 }
+
+// ============================================================
+// SCREEN 3 — POS SESSION  (Cashier Checkout)
+// ============================================================
+function renderPOSSession() {
+  // If no active cashier, show PIN login first
+  if (!S.posActiveUser || S.posActiveUser.role === 'Admin' || S.posActiveUser.role === 'Store Manager') {
+    // Managers go straight to checkout; cashiers also go straight
+  }
+
+  const wrap = document.createElement('div');
+  wrap.className = 'pos-session-wrap';
+
+  // Thin session top bar
+  const bar = document.createElement('div');
+  bar.className = 'pos-session-topbar';
+  bar.innerHTML = `
+    <button class="pharm-back" id="btn-session-back-bo" style="color:rgba(255,255,255,0.7);font-size:12px">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+      Back to management
+    </button>
+    <div style="display:flex;align-items:center;gap:8px">
+      <svg width="20" height="20" viewBox="0 0 64 64" fill="none"><rect x="2" y="2" width="60" height="60" rx="10" fill="#F5C411"/><path d="M22 20 L12 32 L22 44" stroke="#2D1859" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><path d="M42 20 L52 32 L42 44" stroke="#2D1859" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <strong style="color:#fff;font-size:14px">${esc(S.currentCompany)} · POS Session</strong>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <div class="avatar" style="width:26px;height:26px;font-size:10px;background:#7A5FB8;color:#fff">${initials(S.posActiveUser?.name||'')}</div>
+      <span style="font-size:12px;color:rgba(255,255,255,0.8)">${esc(S.posActiveUser?.name||'')} · ${S.posActiveUser?.role||''}</span>
+      <button class="btn btn-outline btn-sm" id="btn-session-lock" style="font-size:11px;color:rgba(255,255,255,0.7);border-color:rgba(255,255,255,0.3)">🔒 Lock</button>
+    </div>
+  `;
+
+  // Checkout area (existing)
+  const checkoutArea = document.createElement('div');
+  checkoutArea.className = 'pos-session-checkout';
+  checkoutArea.innerHTML = renderPOSCheckout();
+
+  if (S.posMobileMoneyModal) {
+    const overlay = document.createElement('div');
+    overlay.className = 'mm-modal-overlay';
+    overlay.innerHTML = renderMobileMoneyModal();
+    checkoutArea.appendChild(overlay);
+  }
+
+  wrap.appendChild(bar);
+  wrap.appendChild(checkoutArea);
+
+  setTimeout(() => {
+    wrap.querySelector('#btn-session-back-bo')?.addEventListener('click', () => {
+      S.posView = 'backoffice'; S.posBackofficeTab = 'dashboard'; render();
+    });
+    wrap.querySelector('#btn-session-lock')?.addEventListener('click', () => {
+      if (typeof posLockRegister === 'function') posLockRegister();
+    });
+    wirePOSEvents();
+  }, 0);
+
+  return wrap;
+}
+
+// ============================================================
+// POS TAB COMPAT SHIM (keeps old S.posTab refs working)
+// ============================================================
+function renderPOSTab() {
+  // Legacy: used by old sidebar. Now routed through renderPOSBackofficeTab.
+  return renderPOSBackofficeTab();
+}
+
+// ---- NEW BACK-OFFICE TABS ----
+
+function renderPOSCategories() {
+  const cats = [...new Set(POS_PRODUCTS.map(p => p.cat || 'General'))].sort();
+  return `
+    <div class="pharm-topbar">
+      <div class="pharm-tab-label">PoS Product Categories</div>
+      <button class="btn btn-gold btn-sm" id="btn-add-category">+ New Category</button>
+    </div>
+    <div class="pharm-content">
+      <div class="pos-table-wrap">
+        <table class="pos-table">
+          <thead><tr><th>#</th><th>Category Name</th><th>Products</th><th>Actions</th></tr></thead>
+          <tbody>
+            ${cats.map((cat, i) => {
+              const count = POS_PRODUCTS.filter(p => (p.cat||'General') === cat).length;
+              return `<tr>
+                <td>${i+1}</td>
+                <td><strong>${esc(cat)}</strong></td>
+                <td>${count} product${count!==1?'s':''}</td>
+                <td>
+                  <button class="btn btn-outline btn-sm" data-edit-cat="${esc(cat)}">Edit</button>
+                  <button class="btn btn-sm" style="color:#e53e3e;background:rgba(229,62,62,0.1)" data-delete-cat="${esc(cat)}">Delete</button>
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function renderPOSCombos() {
+  const combos = S.posCombos || [];
+  return `
+    <div class="pharm-topbar">
+      <div class="pharm-tab-label">Combo Choices</div>
+      <button class="btn btn-gold btn-sm" id="btn-add-combo">+ New Combo</button>
+    </div>
+    <div class="pharm-content">
+      ${combos.length === 0 ? `
+        <div style="text-align:center;padding:80px 20px;color:var(--text-muted)">
+          <div style="font-size:48px;margin-bottom:16px">🎁</div>
+          <div style="font-size:18px;font-weight:700;margin-bottom:8px">No combos yet</div>
+          <div style="font-size:14px;margin-bottom:20px">Create bundle deals — e.g. "Family Pack" or "Meal Deal"</div>
+          <button class="btn btn-gold" id="btn-add-combo-empty">+ Create first combo</button>
+        </div>
+      ` : `
+        <div class="pos-table-wrap">
+          <table class="pos-table">
+            <thead><tr><th>Combo Name</th><th>Items</th><th>Price</th><th>Actions</th></tr></thead>
+            <tbody>${combos.map(c => `<tr><td><strong>${esc(c.name)}</strong></td><td>${c.items?.length||0} products</td><td>$${Number(c.price||0).toFixed(2)}</td><td><button class="btn btn-outline btn-sm">Edit</button></td></tr>`).join('')}</tbody>
+          </table>
+        </div>
+      `}
+    </div>`;
+}
+
+function renderPOSReportSales() {
+  const txns = POS_TRANSACTIONS || [];
+  const byCashier = {};
+  txns.forEach(t => {
+    const k = t.cashier || 'Unknown';
+    if (!byCashier[k]) byCashier[k] = { count:0, total:0 };
+    byCashier[k].count++;
+    byCashier[k].total += Number(t.total||0);
+  });
+  const rows = Object.entries(byCashier).sort((a,b) => b[1].total - a[1].total);
+  return `
+    <div class="pharm-topbar">
+      <div class="pharm-tab-label">Sales Details · Per Cashier</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="date" class="form-input" style="width:140px;font-size:12px" value="${S.posReportFrom}" id="rsd-from"/>
+        <span style="font-size:12px;color:var(--text-muted)">to</span>
+        <input type="date" class="form-input" style="width:140px;font-size:12px" value="${S.posReportTo}" id="rsd-to"/>
+      </div>
+    </div>
+    <div class="pharm-content">
+      <div class="kpi-grid" style="margin-bottom:20px">
+        <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Total Sales</div><div class="kpi-value">$${txns.reduce((s,t)=>s+Number(t.total||0),0).toFixed(2)}</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Transactions</div><div class="kpi-value">${txns.length}</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Avg. Ticket</div><div class="kpi-value">$${txns.length?(txns.reduce((s,t)=>s+Number(t.total||0),0)/txns.length).toFixed(2):'0.00'}</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Active Cashiers</div><div class="kpi-value">${rows.length}</div></div>
+      </div>
+      <div class="pos-table-wrap">
+        <table class="pos-table">
+          <thead><tr><th>Cashier</th><th>Transactions</th><th>Total Sales</th><th>Avg. Ticket</th><th>%</th></tr></thead>
+          <tbody>
+            ${rows.map(([name,d]) => {
+              const grandTotal = txns.reduce((s,t)=>s+Number(t.total||0),0) || 1;
+              const pct = Math.round((d.total/grandTotal)*100);
+              return `<tr>
+                <td><strong>${esc(name)}</strong></td>
+                <td>${d.count}</td>
+                <td style="color:var(--gold);font-weight:700">$${d.total.toFixed(2)}</td>
+                <td>$${(d.total/d.count).toFixed(2)}</td>
+                <td><div style="display:flex;align-items:center;gap:6px"><div style="flex:1;height:6px;background:var(--border);border-radius:3px"><div style="width:${pct}%;height:100%;background:#F5C411;border-radius:3px"></div></div><span style="font-size:11px">${pct}%</span></div></td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function renderPOSReportSession() {
+  const sessions = S.posSessions || [];
+  return `
+    <div class="pharm-topbar">
+      <div class="pharm-tab-label">Session Report</div>
+    </div>
+    <div class="pharm-content">
+      ${sessions.length === 0 ? `
+        <div style="text-align:center;padding:80px 20px;color:var(--text-muted)">
+          <div style="font-size:48px;margin-bottom:12px">📋</div>
+          <div style="font-size:18px;font-weight:700">No sessions recorded yet</div>
+          <div style="margin-top:8px;font-size:14px">Open the register from the <strong>"Open Register →"</strong> button above to start selling.</div>
+        </div>
+      ` : `
+        <div class="pos-table-wrap">
+          <table class="pos-table">
+            <thead><tr><th>Session #</th><th>Cashier</th><th>Opened</th><th>Closed</th><th>Opening Cash</th><th>Expected</th><th>Difference</th><th>Status</th></tr></thead>
+            <tbody>
+              ${sessions.map(s => {
+                const diff = Number(s.closing_cash||0) - Number(s.expected_cash||0);
+                return `<tr>
+                  <td>#${s.id}</td>
+                  <td>${esc(s.opened_by_name||'—')}</td>
+                  <td>${s.start_time?new Date(s.start_time).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—'}</td>
+                  <td>${s.end_time?new Date(s.end_time).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'Open'}</td>
+                  <td>$${Number(s.opening_cash||0).toFixed(2)}</td>
+                  <td>$${Number(s.expected_cash||0).toFixed(2)}</td>
+                  <td style="color:${diff>=0?'#22C55E':'#e53e3e'};font-weight:700">${diff>=0?'+':''}$${diff.toFixed(2)}</td>
+                  <td><span class="pill ${s.state==='OPENED'?'pill-green':'pill-red'}">${s.state||'CLOSED'}</span></td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      `}
+    </div>`;
+}
+
+function renderPOSConfigPayments() {
+  const methods = S.storeSettings?.payments || { Cash:true, 'EVC Plus':true, eDahab:true, ZAAD:true, Sahal:true, Deyn:true };
+  const icons = { Cash:'💵', 'EVC Plus':'📱', eDahab:'📲', ZAAD:'💳', Sahal:'💰', Deyn:'🤝' };
+  return `
+    <div class="pharm-topbar">
+      <div class="pharm-tab-label">Payment Methods</div>
+      <button class="btn btn-gold btn-sm" id="btn-save-payment-methods">Save changes</button>
+    </div>
+    <div class="pharm-content">
+      <div style="max-width:600px">
+        <div style="font-size:14px;color:var(--text-secondary);margin-bottom:20px">Enable or disable payment methods available to cashiers at checkout.</div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          ${Object.entries(methods).map(([name, enabled]) => `
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;background:var(--gray-50);border:1px solid var(--border);border-radius:12px">
+              <div style="display:flex;align-items:center;gap:12px">
+                <span style="font-size:22px">${icons[name]||'💳'}</span>
+                <div>
+                  <div style="font-weight:700;font-size:14px">${name}</div>
+                  <div style="font-size:12px;color:var(--text-muted)">${name==='Cash'?'Physical currency':'Mobile money · Somalia'}</div>
+                </div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" class="pm-toggle" data-pm="${name}" ${enabled?'checked':''}/>
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderPOSConfigCurrencies() {
+  return `
+    <div class="pharm-topbar">
+      <div class="pharm-tab-label">Currencies · Exchange Rate</div>
+      <button class="btn btn-gold btn-sm" id="btn-save-currencies">Save rate</button>
+    </div>
+    <div class="pharm-content">
+      <div style="max-width:500px">
+        <div style="font-size:14px;color:var(--text-secondary);margin-bottom:24px">Set the USD → Somali Shilling (SOS) exchange rate used throughout the POS.</div>
+        <div class="form-grid" style="gap:16px">
+          <div class="form-group">
+            <label class="form-label">Primary Currency</label>
+            <select class="form-select" id="cfg-primary-currency">
+              <option value="USD" ${S.primaryCurrency==='USD'?'selected':''}>USD — US Dollar ($)</option>
+              <option value="SOS" ${S.primaryCurrency==='SOS'?'selected':''}>SOS — Somali Shilling (Sh)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Exchange Rate (1 USD = X Sh)</label>
+            <input type="number" class="form-input" id="cfg-exchange-rate" value="${S.exchangeRate||11800}" min="1"/>
+          </div>
+          <div style="grid-column:1/span 2;padding:14px 16px;background:rgba(245,196,17,0.08);border:1px solid rgba(245,196,17,0.3);border-radius:10px;font-size:13px">
+            <strong>Preview:</strong> $1.00 = ${Number(S.exchangeRate||11800).toLocaleString()} Sh &nbsp;·&nbsp;
+            $100.00 = ${(100*(S.exchangeRate||11800)).toLocaleString()} Sh
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+
+
 
 function renderPOSDash() {
   const u = S.posActiveUser;
@@ -2932,7 +4017,7 @@ function renderPOSDash() {
           <div class="cashier-dash-avatar">${initials(u.name)}</div>
           <div>
             <div style="font-size:11px;color:var(--text-muted);letter-spacing:1px;text-transform:uppercase">Good day,</div>
-            <div style="font-size:22px;font-weight:900;color:var(--purple-800)">${u.name}</div>
+            <div style="font-size:22px;font-weight:900;color:var(--purple-800)">${esc(u.name)}</div>
             <div style="font-size:13px;color:var(--text-muted)">${u.role} · Bakaara Main</div>
           </div>
           <div style="margin-left:auto">
@@ -2944,8 +4029,8 @@ function renderPOSDash() {
 
         ${S.posShiftActive ? `
         <div class="cashier-shift-banner">
-          <span>🟢 Shift active since ${shiftStart}</span>
-          <span class="shift-duration-badge">${shiftDuration}</span>
+          <span>🟢 Register #${S.posSession?.id || '—'} open since ${shiftStart} · Opening cash $${Number(S.posSession?.opening_cash||0).toFixed(2)}</span>
+          <span class="shift-duration-badge">${shiftDuration} · Expected $${Number(S.posSessionSummary?.expected_cash||S.posSession?.opening_cash||0).toFixed(2)}</span>
         </div>` : '<div class="cashier-shift-banner cashier-shift-idle">⚪ Shift not started — press Start Shift to begin</div>'}
 
         <div class="kpi-grid">
@@ -2996,23 +4081,50 @@ function renderPOSDash() {
   }
 
   // ---- MANAGER / ADMIN: global store dashboard ----
-  const todayTotal = POS_TRANSACTIONS.reduce((s,t)=>s+t.total,0);
-  const todayTxns = POS_TRANSACTIONS.length;
-  const avgTicket = (todayTotal / todayTxns).toFixed(2);
+  const dashboard = S.posDashData || {};
+  const todayTotal = Number(dashboard.today_revenue||0);
+  const todayTxns = Number(dashboard.today_orders||0);
+  const avgTicket = todayTxns ? (todayTotal / todayTxns).toFixed(2) : '0.00';
+  const hourlyRows=dashboard.hourly_sales||[];
+  const hours=Array.from({length:12},(_,i)=>8+i);
+  const hourlyValues=hours.map(hour=>Number(hourlyRows.find(row=>Number(row.hour)===hour)?.total||0));
+  const hourlyMax=Math.max(1,...hourlyValues.map(Math.abs));
+  const hourlyPoints=hourlyValues.map((value,index)=>`${Math.round(index*(600/(hours.length-1)))},${Math.round(145-(Math.max(0,value)/hourlyMax)*120)}`).join(' ');
+  const paymentRows=dashboard.payment_methods||[];
+  const paymentTotal=Math.max(1,paymentRows.reduce((sum,row)=>sum+Math.max(0,Number(row.amount||0)),0));
+  const topProducts=dashboard.top_products||[];
+  const stockAlerts = S.posStockAlerts || [];
+  const unreadAlerts = stockAlerts.filter(alert=>Number(alert.unread)).length;
+  const outAlerts = stockAlerts.filter(alert=>alert.severity==='out').length;
+  const registerOpen = S.posSession?.state === 'OPENED';
+  const registerSummary = S.posSessionSummary || {};
   return `
+    <div class="card" style="width:100%;padding:14px 16px;margin-bottom:16px;border:1px solid ${registerOpen?'#86EFAC':'#FCD34D'};background:${registerOpen?'#ECFDF3':'#FFFBEB'};display:flex;align-items:center;gap:12px">
+      <span style="font-size:22px">${registerOpen?'🟢':'🔒'}</span>
+      <span style="flex:1">
+        <strong>${registerOpen?`Register #${S.posSession.id} is open`:'The POS register is closed'}</strong>
+        <span style="display:block;font-size:11px;color:var(--text-muted);margin-top:2px">${registerOpen?`${esc(S.posSession.config_name||S.posConfig?.name||'Main Register')} · Opened by ${esc(S.posSession.opened_by_name||'staff')} · Opening $${Number(S.posSession.opening_cash||0).toFixed(2)} · Expected $${Number(registerSummary.expected_cash||S.posSession.opening_cash||0).toFixed(2)} · ${Number(registerSummary.orders||0)} orders`:'Open the register and record its opening cash before validating the first sale.'}</span>
+      </span>
+      <button class="btn ${registerOpen?'btn-outline':'btn-primary'} btn-sm" id="btn-dashboard-register">${registerOpen?'Register control':'Open register'}</button>
+    </div>
+    ${stockAlerts.length ? `<button id="btn-dashboard-stock-alerts" class="card" style="width:100%;padding:14px 16px;margin-bottom:16px;border:1px solid ${outAlerts?'#FCA5A5':'#FCD34D'};background:${outAlerts?'#FEF2F2':'#FFFBEB'};display:flex;align-items:center;gap:12px;text-align:left;cursor:pointer">
+      <span style="font-size:22px">${outAlerts?'🚨':'⚠️'}</span>
+      <span style="flex:1"><strong>${outAlerts ? `${outAlerts} product${outAlerts===1?' is':'s are'} out of stock` : `${stockAlerts.length} product${stockAlerts.length===1?' needs':'s need'} restocking`}</strong><span style="display:block;font-size:11px;color:var(--text-muted);margin-top:2px">${unreadAlerts} unread notification${unreadAlerts===1?'':'s'} · Open Stock Notifications to review needed quantities.</span></span>
+      <span style="font-weight:800;color:var(--purple-800)">Review →</span>
+    </button>` : ''}
     <div class="kpi-grid">
       <div class="kpi-card dark">
         <div class="kpi-eyebrow" style="color:#F5C411">Today's sales</div>
         <div class="kpi-value">$${todayTotal.toFixed(2)}</div>
-        <div class="kpi-trend" style="color:#EFEAFB">▲ 18% vs yesterday</div>
+        <div class="kpi-trend" style="color:#EFEAFB">Gross $${Number(dashboard.gross_sales||0).toFixed(2)} · Refunds $${Number(dashboard.refunds||0).toFixed(2)}</div>
       </div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Transactions</div><div class="kpi-value">${todayTxns}</div><div class="kpi-trend trend-up">▲ 6 more</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Validated orders</div><div class="kpi-value">${todayTxns}</div><div class="kpi-trend">Live database total</div></div>
       <div class="kpi-card light">
         <div class="kpi-eyebrow">Avg. ticket</div>
         <div class="kpi-value">$${avgTicket}</div>
         <div class="kpi-trend">Per transaction</div>
       </div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Active staff</div><div class="kpi-value">${POS_STAFF.filter(s=>s.status==='active').length}</div><div class="kpi-trend">On register now</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Open registers</div><div class="kpi-value">${Number(dashboard.open_sessions||0)}</div><div class="kpi-trend">${Number(dashboard.active_staff||0)} active staff accounts</div></div>
     </div>
     <div style="display:grid;grid-template-columns:2fr 1fr;gap:16px">
       <div class="chart-card">
@@ -3020,29 +4132,28 @@ function renderPOSDash() {
         <svg viewBox="0 0 600 160" width="100%" height="160" preserveAspectRatio="none">
           <defs><linearGradient id="posFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#F5C411" stop-opacity="0.3"/><stop offset="100%" stop-color="#F5C411" stop-opacity="0"/></linearGradient></defs>
           <g stroke="#F0EEF7" stroke-width="1"><line x1="0" y1="40" x2="600" y2="40"/><line x1="0" y1="80" x2="600" y2="80"/><line x1="0" y1="120" x2="600" y2="120"/></g>
-          <path d="M0,140 C50,130 80,115 120,100 C160,88 200,75 250,60 C300,50 350,42 400,35 C450,30 500,25 550,22 L600,20 L600,160 L0,160 Z" fill="url(#posFill)"/>
-          <path d="M0,140 C50,130 80,115 120,100 C160,88 200,75 250,60 C300,50 350,42 400,35 C450,30 500,25 550,22 L600,20" fill="none" stroke="#F5C411" stroke-width="3"/>
+          <polyline points="${hourlyPoints}" fill="none" stroke="#F5C411" stroke-width="3"/>
         </svg>
-        <div class="chart-x-axis"><span>8AM</span><span>9</span><span>10</span><span>11</span><span>12</span><span>1PM</span><span>2</span><span>3PM</span></div>
+        <div class="chart-x-axis"><span>8AM</span><span>10</span><span>12</span><span>2PM</span><span>4</span><span>7PM</span></div>
       </div>
       <div class="chart-card">
         <h3 class="chart-title" style="margin-bottom:12px">Payment methods</h3>
-        ${[['Cash','$147.60','32%','#2D1859'],['EVC Plus','$138.30','30%','#F5C411'],['Zaad','$224.00','48%','#22C55E'],['Sahal','$34.80','8%','#7A5FB8']].map(([name,amt,pct,col])=>`
+        ${paymentRows.map((row,index)=>{const colors=['#2D1859','#F5C411','#22C55E','#7A5FB8'];const amount=Number(row.amount||0);const pct=`${Math.round(Math.max(0,amount)/paymentTotal*100)}%`;return `
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
-            <div style="width:8px;height:8px;border-radius:50%;background:${col};flex-shrink:0"></div>
-            <div style="flex:1;font-size:13px;font-weight:600">${name}</div>
-            <div style="font-size:12px;font-weight:700;color:var(--text-primary)">${amt}</div>
+            <div style="width:8px;height:8px;border-radius:50%;background:${colors[index%colors.length]};flex-shrink:0"></div>
+            <div style="flex:1;font-size:13px;font-weight:600">${esc(row.name)}</div>
+            <div style="font-size:12px;font-weight:700;color:var(--text-primary)">$${amount.toFixed(2)}</div>
             <div style="font-size:11px;color:var(--text-muted);width:32px;text-align:right">${pct}</div>
           </div>
-        `).join('')}
+        `}).join('') || '<div style="font-size:12px;color:var(--text-muted);margin-bottom:16px">No payments recorded today.</div>'}
         <h3 class="chart-title" style="margin-bottom:12px;margin-top:16px">Top sellers</h3>
-        ${[['Basmati Rice 5kg','24 sold','#2D1859'],['Coca-Cola 330ml','42 sold','#F5C411'],['Sugar 1kg','38 sold','#22C55E'],['Bottled Water 1.5L','56 sold','#7A5FB8']].map(([name,sold,col])=>`
+        ${topProducts.map((row,index)=>{const colors=['#2D1859','#F5C411','#22C55E','#7A5FB8'];return `
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
-            <div style="width:8px;height:8px;border-radius:50%;background:${col};flex-shrink:0"></div>
-            <div style="flex:1;font-size:13px;font-weight:600">${name}</div>
-            <div style="font-size:12px;color:var(--text-muted);font-family:var(--font-mono)">${sold}</div>
+            <div style="width:8px;height:8px;border-radius:50%;background:${colors[index%colors.length]};flex-shrink:0"></div>
+            <div style="flex:1;font-size:13px;font-weight:600">${esc(row.name)}</div>
+            <div style="font-size:12px;color:var(--text-muted);font-family:var(--font-mono)">${Number(row.quantity||0)} sold</div>
           </div>
-        `).join('')}
+        `}).join('') || '<div style="font-size:12px;color:var(--text-muted)">No products sold today.</div>'}
       </div>
     </div>
     <div class="data-section">
@@ -3073,7 +4184,9 @@ function renderPOSCheckout() {
   const cart = S.posCart;
   const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
   const subtotal = cart.reduce((s,item)=>{ const p = item.isWholesale ? item.wholesalePrice : item.price; return s + p * item.qty; }, 0);
-  const tax = subtotal * 0.05;
+  const taxRate = Number(S.storeSettings.taxRate || 0);
+  const tax = subtotal * taxRate / 100;
+  const paymentEnabled = label => Object.entries(S.storeSettings.payments || {}).some(([name, enabled]) => name.toLowerCase() === label.toLowerCase() && enabled);
   const total = subtotal + tax;
   const term = (S.posSearchTerm||'').toLowerCase();
   const filtered = term ? POS_PRODUCTS.filter(p=>p.name.toLowerCase().includes(term)||p.barcode.includes(term)||p.cat.toLowerCase().includes(term)) : POS_PRODUCTS;
@@ -3085,11 +4198,12 @@ function renderPOSCheckout() {
   const overLimit = debtCustomer && (debtCustomer.debtBalance + total) > debtCustomer.creditLimit;
 
   return `
+    ${S.posSession?.state==='OPENED' ? `<div class="cashier-shift-banner" style="margin-bottom:12px"><span>🟢 Register #${S.posSession.id} open · ${esc(S.posSession.config_name||S.posConfig?.name||'Main Register')}</span><span class="shift-duration-badge">Expected cash $${Number(S.posSessionSummary?.expected_cash||S.posSession.opening_cash||0).toFixed(2)}</span></div>` : `<div class="cashier-shift-banner cashier-shift-idle" style="margin-bottom:12px;display:flex;align-items:center"><span style="flex:1">🔒 Register closed — open it before validating an order</span><button class="btn btn-primary btn-sm" id="btn-checkout-open-register">Open register</button></div>`}
     <div class="pos-checkout-layout">
       <div class="pos-product-panel">
         <div class="pos-product-search-bar">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
-          <input class="pos-search-input" id="pos-search" type="text" placeholder="Raadi alaab ama scan barcode..." value="${S.posSearchTerm||''}"/>
+          <input class="pos-search-input" id="pos-search" type="text" placeholder="Raadi alaab ama scan barcode..." value="${esc(S.posSearchTerm||'')}"/>
           <span style="font-size:11px;color:var(--text-muted)">${filtered.length} alaab</span>
         </div>
         <div class="pos-categories">
@@ -3099,7 +4213,7 @@ function renderPOSCheckout() {
           ${filtered.map(p=>`
             <button class="pos-product-tile" data-add-product="${p.id}">
               <div class="pos-tile-emoji">${catEmoji[p.cat]||'\ud83d\udce6'}</div>
-              <div class="pos-tile-name">${p.name}</div>
+              <div class="pos-tile-name">${esc(p.name)}</div>
               <div class="pos-tile-price">$${p.price.toFixed(2)}</div>
               <div class="pos-tile-wholesale">Jumlo: $${p.wholesalePrice.toFixed(2)}</div>
               <div class="pos-tile-stock">${p.stock} stock</div>
@@ -3124,7 +4238,7 @@ function renderPOSCheckout() {
           ` : cart.map((item,i)=>{ const effPrice=item.isWholesale?item.wholesalePrice:item.price; const rowTotal=effPrice*item.qty; return `
             <div class="pos-cart-row">
               <div class="pos-cart-item-info">
-                <div class="pos-cart-item-name">${item.name}</div>
+                <div class="pos-cart-item-name">${esc(item.name)}</div>
                 <div class="pos-cart-item-price">$${effPrice.toFixed(2)}</div>
               </div>
               <div class="pos-wholesale-toggle">
@@ -3145,26 +4259,26 @@ function renderPOSCheckout() {
 
         <div class="pos-cart-summary">
           <div class="pos-summary-row"><span>Wadarta yar</span><span>$${subtotal.toFixed(2)}</span></div>
-          <div class="pos-summary-row"><span>Canshuur (5%)</span><span>$${tax.toFixed(2)}</span></div>
+          <div class="pos-summary-row"><span>Canshuur (${taxRate}%)</span><span>$${tax.toFixed(2)}</span></div>
           <div class="pos-summary-row pos-summary-total"><span>WADARTA</span><span>$${total.toFixed(2)}</span></div>
         </div>
 
         <div class="pos-payment-methods">
           <div class="pos-pay-section-label">Hab lacag-bixinta</div>
           <div class="pos-pay-options">
-            <button class="pos-pay-btn${S.posPaymentMethod==='cash'?' active':''}" data-pay-method="cash">\ud83d\udcb5 Cash</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='evc'?' active':''} pos-pay-mobile" data-pay-method="evc">\ud83d\udcf1 EVC Plus</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='edahab'?' active':''} pos-pay-mobile" data-pay-method="edahab">\ud83d\udcb3 eDahab</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='zaad'?' active':''} pos-pay-mobile" data-pay-method="zaad">\ud83d\udcf2 Zaad</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='sahal'?' active':''}" data-pay-method="sahal">\ud83d\udcb3 Sahal</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='deyn'?' active':''} pos-pay-deyn" data-pay-method="deyn">\ud83d\udcd2 Deyn</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='cash'?' active':''}" data-pay-method="cash" ${paymentEnabled('Cash')?'':'disabled'}>\ud83d\udcb5 Cash</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='evc'?' active':''} pos-pay-mobile" data-pay-method="evc" ${paymentEnabled('EVC Plus')?'':'disabled'}>\ud83d\udcf1 EVC Plus</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='edahab'?' active':''} pos-pay-mobile" data-pay-method="edahab" ${paymentEnabled('eDahab')?'':'disabled'}>\ud83d\udcb3 eDahab</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='zaad'?' active':''} pos-pay-mobile" data-pay-method="zaad" ${paymentEnabled('ZAAD')?'':'disabled'}>\ud83d\udcf2 Zaad</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='sahal'?' active':''}" data-pay-method="sahal" ${paymentEnabled('Sahal')?'':'disabled'}>\ud83d\udcb3 Sahal</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='deyn'?' active':''} pos-pay-deyn" data-pay-method="deyn" ${paymentEnabled('Deyn')?'':'disabled'}>\ud83d\udcd2 Deyn</button>
           </div>
           ${S.posPaymentMethod==='deyn' ? `
             <div class="pos-deyn-selector">
               <label class="pos-pay-section-label">Magaca macmiilka (Buugga Deynta)</label>
               <select id="pos-deyn-customer" class="pos-deyn-select">
                 <option value="">\u2014 Dooro macmiil \u2014</option>
-                ${POS_CUSTOMERS.map(c=>{ const used=c.debtBalance+total; const over=used>c.creditLimit; return `<option value="${c.id}" ${S.posDebtCustomerId===c.id?'selected':''}>${c.name} \u2014 Deyn: $${c.debtBalance.toFixed(2)} / Xad: $${c.creditLimit} ${over?'\u26a0':'\u2713'}</option>`; }).join('')}
+                ${POS_CUSTOMERS.map(c=>{ const used=c.debtBalance+total; const over=used>c.creditLimit; return `<option value="${c.id}" ${S.posDebtCustomerId===c.id?'selected':''}>${esc(c.name)} \u2014 Deyn: $${c.debtBalance.toFixed(2)} / Xad: $${c.creditLimit} ${over?'\u26a0':'\u2713'}</option>`; }).join('')}
               </select>
               ${overLimit ? `<div class="pos-deyn-warning">\u26a0 Xadka deynta waa la dhaafay! Macmiilku xad: $${debtCustomer.creditLimit}, guud ahaan: $${(debtCustomer.debtBalance+total).toFixed(2)}.</div>` : ''}
               ${debtCustomer && !overLimit ? `<div class="pos-deyn-ok">\u2713 ${debtCustomer.name} \u00b7 Deyn cusub: $${(debtCustomer.debtBalance+total).toFixed(2)} / $${debtCustomer.creditLimit} xad</div>` : ''}
@@ -3173,7 +4287,7 @@ function renderPOSCheckout() {
         </div>
 
         <div class="pos-cart-actions">
-          <button class="pos-charge-btn" id="btn-pos-charge" ${cart.length===0||overLimit?'disabled':''}>
+          <button class="pos-charge-btn" id="btn-pos-charge" ${cart.length===0||overLimit||S.posSession?.state!=='OPENED'?'disabled':''}>
             ${['evc','edahab','zaad'].includes(S.posPaymentMethod) ? 'Soo dir OTP \u2192' : `Bixso $${total.toFixed(2)}`}
           </button>
           <button class="pos-clear-btn" id="btn-pos-clear" ${cart.length===0?'disabled':''}>Tirtir cart</button>
@@ -3227,25 +4341,27 @@ function renderPOSReceipt() {
         </div>
         <div class="pos-receipt-body">
           <div style="text-align:center;padding:16px 0;border-bottom:1px dashed var(--border)">
-            <div style="font-weight:900;font-size:15px">SHIFO RETAIL GROUP</div>
-            <div style="font-size:11px;color:var(--text-muted)">Bakaara Main Store · Mogadishu</div>
-            <div style="font-size:11px;color:var(--text-muted);font-family:var(--font-mono);margin-top:4px">${r.id} · ${r.date}</div>
+            <div style="font-weight:900;font-size:15px">${esc(S.storeSettings.receiptHeader || S.storeSettings.storeName)}</div>
+            <div style="font-size:11px;color:var(--text-muted)">${esc(S.storeSettings.defaultStore)} Store</div>
+            <div style="font-size:11px;color:var(--text-muted);font-family:var(--font-mono);margin-top:4px">${esc(r.id)} · ${esc(r.date)}</div>
           </div>
           <div style="padding:12px 0;border-bottom:1px dashed var(--border)">
             ${r.items.map(item=>`
               <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0">
-                <span>${item.name} × ${item.qty}</span>
-                <span style="font-weight:700">$${(item.price*item.qty).toFixed(2)}</span>
+                <span>${esc(item.name)} × ${item.qty}</span>
+                <span style="font-weight:700">$${((item.isWholesale?item.wholesalePrice:item.price)*item.qty).toFixed(2)}</span>
               </div>
             `).join('')}
           </div>
           <div style="padding:12px 0">
             <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text-muted)"><span>Subtotal</span><span>$${r.subtotal.toFixed(2)}</span></div>
-            <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text-muted)"><span>Tax (5%)</span><span>$${r.tax.toFixed(2)}</span></div>
+            <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text-muted)"><span>Tax (${Number(S.storeSettings.taxRate || 0)}%)</span><span>$${r.tax.toFixed(2)}</span></div>
             <div style="display:flex;justify-content:space-between;font-size:16px;font-weight:900;margin-top:8px;color:var(--purple-800)"><span>Total</span><span>$${r.total.toFixed(2)}</span></div>
-            <div style="display:flex;justify-content:space-between;font-size:12px;margin-top:8px;color:var(--text-muted)"><span>Paid via</span><span style="font-weight:700;color:var(--text-primary)">${r.method}</span></div>
+            <div style="display:flex;justify-content:space-between;font-size:12px;margin-top:8px;color:var(--text-muted)"><span>Paid via</span><span style="font-weight:700;color:var(--text-primary)">${esc(r.method)}</span></div>
+            ${r.amountPaid > r.total ? `<div style="display:flex;justify-content:space-between;font-size:12px;margin-top:4px;color:var(--text-muted)"><span>Cash tendered</span><span>$${r.amountPaid.toFixed(2)}</span></div>` : ''}
+            ${r.change > 0 ? `<div style="display:flex;justify-content:space-between;font-size:13px;margin-top:4px;font-weight:800"><span>Change</span><span>$${r.change.toFixed(2)}</span></div>` : ''}
           </div>
-          <div style="text-align:center;font-size:11px;color:var(--text-muted);padding-top:12px;border-top:1px dashed var(--border)">Thank you for shopping at Shifo!</div>
+          <div style="text-align:center;font-size:11px;color:var(--text-muted);padding-top:12px;border-top:1px dashed var(--border)">${esc(S.storeSettings.receiptFooter)}</div>
         </div>
         <div style="display:flex;gap:10px;padding:16px 20px">
           <button class="btn btn-primary" id="btn-receipt-new" style="flex:1">New sale</button>
@@ -3274,16 +4390,17 @@ function renderPOSProducts() {
           </div>
           <div class="crud-modal-body">
             <div class="crud-grid-2">
-              <div class="form-group"><label class="form-label">Product Name *</label><input class="form-input" id="cf-name" value="${f.name||''}"/></div>
+              <div class="form-group"><label class="form-label">Product Name *</label><input class="form-input" id="cf-name" value="${esc(f.name||'')}"/></div>
               <div class="form-group"><label class="form-label">Category</label>
                 <select class="form-select" id="cf-cat">
                   ${['Groceries','Beverages','Household','Personal Care','Snacks','Bakery','Fresh'].map(c=>`<option ${(f.cat||'Groceries')===c?'selected':''}>${c}</option>`).join('')}
                 </select>
               </div>
               <div class="form-group"><label class="form-label">Retail Price (USD) *</label><input class="form-input" id="cf-price" type="number" step="0.01" min="0" value="${f.price||''}"/></div>
-              <div class="form-group"><label class="form-label">Wholesale Price (USD)</label><input class="form-input" id="cf-wprice" type="number" step="0.01" min="0" value="${f.wholesalePrice||''}"/></div>
+              <div class="form-group"><label class="form-label">Wholesale Price (USD)</label><input class="form-input" id="cf-wholesalePrice" type="number" step="0.01" min="0" value="${f.wholesalePrice||''}"/></div>
               <div class="form-group"><label class="form-label">Stock Qty *</label><input class="form-input" id="cf-stock" type="number" min="0" value="${f.stock||''}"/></div>
-              <div class="form-group"><label class="form-label">Barcode</label><input class="form-input" id="cf-barcode" value="${f.barcode||''}"/></div>
+              <div class="form-group"><label class="form-label">Low-stock alert level</label><input class="form-input" id="cf-minimumStock" type="number" min="0" value="${f.minimumStock ?? 5}"/><div style="font-size:11px;color:var(--text-muted);margin-top:4px">Managers are notified at or below this quantity.</div></div>
+              <div class="form-group"><label class="form-label">Barcode</label><input class="form-input" id="cf-barcode" value="${esc(f.barcode||'')}"/></div>
             </div>
             ${S.crudForm._error ? `<div class="crud-error">${S.crudForm._error}</div>` : ''}
           </div>
@@ -3318,7 +4435,7 @@ function renderPOSProducts() {
     <div class="kpi-grid">
       <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Total products</div><div class="kpi-value">${POS_PRODUCTS.length}</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Categories</div><div class="kpi-value">${cats.length}</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Low stock</div><div class="kpi-value trend-warn">${POS_PRODUCTS.filter(p=>p.stock<40).length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Low stock</div><div class="kpi-value trend-warn">${POS_PRODUCTS.filter(p=>p.stock<=p.minimumStock).length}</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Total value</div><div class="kpi-value">$${POS_PRODUCTS.reduce((s,p)=>s+p.price*p.stock,0).toFixed(0)}</div></div>
     </div>
     <div class="data-section">
@@ -3337,12 +4454,12 @@ function renderPOSProducts() {
           <tbody>
             ${POS_PRODUCTS.map(p=>`
               <tr>
-                <td style="font-weight:700">${p.name}</td>
-                <td><span class="pill" style="background:var(--gray-50);color:var(--text-secondary)">${p.cat}</span></td>
+                <td style="font-weight:700">${esc(p.name)}</td>
+                <td><span class="pill" style="background:var(--gray-50);color:var(--text-secondary)">${esc(p.cat)}</span></td>
                 <td style="font-weight:800">$${p.price.toFixed(2)}</td>
                 <td style="font-size:13px;color:var(--text-muted)">$${p.wholesalePrice.toFixed(2)}</td>
                 <td style="font-weight:700;color:${p.stock<40?'#B45309':'var(--text-primary)'}">${p.stock}</td>
-                <td style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">${p.barcode}</td>
+                <td style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">${esc(p.barcode)}</td>
                 <td><span class="pill ${p.stock<40?'pill-amber':'pill-green'}">● ${p.stock<40?'Low':'In stock'}</span></td>
                 <td class="col-right">
                   <div class="crud-actions">
@@ -3382,8 +4499,8 @@ function renderPOSCustomers() {
           </div>
           <div class="crud-modal-body">
             <div class="crud-grid-2">
-              <div class="form-group"><label class="form-label">Full Name *</label><input class="form-input" id="cf-name" value="${f.name||''}"/></div>
-              <div class="form-group"><label class="form-label">Phone *</label><input class="form-input" id="cf-phone" value="${f.phone||''}"/></div>
+              <div class="form-group"><label class="form-label">Full Name *</label><input class="form-input" id="cf-name" value="${esc(f.name||'')}"/></div>
+              <div class="form-group"><label class="form-label">Phone *</label><input class="form-input" id="cf-phone" value="${esc(f.phone||'')}"/></div>
               <div class="form-group"><label class="form-label">Tier</label>
                 <select class="form-select" id="cf-tier">
                   ${['Bronze','Silver','Gold'].map(t=>`<option ${(f.tier||'Bronze')===t?'selected':''}>${t}</option>`).join('')}
@@ -3465,8 +4582,8 @@ function renderPOSCustomers() {
               const rowClass = isOver?'buugga-row-over':hasDebt?'buugga-row-debt':'';
               const statusPill = isOver ? '<span class="pill" style="background:#FEF0EE;color:#B42318;border:1px solid #FDA29B">● Xad dhaafay</span>' : hasDebt ? `<span class="pill" style="background:#FFFCEF;color:#B45309;border:1px solid rgba(245,196,17,0.3)">● ${pct}% used</span>` : '<span class="pill pill-green">● Saafi</span>';
               return `<tr class="${rowClass}">
-                <td><div class="flex items-center gap-10"><div class="avatar avatar-sm">${initials(c.name)}</div><div><div style="font-weight:700">${c.name}</div><div style="font-size:10px;color:var(--text-muted)">${c.tier}</div></div></div></td>
-                <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${c.phone}</td>
+                <td><div class="flex items-center gap-10"><div class="avatar avatar-sm">${esc(initials(c.name))}</div><div><div style="font-weight:700">${esc(c.name)}</div><div style="font-size:10px;color:var(--text-muted)">${esc(c.tier)}</div></div></div></td>
+                <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${esc(c.phone)}</td>
                 <td style="font-weight:700">$${c.creditLimit}</td>
                 <td><div style="font-weight:800;color:${isOver?'#B42318':hasDebt?'#B45309':'var(--text-primary)'}">$${c.debtBalance.toFixed(2)}</div></td>
                 <td><div class="buugga-bar-wrap"><div class="buugga-bar" style="width:${Math.min(pct,100)}%;background:${isOver?'#B42318':pct>60?'#B45309':'#22C55E'}"></div></div><div style="font-size:11px;font-weight:700;margin-top:2px;color:${isOver?'#B42318':'var(--text-muted)'}">${pct}%</div></td>
@@ -3491,7 +4608,7 @@ function renderPOSCustomers() {
         <table class="data-table" style="min-width:600px">
           <thead><tr><th>Macmiilka</th><th>Heerka</th><th>Dhibcaha</th><th>Booqdooyinka</th><th>Booqashadii u dambeysay</th></tr></thead>
           <tbody>
-            ${POS_CUSTOMERS.map(c=>{ const tc=tierColor[c.tier]||'#ccc'; return `<tr><td><div class="flex items-center gap-10"><div class="avatar avatar-sm">${initials(c.name)}</div><span style="font-weight:700">${c.name}</span></div></td><td><span class="pill" style="background:${tc}22;color:${tc==='#F5C411'?'#B45309':tc};border:1px solid ${tc}44;font-weight:800">\u2605 ${c.tier}</span></td><td style="font-weight:700">${c.points.toLocaleString()}</td><td>${c.visits}</td><td style="font-size:12px;color:var(--text-muted)">${c.lastVisit}</td></tr>`; }).join('')}
+            ${POS_CUSTOMERS.map(c=>{ const tc=tierColor[c.tier]||'#ccc'; return `<tr><td><div class="flex items-center gap-10"><div class="avatar avatar-sm">${esc(initials(c.name))}</div><span style="font-weight:700">${esc(c.name)}</span></div></td><td><span class="pill" style="background:${tc}22;color:${tc==='#F5C411'?'#B45309':tc};border:1px solid ${tc}44;font-weight:800">\u2605 ${esc(c.tier)}</span></td><td style="font-weight:700">${c.points.toLocaleString()}</td><td>${c.visits}</td><td style="font-size:12px;color:var(--text-muted)">${esc(c.lastVisit)}</td></tr>`; }).join('')}
           </tbody>
         </table>
       </div>
@@ -3500,9 +4617,12 @@ function renderPOSCustomers() {
 }
 
 function renderPOSTransactions() {
-  const totalSales = POS_TRANSACTIONS.reduce((s,t)=>s+t.total,0);
-  const cashTotal = POS_TRANSACTIONS.filter(t=>t.method==='Cash').reduce((s,t)=>s+t.total,0);
-  const mobileTotal = totalSales - cashTotal;
+  const completedTransactions = POS_TRANSACTIONS.filter(t=>t.status==='COMPLETED');
+  const saleOrders = completedTransactions.filter(t=>!t.isRefund&&t.total>=0);
+  const refundOrders = completedTransactions.filter(t=>t.isRefund||t.total<0);
+  const grossSales = saleOrders.reduce((s,t)=>s+t.total,0);
+  const refunds = Math.abs(refundOrders.reduce((s,t)=>s+t.total,0));
+  const totalSales = grossSales-refunds;
   const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
 
   // View detail modal
@@ -3518,13 +4638,16 @@ function renderPOSTransactions() {
           </div>
           <div class="crud-modal-body">
             <div class="txn-detail-grid">
-              <div class="txn-detail-row"><span>ID</span><span class="mono-val">${t.id}</span></div>
-              <div class="txn-detail-row"><span>Date</span><span>${t.date}</span></div>
-              <div class="txn-detail-row"><span>Time</span><span class="mono-val">${t.time}</span></div>
-              <div class="txn-detail-row"><span>Cashier</span><span>${t.cashier}</span></div>
-              <div class="txn-detail-row"><span>Customer</span><span>${t.customer}</span></div>
+              <div class="txn-detail-row"><span>ID</span><span class="mono-val">${esc(t.id)}</span></div>
+              <div class="txn-detail-row"><span>Date</span><span>${esc(t.date)}</span></div>
+              <div class="txn-detail-row"><span>Time</span><span class="mono-val">${esc(t.time)}</span></div>
+              <div class="txn-detail-row"><span>Cashier</span><span>${esc(t.cashier)}</span></div>
+              <div class="txn-detail-row"><span>Customer</span><span>${esc(t.customer)}</span></div>
               <div class="txn-detail-row"><span>Items</span><span>${t.items}</span></div>
-              <div class="txn-detail-row"><span>Payment</span><span>${t.method}</span></div>
+              <div class="txn-detail-row"><span>Payment</span><span>${esc(t.method)}</span></div>
+              <div class="txn-detail-row"><span>Status</span><span>${esc(t.status)}</span></div>
+              <div class="txn-detail-row"><span>Order state</span><span>${esc(t.posState||'legacy')}</span></div>
+              <div class="txn-detail-row"><span>Document type</span><span>${t.isRefund?'Linked refund':'Sale order'}</span></div>
               <div class="txn-detail-row txn-total-row"><span>Total</span><span>$${t.total.toFixed(2)}</span></div>
             </div>
           </div>
@@ -3543,10 +4666,10 @@ function renderPOSTransactions() {
       <div class="crud-overlay">
         <div class="crud-confirm">
           <div class="crud-confirm-icon">⚠️</div>
-          <h3>Void Transaction ${t?.id}?</h3>
-          <p>Amount: <strong>$${t?.total.toFixed(2)}</strong> · ${t?.method}. This action cannot be undone.</p>
+          <h3>Refund Transaction ${t?.id}?</h3>
+          <p>Amount: <strong>$${t?.total.toFixed(2)}</strong> · ${t?.method}. A linked negative refund order will be created and the original sale will remain unchanged.</p>
           <div class="crud-confirm-actions">
-            <button class="btn btn-danger" id="btn-delete-confirm">Void transaction</button>
+            <button class="btn btn-danger" id="btn-delete-confirm">Refund transaction</button>
             <button class="btn btn-outline" id="btn-delete-cancel">Cancel</button>
           </div>
         </div>
@@ -3557,34 +4680,35 @@ function renderPOSTransactions() {
     ${viewHtml}${deleteHtml}
     <div class="kpi-grid">
       <div class="kpi-card dark">
-        <div class="kpi-eyebrow" style="color:#F5C411">Total sales</div>
+        <div class="kpi-eyebrow" style="color:#F5C411">Net sales</div>
         <div class="kpi-value">$${totalSales.toFixed(2)}</div>
       </div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Transactions</div><div class="kpi-value">${POS_TRANSACTIONS.length}</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Cash</div><div class="kpi-value">$${cashTotal.toFixed(2)}</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Mobile money</div><div class="kpi-value">$${mobileTotal.toFixed(2)}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Sale orders</div><div class="kpi-value">${saleOrders.length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Gross sales</div><div class="kpi-value">$${grossSales.toFixed(2)}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Refunds</div><div class="kpi-value" style="color:${refunds?'#B91C1C':'inherit'}">$${refunds.toFixed(2)}</div></div>
     </div>
     <div class="data-section">
-      <div class="section-header-bar"><h3 class="chart-title">All transactions — Today</h3>
-        <div class="ml-auto" style="font-size:12px;color:var(--text-muted)">Click row to view · 🗑️ to void</div>
+      <div class="section-header-bar"><h3 class="chart-title">POS Orders</h3>
+        <div class="ml-auto" style="font-size:12px;color:var(--text-muted)">Click row to view · 🗑️ to refund</div>
       </div>
       <div class="overflow-x-auto">
         <table class="data-table" style="min-width:820px">
-          <thead><tr><th>ID</th><th>Cashier</th><th>Customer</th><th>Items</th><th>Total</th><th>Payment</th><th>Time</th><th class="col-right">Actions</th></tr></thead>
+          <thead><tr><th>ID</th><th>Cashier</th><th>Customer</th><th>Items</th><th>Total</th><th>Payment</th><th>Status</th><th>Time</th><th class="col-right">Actions</th></tr></thead>
           <tbody>
             ${POS_TRANSACTIONS.map(t=>`
               <tr class="txn-row-clickable" data-view-txn="${t.id}">
-                <td style="font-family:var(--font-mono);font-weight:700;color:#2D1859">${t.id}</td>
-                <td>${t.cashier}</td>
-                <td style="font-size:12px;color:var(--text-muted)">${t.customer}</td>
+                <td style="font-family:var(--font-mono);font-weight:700;color:#2D1859">${esc(t.id)}</td>
+                <td>${esc(t.cashier)}</td>
+                <td style="font-size:12px;color:var(--text-muted)">${esc(t.customer)}</td>
                 <td>${t.items}</td>
                 <td style="font-weight:800">$${t.total.toFixed(2)}</td>
-                <td><span class="pill ${t.method==='Cash'?'pill-green':'pill-gold'}">${t.method}</span></td>
-                <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${t.time}</td>
+                <td><span class="pill ${t.method==='Cash'?'pill-green':'pill-gold'}">${esc(t.method)}</span></td>
+                <td><span class="pill ${t.status==='COMPLETED'?'pill-green':'pill-red'}">${esc(t.status)}</span></td>
+                <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${esc(t.time)}</td>
                 <td class="col-right" onclick="event.stopPropagation()">
                   <div class="crud-actions">
                     <button class="crud-btn" data-view-txn-btn="${t.id}" title="View details" style="color:var(--purple-800)">👁️</button>
-                    <button class="crud-btn crud-btn-delete" data-delete-txn="${t.id}" title="Void">🗑️</button>
+                    ${['Admin','Store Manager'].includes(S.posActiveUser?.role) && t.status==='COMPLETED' && !t.isRefund ? `<button class="crud-btn crud-btn-delete" data-delete-txn="${t.id}" title="Refund">🗑️</button>` : ''}
                   </div>
                 </td>
               </tr>
@@ -3596,73 +4720,40 @@ function renderPOSTransactions() {
   `;
 }
 
+function renderStaffCredentialResult() {
+  const result=S.staffCredentialResult;
+  if(!result)return '';
+  return `<div class="crud-overlay">
+    <div class="crud-modal" style="max-width:540px">
+      <div class="crud-modal-header"><h3>Staff Account Created</h3><button class="crud-close-btn" id="btn-staff-credentials-done">×</button></div>
+      <div class="crud-modal-body">
+        <div style="background:#ECFDF3;border:1px solid #86EFAC;border-radius:10px;padding:12px 14px;color:#166534;font-size:13px;margin-bottom:16px"><strong>${esc(result.name)}</strong> can now select their name on the Retail POS lock screen and enter the PIN below.</div>
+        <div class="txn-detail-grid">
+          <div class="txn-detail-row"><span>Email</span><span class="mono-val">${esc(result.email)}</span></div>
+          <div class="txn-detail-row"><span>Temporary password</span><span class="mono-val">${esc(result.temporaryPassword)}</span></div>
+          <div class="txn-detail-row"><span>POS PIN</span><span class="mono-val" style="font-size:22px;letter-spacing:6px;color:var(--purple-800)">${esc(result.pin)}</span></div>
+        </div>
+        <div style="font-size:11px;color:#B45309;background:#FFFBEB;border:1px solid #FCD34D;border-radius:8px;padding:10px;margin-top:14px">Copy these credentials now. For security, the PIN and temporary password will not be displayed again.</div>
+      </div>
+      <div class="crud-modal-footer"><button class="btn btn-outline" id="btn-copy-staff-credentials">Copy credentials</button><button class="btn btn-primary" id="btn-staff-credentials-done-2">Done</button></div>
+    </div>
+  </div>`;
+}
+
 function renderPOSStaff() {
-  const systemCashUSD = POS_TRANSACTIONS.filter(t=>t.method==='Cash').reduce((s,t)=>s+t.total,0);
+  const systemCashUSD = Number(S.posSessionSummary?.expected_cash||0);
   const countedUSD = parseFloat(S.shiftCountedUSD)||0;
   const variance = countedUSD - systemCashUSD;
   const varianceClass = variance===0?'shift-var-zero':variance>0?'shift-var-over':'shift-var-short';
   const varianceLabel = variance===0 ? '\u2713 Sax' : variance>0 ? `\u25b2 Kordhay $${Math.abs(variance).toFixed(2)}` : `\u25bc Dhimay $${Math.abs(variance).toFixed(2)}`;
 
-  // Credential creation form state
-  const cf = S._staffCredForm || {};
-  const autoUser = cf.name ? (()=>{ const p=cf.name.trim().split(' '); return (p[0]||'').toLowerCase()+'.'+(p[1]?p[1][0].toLowerCase():''); })() : '';
-  const autoPin  = cf.generatedPin || '';
-
   return `
+    ${renderStaffCredentialResult()}
     <div class="kpi-grid">
       <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Shaqaalaha guud</div><div class="kpi-value">${POS_STAFF.length}</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Shaqeeya</div><div class="kpi-value" style="color:#0F7A3A">${POS_STAFF.filter(s=>s.status==='active').length}</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Nasanaya</div><div class="kpi-value trend-warn">${POS_STAFF.filter(s=>s.status==='break').length}</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Iibka maanta</div><div class="kpi-value">${POS_STAFF.reduce((s,st)=>s+st.sales,0)}</div></div>
-    </div>
-
-    <!-- CREATE STAFF WITH CREDENTIALS -->
-    <div class="staff-cred-panel">
-      <div class="staff-cred-header">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-        <h3 class="staff-cred-title">Create Staff Account</h3>
-      </div>
-      <div class="staff-cred-grid">
-        <div class="form-group">
-          <label class="form-label" style="color:rgba(255,255,255,0.8)">Full Name *</label>
-          <input class="form-input shift-count-input" id="scf-name" placeholder="e.g. Ali Omar" value="${cf.name||''}"/>
-        </div>
-        <div class="form-group">
-          <label class="form-label" style="color:rgba(255,255,255,0.8)">Role *</label>
-          <select class="form-select shift-count-input" id="scf-role">
-            ${['Cashier','Senior Cashier','Store Manager','Admin'].map(r=>`<option value="${r}" ${(cf.role||'Cashier')===r?'selected':''}>${r}</option>`).join('')}
-          </select>
-        </div>
-        <div class="form-group">
-          <label class="form-label" style="color:rgba(255,255,255,0.8)">Store</label>
-          <select class="form-select shift-count-input" id="scf-store">
-            ${['Bakaara Main','Hodan Store','Wadajir Store','Hamar Weyne'].map(st=>`<option ${(cf.store||'Bakaara Main')===st?'selected':''}>${st}</option>`).join('')}
-          </select>
-        </div>
-        <div class="form-group">
-          <label class="form-label" style="color:rgba(255,255,255,0.8)">Shift</label>
-          <select class="form-select shift-count-input" id="scf-shift">
-            ${['Morning','Afternoon','Full day'].map(sh=>`<option ${(cf.shift||'Morning')===sh?'selected':''}>${sh}</option>`).join('')}
-          </select>
-        </div>
-      </div>
-      ${autoUser ? `
-      <div class="staff-cred-preview">
-        <div class="cred-preview-item">
-          <span class="cred-preview-label">Auto username</span>
-          <span class="cred-preview-val" style="font-family:var(--font-mono)">${autoUser}</span>
-        </div>
-        <div class="cred-preview-item">
-          <span class="cred-preview-label">Auto-generated PIN</span>
-          <span class="cred-preview-val cred-pin">${autoPin || '—'}</span>
-          <button class="btn btn-ghost btn-sm" id="btn-regen-pin" style="color:var(--gold);font-size:11px">↺ New PIN</button>
-        </div>
-      </div>` : ''}
-      ${cf._error ? `<div class="crud-error" style="margin:8px 0">${cf._error}</div>` : ''}
-      <div style="display:flex;gap:10px;margin-top:14px">
-        <button class="btn btn-gold" id="btn-create-staff-cred">Create Account ✓</button>
-        <button class="btn btn-ghost" id="btn-clear-staff-cred" style="color:#EFEAFB">Clear</button>
-      </div>
     </div>
 
     <div class="shift-panel">
@@ -3674,10 +4765,12 @@ function renderPOSStaff() {
         <label class="form-label" style="color:rgba(255,255,255,0.7)">Cashier-ka shiftiga xira</label>
         <select class="form-select" id="shift-cashier-sel" style="max-width:280px;background:rgba(255,255,255,0.1);border-color:rgba(255,255,255,0.2);color:#FFF">
           <option value="">\u2014 Dooro cashier \u2014</option>
-          ${POS_STAFF.map(s=>`<option value="${s.id}" ${S.shiftCashier===s.id?'selected':''}>${s.name} \u00b7 ${s.store}</option>`).join('')}
+          ${POS_STAFF.map(s=>`<option value="${s.id}" ${S.shiftCashier===s.id?'selected':''}>${esc(s.name)} \u00b7 ${esc(s.store)}</option>`).join('')}
         </select>
       </div>
       <div class="shift-system-totals">
+        <div class="shift-sys-row"><span class="shift-sys-label">Register session</span><span class="shift-sys-val">${S.posSession?.state==='OPENED'?`#${S.posSession.id} · OPEN`:'CLOSED'}</span></div>
+        <div class="shift-sys-row"><span class="shift-sys-label">Opening cash</span><span class="shift-sys-val">$${Number(S.posSession?.opening_cash||0).toFixed(2)}</span></div>
         <div class="shift-sys-row"><span class="shift-sys-label">Nidaamka: Cash USD</span><span class="shift-sys-val">$${systemCashUSD.toFixed(2)}</span></div>
       </div>
       <div class="shift-count-grid">
@@ -3693,7 +4786,7 @@ function renderPOSStaff() {
         <div style="text-align:right"><div style="font-size:11px;opacity:0.7">Nidaamka</div><div style="font-weight:800">$${systemCashUSD.toFixed(2)}</div></div>
       </div>` : ''}
       <div style="display:flex;gap:10px;margin-top:14px">
-        <button class="btn btn-gold" id="btn-close-shift">Xir Shiftiga \u2713</button>
+        <button class="btn btn-gold" id="btn-close-shift" ${S.posSession?.state==='OPENED'?'':'disabled'}>Xir Shiftiga \u2713</button>
         <button class="btn btn-ghost" id="btn-reset-shift" style="color:#EFEAFB">Dib u bilow</button>
       </div>
     </div>
@@ -3704,6 +4797,7 @@ function renderPOSStaff() {
       if (S.crudModal && S.crudModal.type === 'staff') {
         const isEdit = S.crudModal.mode === 'edit';
         const f = S.crudForm;
+        const branches = (S.posBranches||[]).length ? S.posBranches : [{id:'',name:'Main Store'}];
         staffModal = `
           <div class="crud-overlay">
             <div class="crud-modal">
@@ -3713,15 +4807,17 @@ function renderPOSStaff() {
               </div>
               <div class="crud-modal-body">
                 <div class="crud-grid-2">
-                  <div class="form-group"><label class="form-label">Full Name *</label><input class="form-input" id="cf-name" value="${f.name||''}"/></div>
+                  <div class="form-group"><label class="form-label">Full Name *</label><input class="form-input" id="cf-name" value="${esc(f.name||'')}"/></div>
+                  <div class="form-group"><label class="form-label">Email ${isEdit?'':'(optional)'}</label><input class="form-input" id="cf-email" type="email" placeholder="${isEdit?'staff@company.so':'Auto-generated if empty'}" value="${esc(f.email||'')}" ${isEdit?'':'autocomplete="off"'}/></div>
+                  <div class="form-group"><label class="form-label">Phone</label><input class="form-input" id="cf-phone" type="tel" placeholder="061…" value="${esc(f.phone||'')}"/></div>
                   <div class="form-group"><label class="form-label">Role</label>
                     <select class="form-select" id="cf-role">
-                      ${['Cashier','Senior Cashier','Store Manager','Admin'].map(r=>`<option ${(f.role||'Cashier')===r?'selected':''}>${r}</option>`).join('')}
+                      ${['Cashier','Senior Cashier','Store Manager'].map(r=>`<option ${(f.role||'Cashier')===r?'selected':''}>${r}</option>`).join('')}
                     </select>
                   </div>
                   <div class="form-group"><label class="form-label">Store</label>
-                    <select class="form-select" id="cf-store">
-                      ${['Bakaara Main','Hodan Store','Wadajir Store','Hamar Weyne'].map(st=>`<option ${(f.store||'Bakaara Main')===st?'selected':''}>${st}</option>`).join('')}
+                    <select class="form-select" id="cf-branchId">
+                      ${branches.map(branch=>`<option value="${branch.id}" ${Number(f.branchId||branches[0]?.id)===Number(branch.id)?'selected':''}>${esc(branch.name)}</option>`).join('')}
                     </select>
                   </div>
                   <div class="form-group"><label class="form-label">Shift</label>
@@ -3734,6 +4830,14 @@ function renderPOSStaff() {
                       <option ${(f.status||'active')==='active'?'selected':''}>active</option>
                       <option ${f.status==='break'?'selected':''}>break</option>
                     </select>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">4-digit POS PIN ${isEdit?'(leave empty to keep)':'*'}</label>
+                    <div style="display:flex;gap:8px">
+                      <input class="form-input mono" id="cf-pin" type="text" inputmode="numeric" maxlength="4" pattern="[0-9]{4}" placeholder="0000" value="${esc(f.pin||'')}" style="letter-spacing:5px;font-weight:800"/>
+                      <button type="button" class="btn btn-outline btn-sm" id="btn-generate-staff-pin">Generate</button>
+                    </div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Give this PIN to the staff member privately. It is shown once after saving.</div>
                   </div>
                 </div>
                 ${S.crudForm._error ? `<div class="crud-error">${S.crudForm._error}</div>` : ''}
@@ -3779,12 +4883,12 @@ function renderPOSStaff() {
           <tbody>
             ${POS_STAFF.map(s=>`
               <tr>
-                <td><div class="flex items-center gap-10"><div class="avatar avatar-sm">${initials(s.name)}</div><span style="font-weight:700">${s.name}</span></div></td>
-                <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${s.username||'—'}</td>
+                <td><div class="flex items-center gap-10"><div class="avatar avatar-sm">${esc(initials(s.name))}</div><span style="font-weight:700">${esc(s.name)}</span></div></td>
+                <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${esc(s.username||'—')}</td>
                 <td><span class="role-tag ${s.role.includes('Admin')?'role-manager':s.role.includes('Manager')?'role-manager':s.role.includes('Senior')?'role-pharmacist':'role-cashier'}">${s.role}</span></td>
-                <td><span class="pin-badge">${s.pin ? '●●●●' : '—'}</span></td>
-                <td style="font-size:13px">${s.store}</td>
-                <td style="font-size:12px;color:var(--text-muted)">${s.shift}</td>
+                <td><span class="pin-badge">${s.hasPin ? '●●●●' : 'Not set'}</span></td>
+                <td style="font-size:13px">${esc(s.store)}</td>
+                <td style="font-size:12px;color:var(--text-muted)">${esc(s.shift)}</td>
                 <td style="font-weight:700">$${s.sales}</td>
                 <td><span class="pill ${s.status==='active'?'pill-green':'pill-amber'}">\u25cf ${s.status==='active'?'Shaqeeya':'Nasanaya'}</span></td>
                 <td class="col-right">
@@ -3802,9 +4906,50 @@ function renderPOSStaff() {
   `;
 }
 
+function renderPOSSessions() {
+  const rows = S.posSessions || [];
+  const current = S.posSession;
+  const summary = S.posSessionSummary || {};
+  return `
+    <div class="kpi-grid">
+      <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Register state</div><div class="kpi-value" style="font-size:22px">${current?.state==='OPENED'?'OPEN':'CLOSED'}</div><div class="kpi-trend" style="color:#EFEAFB">${current?`Session #${current.id}`:'No active session'}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Opening cash</div><div class="kpi-value">$${Number(current?.opening_cash||0).toFixed(2)}</div><div class="kpi-trend">Recorded at opening</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Expected cash</div><div class="kpi-value">$${Number(summary.expected_cash||0).toFixed(2)}</div><div class="kpi-trend">Opening + cash payments + in − out</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Session net sales</div><div class="kpi-value">$${Number(summary.net_sales||0).toFixed(2)}</div><div class="kpi-trend">${Number(summary.orders||0)} validated orders</div></div>
+    </div>
+    <div class="card" style="padding:20px;margin-bottom:16px">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <div style="flex:1;min-width:240px"><h3 class="chart-title">Register Control</h3><div style="font-size:11px;color:var(--text-muted);margin-top:4px">Open the register, record cash movements, and reconcile it before closing.</div></div>
+        ${current?.state==='OPENED' ? `<button class="btn btn-outline btn-sm" id="btn-cash-in">Cash In</button><button class="btn btn-outline btn-sm" id="btn-cash-out">Cash Out</button><button class="btn btn-primary btn-sm" id="btn-session-close">Close & reconcile</button>` : `<button class="btn btn-primary btn-sm" id="btn-session-open">Open register</button>`}
+      </div>
+      ${current?.state==='OPENED' ? `<div class="txn-detail-grid" style="margin-top:16px"><div class="txn-detail-row"><span>Configuration</span><strong>${esc(current.config_name||S.posConfig?.name||'Main Register')}</strong></div><div class="txn-detail-row"><span>Opened by</span><strong>${esc(current.opened_by_name||'—')}</strong></div><div class="txn-detail-row"><span>Opened at</span><strong>${esc(current.opened_at||'—')}</strong></div><div class="txn-detail-row"><span>Cash in / out</span><strong>$${Number(summary.cash_movements?.in||0).toFixed(2)} / $${Number(summary.cash_movements?.out||0).toFixed(2)}</strong></div></div>` : ''}
+    </div>
+    <div class="data-section">
+      <div class="section-header-bar"><h3 class="chart-title">Register Sessions</h3><span class="ml-auto" style="font-size:11px;color:var(--text-muted)">${rows.length} session${rows.length===1?'':'s'}</span></div>
+      <div class="overflow-x-auto"><table class="data-table" style="min-width:1000px"><thead><tr><th>Session</th><th>Register</th><th>Opened by</th><th>Opened</th><th>Closed</th><th>Orders</th><th>Net sales</th><th>Expected cash</th><th>Counted</th><th>Difference</th><th>Status</th></tr></thead><tbody>
+        ${rows.map(row=>`<tr><td style="font-family:var(--font-mono);font-weight:800">#${row.id}</td><td>${esc(row.config_name)}</td><td>${esc(row.opened_by_name)}</td><td>${esc(row.opened_at||'—')}</td><td>${esc(row.closed_at||'—')}</td><td>${Number(row.orders||0)}</td><td>$${Number(row.net_sales||0).toFixed(2)}</td><td>$${Number(row.state==='CLOSED'?row.expected_cash:row.calculated_cash||0).toFixed(2)}</td><td>${row.counted_cash==null?'—':`$${Number(row.counted_cash).toFixed(2)}`}</td><td>${row.difference_amount==null?'—':`$${Number(row.difference_amount).toFixed(2)}`}</td><td><span class="pill ${row.state==='OPENED'?'pill-green':row.state==='CLOSED'?'pill-gold':'pill-amber'}">${esc(row.state)}</span></td></tr>`).join('')}
+        ${rows.length?'':'<tr><td colspan="11" style="text-align:center;padding:28px;color:var(--text-muted)">No register sessions yet.</td></tr>'}
+      </tbody></table></div>
+    </div>`;
+}
+
+function renderPOSPayments() {
+  const rows=S.posPayments||[];
+  const total=rows.reduce((sum,row)=>sum+Number(row.amount||0),0);
+  const methods=[...new Set(rows.map(row=>row.method_name))];
+  return `
+    <div class="kpi-grid"><div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Net payments</div><div class="kpi-value">$${total.toFixed(2)}</div></div><div class="kpi-card light"><div class="kpi-eyebrow">Payment lines</div><div class="kpi-value">${rows.length}</div></div><div class="kpi-card light"><div class="kpi-eyebrow">Methods used</div><div class="kpi-value">${methods.length}</div></div><div class="kpi-card light"><div class="kpi-eyebrow">Register</div><div class="kpi-value" style="font-size:20px">${S.posSession?.state==='OPENED'?`#${S.posSession.id} OPEN`:'CLOSED'}</div></div></div>
+    <div class="data-section"><div class="section-header-bar"><h3 class="chart-title">Payment Lines</h3><div class="ml-auto" style="font-size:11px;color:var(--text-muted)">Tender and returned change are separate auditable lines.</div></div><div class="overflow-x-auto"><table class="data-table" style="min-width:900px"><thead><tr><th>ID</th><th>Order</th><th>Session</th><th>Cashier</th><th>Method</th><th>Type</th><th>Amount</th><th>Reference</th><th>Status</th><th>Time</th></tr></thead><tbody>
+      ${rows.map(row=>`<tr><td>#${row.id}</td><td style="font-family:var(--font-mono)">${esc(row.order_reference)}</td><td>#${row.session_id}</td><td>${esc(row.cashier_name)}</td><td><span class="pill ${row.method_type==='cash'?'pill-green':'pill-gold'}">${esc(row.method_name)}</span></td><td>${Number(row.is_change)?'Change returned':esc(row.method_type)}</td><td style="font-weight:800;color:${Number(row.amount)<0?'#B91C1C':'inherit'}">$${Number(row.amount).toFixed(2)}</td><td>${esc(row.reference_number||'—')}</td><td>${esc(row.status)}</td><td>${esc(row.created_at)}</td></tr>`).join('')}
+      ${rows.length?'':'<tr><td colspan="10" style="text-align:center;padding:28px;color:var(--text-muted)">No POS payments have been recorded.</td></tr>'}
+    </tbody></table></div></div>`;
+}
+
 function renderPOSSettings() {
   const s = S.storeSettings;
-  const stores = ['Bakaara Main','Hodan Store','Wadajir Store','Hamar Weyne'];
+  const stores = (S.posBranches || []).length
+    ? S.posBranches.map(branch => branch.name)
+    : [s.defaultStore || 'Main Store'];
   const savedBanner = S._settingsSaved
     ? `<div style="background:#DEF7EC;color:#0F7A3A;border:1px solid #86EFAC;padding:10px 14px;border-radius:8px;font-size:13px;font-weight:700;margin-bottom:16px">Settings saved.</div>`
     : '';
@@ -3818,7 +4963,7 @@ function renderPOSSettings() {
         <div class="flex-col gap-14">
           <div class="form-group">
             <label class="form-label">Store name</label>
-            <input class="form-input" id="ss-store-name" value="${s.storeName}"/>
+            <input class="form-input" id="ss-store-name" value="${esc(s.storeName)}"/>
           </div>
           <div class="form-group">
             <label class="form-label">Default currency</label>
@@ -3832,7 +4977,7 @@ function renderPOSSettings() {
           <div class="form-group">
             <label class="form-label">Default store</label>
             <select class="form-select" id="ss-default-store">
-              ${stores.map(st => `<option ${s.defaultStore===st?'selected':''}>${st}</option>`).join('')}
+              ${stores.map(st => `<option ${s.defaultStore===st?'selected':''}>${esc(st)}</option>`).join('')}
             </select>
           </div>
           <button class="btn btn-primary btn-sm" id="btn-save-store-settings" style="align-self:flex-start">Save store settings</button>
@@ -3844,11 +4989,11 @@ function renderPOSSettings() {
         <div class="flex-col gap-14">
           <div class="form-group">
             <label class="form-label">Receipt header</label>
-            <input class="form-input" id="ss-receipt-header" value="${s.receiptHeader}"/>
+            <input class="form-input" id="ss-receipt-header" value="${esc(s.receiptHeader)}"/>
           </div>
           <div class="form-group">
             <label class="form-label">Footer message</label>
-            <input class="form-input" id="ss-receipt-footer" value="${s.receiptFooter}"/>
+            <input class="form-input" id="ss-receipt-footer" value="${esc(s.receiptFooter)}"/>
           </div>
           <div class="form-group">
             <label class="form-label">Show barcode on receipt</label>
@@ -3858,6 +5003,17 @@ function renderPOSSettings() {
             </select>
           </div>
           <button class="btn btn-primary btn-sm" id="btn-save-receipt-settings" style="align-self:flex-start">Save receipt settings</button>
+        </div>
+      </div>
+
+      <div class="card" style="padding:24px;margin-bottom:16px">
+        <h3 style="font-size:16px;font-weight:800;margin-bottom:4px">Register & Cash Control</h3>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:16px">Controls the Odoo-style opening and closing workflow for this branch register.</div>
+        <div class="flex-col gap-14">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)"><span><strong>Cash control</strong><small style="display:block;color:var(--text-muted);margin-top:3px">Track opening, cash payments, cash in/out, and closing cash.</small></span><label class="toggle"><input type="checkbox" id="ss-cash-control" ${s.cashControl?'checked':''}/><span class="toggle-slider"></span></label></div>
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)"><span><strong>Opening control</strong><small style="display:block;color:var(--text-muted);margin-top:3px">Require an opening balance before validating orders.</small></span><label class="toggle"><input type="checkbox" id="ss-opening-control" ${s.openingControl?'checked':''}/><span class="toggle-slider"></span></label></div>
+          <div class="form-group"><label class="form-label">Maximum closing difference (USD)</label><input class="form-input" id="ss-max-difference" type="number" min="0" step="0.01" value="${Number(s.maximumDifference||0)}"/><div style="font-size:11px;color:var(--text-muted);margin-top:4px">A larger difference requires Company Admin or Store Manager approval.</div></div>
+          <button class="btn btn-primary btn-sm" id="btn-save-register-settings" style="align-self:flex-start">Save register controls</button>
         </div>
       </div>
 
@@ -3879,10 +5035,167 @@ function renderPOSSettings() {
   `;
 }
 
+function posMoney(value) {
+  return `$${Number(value || 0).toFixed(2)}`;
+}
+
+function posReportConfig(section, data) {
+  const configs = {
+    sales: {
+      title:'Daily Sales', rows:data.daily_sales || [],
+      columns:[['date','Date'],['orders','Orders'],['subtotal','Subtotal',posMoney],['tax','Tax',posMoney],['total','Total',posMoney]],
+    },
+    orders: {
+      title:'Transactions', rows:data.orders || [],
+      columns:[['reference_number','Reference'],['order_date','Date'],['cashier','Cashier'],['customer','Customer'],['items','Items'],['payment_method','Payment'],['status','Status'],['subtotal','Subtotal',posMoney],['tax_amount','Tax',posMoney],['total_amount','Total',posMoney]],
+    },
+    products: {
+      title:'Top Products', rows:data.top_products || [],
+      columns:[['sku','SKU'],['name','Product'],['category','Category'],['quantity_sold','Quantity Sold'],['sales','Sales',posMoney]],
+    },
+    payments: {
+      title:'Payment Methods', rows:data.payments || [],
+      columns:[['payment_method','Payment Method'],['transactions','Transactions'],['amount','Amount',posMoney]],
+    },
+    inventory: {
+      title:'Inventory', rows:data.inventory || [],
+      columns:[['sku','SKU'],['name','Product'],['category','Category'],['current_stock','Stock'],['minimum_stock','Minimum'],['purchase_price','Cost',posMoney],['selling_price','Retail',posMoney],['wholesale_price','Wholesale',posMoney],['retail_value','Retail Value',posMoney],['stock_status','Status']],
+    },
+    customers: {
+      title:'Customers & Debt', rows:data.customers || [],
+      columns:[['customer_code','Code'],['name','Customer'],['phone','Phone'],['email','Email'],['credit_limit','Credit Limit',posMoney],['balance','Debt Balance',posMoney],['status','Status'],['created_at','Created']],
+    },
+    staff: {
+      title:'Staff Performance', rows:data.staff || [],
+      columns:[['name','Staff'],['email','Email'],['roles','Role'],['branch','Branch'],['completed_orders','Completed Orders'],['sales','Sales',posMoney],['status','Status']],
+    },
+    shifts: {
+      title:'Shift Reconciliation', rows:data.shifts || [],
+      columns:[['closed_at','Closed At'],['cashier','Cashier'],['closed_by','Closed By'],['branch','Branch'],['system_cash','System Cash',posMoney],['counted_cash','Counted Cash',posMoney],['variance','Variance',posMoney],['notes','Notes']],
+    },
+  };
+  return configs[section] || configs.sales;
+}
+
+function renderPOSReports() {
+  const data = S.posReportData;
+  if (S.posReportLoading && !data) return `<div class="card" style="padding:40px;text-align:center;color:var(--text-muted)">Generating report…</div>`;
+  const summary = data?.summary || {};
+  const sections = [['sales','Daily Sales'],['orders','Transactions'],['products','Top Products'],['payments','Payments'],['inventory','Inventory'],['customers','Customers'],['staff','Staff'],['shifts','Shifts']];
+  const config = data ? posReportConfig(S.posReportSection, data) : null;
+  return `
+    <div class="card pos-report-controls" style="padding:18px;margin-bottom:16px">
+      <div style="display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap">
+        <div class="form-group"><label class="form-label">From</label><input id="pos-report-from" class="form-input" type="date" value="${esc(S.posReportFrom)}"></div>
+        <div class="form-group"><label class="form-label">To</label><input id="pos-report-to" class="form-input" type="date" value="${esc(S.posReportTo)}"></div>
+        <button class="btn btn-primary" id="btn-run-pos-report" ${S.posReportLoading?'disabled':''}>${S.posReportLoading?'Loading…':'Run report'}</button>
+        <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-outline btn-sm" id="btn-export-report-csv" ${data?'':'disabled'}>Export CSV</button>
+          <button class="btn btn-outline btn-sm" id="btn-export-report-json" ${data?'':'disabled'}>Export All</button>
+          <button class="btn btn-outline btn-sm" id="btn-print-pos-report" ${data?'':'disabled'}>Print / PDF</button>
+        </div>
+      </div>
+      ${S.posReportError ? `<div class="crud-error" style="margin-top:12px">${esc(S.posReportError)}</div>` : ''}
+      <div style="font-size:11px;color:var(--text-muted);margin-top:9px">Exports are limited to this company and the selected date range. “Export All” downloads every report section as JSON.</div>
+    </div>
+    ${data ? `
+      <div class="kpi-grid">
+        <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Gross sales</div><div class="kpi-value">${posMoney(summary.gross_sales)}</div><div class="kpi-trend" style="color:#EFEAFB">${Number(summary.completed_orders||0)} completed orders</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Average ticket</div><div class="kpi-value">${posMoney(summary.average_ticket)}</div><div class="kpi-trend">Tax ${posMoney(summary.tax_collected)}</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Outstanding debt</div><div class="kpi-value">${posMoney(summary.outstanding_debt)}</div><div class="kpi-trend">All current customers</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Inventory value</div><div class="kpi-value">${posMoney(summary.inventory_retail_value)}</div><div class="kpi-trend ${Number(summary.out_of_stock_products)>0?'trend-down':''}">${Number(summary.low_stock_products||0)} low · ${Number(summary.out_of_stock_products||0)} out</div></div>
+      </div>
+      <div class="data-section pos-report-table">
+        <div class="section-header-bar" style="gap:8px;flex-wrap:wrap">
+          ${sections.map(([key,label])=>`<button class="btn btn-sm ${S.posReportSection===key?'btn-primary':'btn-outline'}" data-report-section="${key}">${label}</button>`).join('')}
+        </div>
+        <div style="padding:14px 16px 0"><h3 class="chart-title">${esc(config.title)}</h3><div style="font-size:11px;color:var(--text-muted);margin-top:3px">${esc(data.range?.from)} to ${esc(data.range?.to)} · ${config.rows.length} row${config.rows.length===1?'':'s'}</div></div>
+        <div class="overflow-x-auto">
+          <table class="data-table" style="min-width:760px">
+            <thead><tr>${config.columns.map(([,label])=>`<th>${esc(label)}</th>`).join('')}</tr></thead>
+            <tbody>
+              ${config.rows.map(row=>`<tr>${config.columns.map(([key,,formatter])=>`<td>${esc(formatter ? formatter(row[key]) : (row[key] ?? '—'))}</td>`).join('')}</tr>`).join('')}
+              ${config.rows.length ? '' : `<tr><td colspan="${config.columns.length}" style="text-align:center;color:var(--text-muted);padding:28px">No data in this date range.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    ` : `<div class="card" style="padding:36px;text-align:center;color:var(--text-muted)">Choose a date range and run the report.</div>`}
+  `;
+}
+
+function renderPOSNotifications() {
+  const alerts = S.posStockAlerts || [];
+  const unread = alerts.filter(alert=>Number(alert.unread));
+  const out = alerts.filter(alert=>alert.severity==='out');
+  const low = alerts.filter(alert=>alert.severity==='low');
+  return `
+    <div class="kpi-grid">
+      <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Unread alerts</div><div class="kpi-value">${unread.length}</div><div class="kpi-trend" style="color:#EFEAFB">Personal notification count</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Out of stock</div><div class="kpi-value" style="color:${out.length?'#B91C1C':'inherit'}">${out.length}</div><div class="kpi-trend">Needs immediate restock</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Low stock</div><div class="kpi-value">${low.length}</div><div class="kpi-trend">At or below minimum level</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Open notifications</div><div class="kpi-value">${alerts.length}</div><div class="kpi-trend">Automatically resolves after restock</div></div>
+    </div>
+    <div class="data-section">
+      <div class="section-header-bar">
+        <div><h3 class="chart-title">Products Needed</h3><div style="font-size:11px;color:var(--text-muted);margin-top:3px">Notifications are created when stock reaches its configured minimum.</div></div>
+        <button class="btn btn-outline btn-sm ml-auto" id="btn-refresh-stock-alerts">Refresh</button>
+        <button class="btn btn-primary btn-sm" id="btn-read-all-stock-alerts" ${unread.length?'':'disabled'}>Mark all read</button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="data-table" style="min-width:780px">
+          <thead><tr><th>Product</th><th>SKU / Barcode</th><th>Current Stock</th><th>Minimum</th><th>Needed</th><th>Severity</th><th>Detected</th><th class="col-right">Actions</th></tr></thead>
+          <tbody>
+            ${alerts.map(alert=>{
+              const needed=Math.max(0,Number(alert.minimum_stock||0)-Number(alert.current_stock||0)+1);
+              const isOut=alert.severity==='out';
+              return `<tr style="${Number(alert.unread)?'background:#FFFDF3':''}">
+                <td><div style="font-weight:800">${esc(alert.product_name)}</div>${Number(alert.unread)?'<span class="pill pill-gold" style="margin-top:4px">New</span>':''}</td>
+                <td style="font-family:var(--font-mono);font-size:11px">${esc(alert.sku||alert.barcode||'—')}</td>
+                <td style="font-weight:900;color:${isOut?'#B91C1C':'#B45309'}">${esc(alert.current_stock)}</td>
+                <td>${esc(alert.minimum_stock)}</td><td style="font-weight:800">${needed}</td>
+                <td><span class="pill ${isOut?'pill-red':'pill-amber'}">${isOut?'Out of stock':'Low stock'}</span></td>
+                <td style="font-size:11px;color:var(--text-muted)">${esc(alert.detected_at)}</td>
+                <td class="col-right"><div class="crud-actions">
+                  <button class="crud-btn crud-btn-edit" data-restock-product="${alert.product_id}" title="Update stock">Restock</button>
+                  ${Number(alert.unread)?`<button class="crud-btn" data-read-stock-alert="${alert.id}" title="Mark read">Read</button>`:''}
+                </div></td>
+              </tr>`;
+            }).join('')}
+            ${alerts.length?'':'<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:32px">All products are above their minimum stock levels.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function posDownload(filename, content, type) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url; link.download = filename; document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 1000);
+}
+
+function posCsvCell(value) {
+  let text = String(value ?? '');
+  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g,'""')}"`;
+}
+
+function posExportCurrentReportCsv() {
+  if (!S.posReportData) return;
+  const config = posReportConfig(S.posReportSection, S.posReportData);
+  const csv = [config.columns.map(([,label])=>posCsvCell(label)).join(','), ...config.rows.map(row=>config.columns.map(([key])=>posCsvCell(row[key])).join(','))].join('\r\n');
+  posDownload(`curdun-pos-${S.posReportSection}-${S.posReportFrom}-to-${S.posReportTo}.csv`, `\uFEFF${csv}`, 'text/csv;charset=utf-8');
+}
+
 // ============================================================
 // LOGIN EVENT HANDLER (separate from wirePOSEvents)
 // ============================================================
 function wirePOSLoginEvents() {
+  document.getElementById('btn-exit-pos-station')?.addEventListener('click',()=>{S.view='login';S.posAuthError='';render();});
   // --- Staff mode: card selection ---
   document.querySelectorAll('[data-login-id]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -3917,58 +5230,40 @@ function wirePOSLoginEvents() {
   });
 
   // --- Admin login form submit ---
-  document.getElementById('pos-admin-login-form')?.addEventListener('submit', (e) => {
+  document.getElementById('pos-admin-login-form')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const email = document.getElementById('pos-admin-email').value.trim().toLowerCase();
     const pw = document.getElementById('pos-admin-pw').value;
     S.posAdminEmail = email;
 
-    const admin = COMPANY_ADMINS.find(a => a.email.toLowerCase() === email);
-    if (!admin) {
-      S.posAuthError = 'No admin account found for that email.';
-      render();
-      return;
-    }
-
-    // 1) Matches saved POS password (already changed once) \u2192 sign in
-    if (admin.posPassword && pw === admin.posPassword) {
-      S.posActiveUser = { ...admin };
-      S.currentCompany = admin.company;
+    try {
+      const user = await posEmailLogin(email, pw);
+      if (user.must_change_password) {
+        S.posPendingAdmin = user;
+        S.posLoginMode = 'force-change';
+        S.posAuthError = '';
+        render();
+        return;
+      }
+      const role = posRoleName(user);
+      S.posActiveUser = { ...mapStaff(user), role, access:POS_ROLES[role] || POS_ROLES.Cashier };
+      S.currentCompany = user.company_name || S.currentCompany;
       S.posLoginMode = 'staff';
-      S.posAuthError = '';
-      S.posAdminEmail = '';
       S.posTab = 'dash';
+      await posBootstrap();
+    } catch (error) {
+      S.posAuthError = error.message || 'Incorrect password.';
       render();
-      return;
     }
-
-    // 2) Matches temp password AND still requires change \u2192 force change
-    if (admin.mustChangePosPassword && pw === admin.tempPassword) {
-      S.posPendingAdmin = admin;
-      S.posLoginMode = 'force-change';
-      S.posAuthError = '';
-      render();
-      return;
-    }
-
-    // 3) Temp password used after already-changed \u2192 reject (temp only works once in POS)
-    if (pw === admin.tempPassword && !admin.mustChangePosPassword) {
-      S.posAuthError = 'Temporary password no longer works in POS. Use your new POS password.';
-      render();
-      return;
-    }
-
-    S.posAuthError = 'Incorrect password.';
-    render();
   });
 
   // --- Force-change form submit ---
-  document.getElementById('pos-force-change-form')?.addEventListener('submit', (e) => {
+  document.getElementById('pos-force-change-form')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const np = document.getElementById('pos-new-pw').value;
     const cp = document.getElementById('pos-confirm-pw').value;
-    if (np.length < 8) {
-      S.posAuthError = 'Password must be at least 8 characters.';
+    if (np.length < 10 || !/[A-Z]/.test(np) || !/\d/.test(np)) {
+      S.posAuthError = 'Use at least 10 characters, one uppercase letter, and one number.';
       render();
       return;
     }
@@ -3977,21 +5272,19 @@ function wirePOSLoginEvents() {
       render();
       return;
     }
-    const admin = S.posPendingAdmin;
-    admin.posPassword = np;
-    admin.mustChangePosPassword = false;
-    S.posActiveUser = { ...admin };
-    S.currentCompany = admin.company;
-    S.posPendingAdmin = null;
-    S.posLoginMode = 'staff';
-    S.posAuthError = '';
-    S.posTab = 'dash';
-    render();
+    try {
+      const user = await api('/auth/change-password', { method:'POST', body:{ password:np, password_confirmation:cp } });
+      const role = posRoleName(user);
+      S.posActiveUser = { ...mapStaff(user), role, access:POS_ROLES[role] || POS_ROLES.Cashier };
+      S.currentCompany = user.company_name || S.currentCompany;
+      S.posPendingAdmin = null; S.posLoginMode = 'staff'; S.posAuthError = ''; S.posTab = 'dash';
+      await posBootstrap();
+    } catch (error) { S.posAuthError = error.message; render(); }
   });
 
   // --- Numpad (staff mode) ---
   document.querySelectorAll('.numpad-key:not(.numpad-key-empty)').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const k = btn.dataset.key;
       if (k === '\u232b') {
         S.posLoginPin = (S.posLoginPin || '').slice(0, -1);
@@ -4002,19 +5295,11 @@ function wirePOSLoginEvents() {
       if ((S.posLoginPin || '').length >= 4) return;
       S.posLoginPin = (S.posLoginPin || '') + k;
       if (S.posLoginPin.length === 4) {
-        const staff = POS_STAFF.find(s => s.id === S._loginSelectedId);
-        if (staff && String(staff.pin) === S.posLoginPin) {
-          S.posActiveUser = { ...staff };
-          S.posLoginPin = '';
-          S._loginSelectedId = null;
-          S.posAuthError = '';
-          S.posTab = 'dash';
-          render();
-        } else {
-          S.posAuthError = 'PIN is incorrect. Please try again.';
-          S.posLoginPin = '';
-          render();
-        }
+        const pin = S.posLoginPin;
+        S.posLoginPin = '';
+        const selected = POS_STAFF.find(staff => staff.id === S._loginSelectedId);
+        try { await posPinLogin(pin, selected?.id, selected?.branchId); S._loginSelectedId = null; S.posAuthError = ''; render(); }
+        catch (error) { S.posAuthError = error.message || 'PIN is incorrect.'; render(); }
       } else {
         render();
       }
@@ -4023,6 +5308,60 @@ function wirePOSLoginEvents() {
 }
 
 function wirePOSEvents() {
+  // Opening Control (Odoo-style modal, replaces prompt()).
+  document.getElementById('btn-checkout-open-register')?.addEventListener('click', () => openRegisterModal('open'));
+  document.getElementById('btn-session-open')?.addEventListener('click',           () => openRegisterModal('open'));
+  document.getElementById('btn-dashboard-register')?.addEventListener('click', () => {
+    if (S.posSession?.state === 'OPENED') { S.posTab = 'staff'; render(); return; }
+    openRegisterModal('open');
+  });
+  // Cash In / Cash Out (modal, replaces prompt()).
+  document.getElementById('btn-cash-in')?.addEventListener('click',  () => openCashMovementModal('IN'));
+  document.getElementById('btn-cash-out')?.addEventListener('click', () => openCashMovementModal('OUT'));
+  // Closing Control (modal with full variance breakdown, replaces prompt()).
+  document.getElementById('btn-session-close')?.addEventListener('click', () => openRegisterModal('close'));
+  const closeStaffCredentials=()=>{S.staffCredentialResult=null;render();};
+  document.getElementById('btn-staff-credentials-done')?.addEventListener('click',closeStaffCredentials);
+  document.getElementById('btn-staff-credentials-done-2')?.addEventListener('click',closeStaffCredentials);
+  document.getElementById('btn-copy-staff-credentials')?.addEventListener('click',async event=>{
+    const result=S.staffCredentialResult;if(!result)return;
+    const text=`Curdun Retail POS\nStaff: ${result.name}\nEmail: ${result.email}\nTemporary password: ${result.temporaryPassword}\nPOS PIN: ${result.pin}`;
+    try{await navigator.clipboard.writeText(text);event.currentTarget.textContent='Copied ✓';}
+    catch(_){alert(text);}
+  });
+
+  document.getElementById('btn-dashboard-stock-alerts')?.addEventListener('click', async ()=>{
+    S.posTab='notifications'; render();
+    try{await posLoadStockAlerts();}catch(error){alert(error.message);}
+  });
+
+  // ---- Reports ----
+  document.getElementById('btn-run-pos-report')?.addEventListener('click', async () => {
+    S.posReportFrom = document.getElementById('pos-report-from')?.value || S.posReportFrom;
+    S.posReportTo = document.getElementById('pos-report-to')?.value || S.posReportTo;
+    try { await posLoadReports(S.posReportFrom, S.posReportTo); } catch (_) {}
+  });
+  document.querySelectorAll('[data-report-section]').forEach(btn=>btn.addEventListener('click',()=>{ S.posReportSection=btn.dataset.reportSection; render(); }));
+  document.getElementById('btn-export-report-csv')?.addEventListener('click', posExportCurrentReportCsv);
+  document.getElementById('btn-export-report-json')?.addEventListener('click', () => {
+    if (!S.posReportData) return;
+    posDownload(`curdun-pos-complete-report-${S.posReportFrom}-to-${S.posReportTo}.json`, JSON.stringify(S.posReportData,null,2), 'application/json;charset=utf-8');
+  });
+  document.getElementById('btn-print-pos-report')?.addEventListener('click', ()=>window.print());
+
+  // ---- Stock notifications ----
+  document.getElementById('btn-refresh-stock-alerts')?.addEventListener('click', async ()=>{ try{await posLoadStockAlerts();}catch(error){alert(error.message);} });
+  document.getElementById('btn-read-all-stock-alerts')?.addEventListener('click', async ()=>{ try{await posMarkAllStockAlertsRead();}catch(error){alert(error.message);} });
+  document.querySelectorAll('[data-read-stock-alert]').forEach(btn=>btn.addEventListener('click', async ()=>{ try{await posMarkStockAlertRead(btn.dataset.readStockAlert);}catch(error){alert(error.message);} }));
+  document.querySelectorAll('[data-restock-product]').forEach(btn=>btn.addEventListener('click', ()=>{
+    const product=POS_PRODUCTS.find(item=>item.id===Number(btn.dataset.restockProduct));
+    if(!product)return;
+    S.posTab='products';
+    S.crudModal={type:'product',mode:'edit',id:product.id};
+    S.crudForm={name:product.name,cat:product.cat,price:product.price,wholesalePrice:product.wholesalePrice,stock:product.stock,minimumStock:product.minimumStock,barcode:product.barcode};
+    render();
+  }));
+
   // ---- CRUD: Products ----
   document.getElementById('btn-add-product')?.addEventListener('click', () => {
     S.crudModal = { type:'product', mode:'add', id:null };
@@ -4034,7 +5373,7 @@ function wirePOSEvents() {
       const p = POS_PRODUCTS.find(x=>x.id===parseInt(btn.dataset.editProduct));
       if (!p) return;
       S.crudModal = { type:'product', mode:'edit', id:p.id };
-      S.crudForm = { name:p.name, cat:p.cat, price:p.price, wholesalePrice:p.wholesalePrice, stock:p.stock, barcode:p.barcode };
+      S.crudForm = { name:p.name, cat:p.cat, price:p.price, wholesalePrice:p.wholesalePrice, stock:p.stock, minimumStock:p.minimumStock, barcode:p.barcode };
       render();
     });
   });
@@ -4070,7 +5409,11 @@ function wirePOSEvents() {
   // ---- CRUD: Staff ----
   document.getElementById('btn-add-staff')?.addEventListener('click', () => {
     S.crudModal = { type:'staff', mode:'add', id:null };
-    S.crudForm = {};
+    S.crudForm = { pin:String(Math.floor(1000+Math.random()*9000)), branchId:(S.posBranches||[])[0]?.id||null, status:'active' };
+    render();
+  });
+  document.getElementById('btn-generate-staff-pin')?.addEventListener('click', () => {
+    S.crudForm.pin=String(Math.floor(1000+Math.random()*9000));
     render();
   });
   document.querySelectorAll('[data-edit-staff]').forEach(btn => {
@@ -4078,7 +5421,7 @@ function wirePOSEvents() {
       const s = POS_STAFF.find(x=>x.id===parseInt(btn.dataset.editStaff));
       if (!s) return;
       S.crudModal = { type:'staff', mode:'edit', id:s.id };
-      S.crudForm = { name:s.name, role:s.role, store:s.store, shift:s.shift, status:s.status };
+      S.crudForm = { name:s.name, email:s.email, role:s.role, branchId:s.branchId, store:s.store, shift:s.shift, status:s.status, pin:'' };
       render();
     });
   });
@@ -4118,15 +5461,17 @@ function wirePOSEvents() {
   document.getElementById('btn-delete-cancel')?.addEventListener('click', () => { S.confirmDeleteModal=null; render(); });
 
   // ---- Shared SAVE ----
-  document.getElementById('btn-crud-save')?.addEventListener('click', () => {
+  document.getElementById('btn-crud-save')?.addEventListener('click', async () => {
     if (!S.crudModal) return;
     const f = {};
     // Collect form values
-    ['name','phone','cat','role','store','shift','status','tier'].forEach(id => {
+    ['name','email','phone','pin','cat','role','store','shift','status','tier'].forEach(id => {
       const el = document.getElementById('cf-'+id);
       if (el) f[id] = el.value.trim();
     });
-    ['price','wholesalePrice','stock','creditLimit'].forEach(id => {
+    const branchInput=document.getElementById('cf-branchId');
+    if(branchInput)f.branchId=parseInt(branchInput.value)||null;
+    ['price','wholesalePrice','stock','minimumStock','creditLimit'].forEach(id => {
       const el = document.getElementById('cf-'+id);
       if (el) f[id] = parseFloat(el.value)||0;
     });
@@ -4137,92 +5482,107 @@ function wirePOSEvents() {
 
     const { type, mode, id } = S.crudModal;
 
+    try {
     if (type === 'product') {
       if (!f.name) { S.crudForm._error='Product name is required.'; render(); return; }
       if (f.price<=0) { S.crudForm._error='Price must be greater than 0.'; render(); return; }
       if (mode === 'add') {
-        POS_PRODUCTS.push({ id: Date.now(), name:f.name, cat:f.cat||'Groceries', price:f.price, wholesalePrice:f.wholesalePrice||f.price*6, stock:f.stock||0, barcode:f.barcode||'' });
+        await posCreateProduct(f);
       } else {
-        const p = POS_PRODUCTS.find(x=>x.id===id);
-        if (p) Object.assign(p, { name:f.name, cat:f.cat, price:f.price, wholesalePrice:f.wholesalePrice, stock:f.stock, barcode:f.barcode });
+        await posUpdateProduct(id,f);
       }
     } else if (type === 'customer') {
       if (!f.name) { S.crudForm._error='Customer name is required.'; render(); return; }
       if (!f.phone) { S.crudForm._error='Phone number is required.'; render(); return; }
       if (mode === 'add') {
-        POS_CUSTOMERS.push({ id:Date.now(), name:f.name, phone:f.phone, tier:f.tier||'Bronze', creditLimit:f.creditLimit||100, debtBalance:0, points:0, visits:0, lastVisit:'—' });
+        await posCreateCustomer(f);
       } else {
-        const c = POS_CUSTOMERS.find(x=>x.id===id);
-        if (c) Object.assign(c, { name:f.name, phone:f.phone, tier:f.tier, creditLimit:f.creditLimit });
+        await posUpdateCustomer(id,f);
       }
     } else if (type === 'staff') {
       if (!f.name) { S.crudForm._error='Staff name is required.'; render(); return; }
+      if (mode==='add' && !/^\d{4}$/.test(f.pin||'')) { S.crudForm={...S.crudForm,...f,_error:'Enter or generate a 4-digit POS PIN.'}; render(); return; }
+      if (mode==='edit' && f.pin && !/^\d{4}$/.test(f.pin)) { S.crudForm={...S.crudForm,...f,_error:'POS PIN must contain exactly 4 digits.'}; render(); return; }
       if (mode === 'add') {
-        POS_STAFF.push({ id:Date.now(), name:f.name, role:f.role||'Cashier', store:f.store||'Bakaara Main', shift:f.shift||'Morning', sales:0, status:f.status||'active' });
+        const result = await posCreateStaff(f);
+        S.staffCredentialResult={name:result.user.name,email:result.user.email,temporaryPassword:result.temporary_password,pin:result.pin};
       } else {
-        const s = POS_STAFF.find(x=>x.id===id);
-        if (s) Object.assign(s, { name:f.name, role:f.role, store:f.store, shift:f.shift, status:f.status });
+        await posUpdateStaff(id,f);
       }
     }
     S.crudModal = null; S.crudForm = {};
     render();
+    } catch (error) { S.crudForm._error=error.message;render(); }
   });
 
   // ---- Shared DELETE CONFIRM ----
-  document.getElementById('btn-delete-confirm')?.addEventListener('click', () => {
+  document.getElementById('btn-delete-confirm')?.addEventListener('click', async () => {
     if (!S.confirmDeleteModal) return;
     const { type, id } = S.confirmDeleteModal;
     if (type === 'product') {
-      const i = POS_PRODUCTS.findIndex(x=>x.id===id);
-      if (i!==-1) POS_PRODUCTS.splice(i,1);
+      await posDeleteProduct(id);
     } else if (type === 'customer') {
-      const i = POS_CUSTOMERS.findIndex(x=>x.id===id);
-      if (i!==-1) POS_CUSTOMERS.splice(i,1);
+      await posDeleteCustomer(id);
     } else if (type === 'staff') {
-      const i = POS_STAFF.findIndex(x=>x.id===id);
-      if (i!==-1) POS_STAFF.splice(i,1);
+      await api(`/platform/users/${id}`,{method:'PUT',body:{status:'inactive'}});const i=POS_STAFF.findIndex(x=>x.id===id);if(i!==-1)POS_STAFF.splice(i,1);
     } else if (type === 'transaction') {
-      const i = POS_TRANSACTIONS.findIndex(x=>x.id===id);
-      if (i!==-1) POS_TRANSACTIONS.splice(i,1);
+      const transaction = POS_TRANSACTIONS.find(item=>item.id===id);
+      if (!transaction?._backendId) throw new Error('Transaction record is unavailable.');
+      await posVoidTransaction(transaction._backendId);
     }
-    S.confirmDeleteModal = null;
-    render();
+    S.confirmDeleteModal = null; render();
   });
 
   // ---- Deyn: collect ----
   document.querySelectorAll('[data-collect-deyn]').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const c = POS_CUSTOMERS.find(x=>x.id===parseInt(btn.dataset.collectDeyn));
-      if (c && c.debtBalance > 0) { c.debtBalance = 0; render(); }
+      if (c && c.debtBalance > 0) { try{await posCollectDebt(c.id,c.debtBalance);render();}catch(error){alert(error.message);} }
     });
   });
 
   // ---- POS Settings tab ----
   // Store settings save
   const btnSaveStore = document.getElementById('btn-save-store-settings');
-  if (btnSaveStore) btnSaveStore.addEventListener('click', () => {
+  if (btnSaveStore) btnSaveStore.addEventListener('click', async () => {
     const name = document.getElementById('ss-store-name').value.trim();
     if (!name) { alert('Store name is required.'); return; }
     S.storeSettings.storeName    = name;
     S.storeSettings.taxRate      = parseFloat(document.getElementById('ss-tax-rate').value) || 0;
     S.storeSettings.defaultStore = document.getElementById('ss-default-store').value;
+    S.storeSettings.defaultBranchId = (S.posBranches || []).find(branch => branch.name === S.storeSettings.defaultStore)?.id || null;
     S.currentStore               = S.storeSettings.defaultStore + ' Store';
-    S._settingsSaved = true;
-    render();
-    setTimeout(() => { S._settingsSaved = false; render(); }, 2500);
+    try {
+      await posSaveSettings(S.storeSettings);
+      S._settingsSaved = true;
+      render();
+      setTimeout(() => { S._settingsSaved = false; render(); }, 2500);
+    } catch (error) { alert(error.message); }
   });
   const btnSaveReceipt = document.getElementById('btn-save-receipt-settings');
-  if (btnSaveReceipt) btnSaveReceipt.addEventListener('click', () => {
+  if (btnSaveReceipt) btnSaveReceipt.addEventListener('click', async () => {
     S.storeSettings.receiptHeader        = document.getElementById('ss-receipt-header').value;
     S.storeSettings.receiptFooter        = document.getElementById('ss-receipt-footer').value;
     S.storeSettings.showBarcodeOnReceipt = document.getElementById('ss-receipt-barcode').value === 'yes';
-    S._settingsSaved = true;
-    render();
-    setTimeout(() => { S._settingsSaved = false; render(); }, 2500);
+    try {
+      await posSaveSettings(S.storeSettings);
+      S._settingsSaved = true;
+      render();
+      setTimeout(() => { S._settingsSaved = false; render(); }, 2500);
+    } catch (error) { alert(error.message); }
+  });
+  const btnSaveRegister = document.getElementById('btn-save-register-settings');
+  if (btnSaveRegister) btnSaveRegister.addEventListener('click', async () => {
+    S.storeSettings.cashControl = document.getElementById('ss-cash-control').checked;
+    S.storeSettings.openingControl = document.getElementById('ss-opening-control').checked;
+    S.storeSettings.maximumDifference = Math.max(0, Number(document.getElementById('ss-max-difference').value)||0);
+    try { await posSaveSettings(S.storeSettings);await posBootstrap();S._settingsSaved=true;render();setTimeout(()=>{S._settingsSaved=false;render();},2500); } catch(error){alert(error.message);}
   });
   document.querySelectorAll('[data-payment-toggle]').forEach(cb => {
-    cb.addEventListener('change', () => {
+    cb.addEventListener('change', async () => {
       S.storeSettings.payments[cb.dataset.paymentToggle] = cb.checked;
+      try { await posSaveSettings(S.storeSettings); }
+      catch (error) { cb.checked = !cb.checked; S.storeSettings.payments[cb.dataset.paymentToggle] = cb.checked; alert(error.message); }
     });
   });
 
@@ -4232,10 +5592,19 @@ function wirePOSEvents() {
   const shiftUSD = document.getElementById('shift-usd');
   if (shiftUSD) shiftUSD.addEventListener('input', () => { S.shiftCountedUSD = shiftUSD.value; render(); });
   const closeShiftBtn = document.getElementById('btn-close-shift');
-  if (closeShiftBtn) closeShiftBtn.addEventListener('click', () => {
-    alert('Shiftiga waa la xiray! \u2713 Waraaqda waa la daabacay.');
-    S.shiftCountedUSD=''; S.shiftCashier=null;
-    render();
+  if (closeShiftBtn) closeShiftBtn.addEventListener('click', async () => {
+    if (!S.shiftCashier) { alert('Select a cashier before closing the shift.'); return; }
+    try {
+      let result;
+      try { result = await posCloseShift(S.shiftCashier, parseFloat(S.shiftCountedUSD)||0); }
+      catch (error) {
+        if (error.status === 409 && /approve/i.test(error.message) && confirm(`${error.message}\n\nApprove this cash difference and close the register?`)) result = await posCloseShift(S.shiftCashier, parseFloat(S.shiftCountedUSD)||0, true);
+        else throw error;
+      }
+      alert(`Shift saved.\nSystem cash: $${Number(result.system_cash).toFixed(2)}\nCounted: $${Number(result.counted_cash).toFixed(2)}\nVariance: $${Number(result.variance).toFixed(2)}`);
+      S.shiftCountedUSD=''; S.shiftCashier=null;
+      render();
+    } catch (error) { alert(error.message); }
   });
   const resetShiftBtn = document.getElementById('btn-reset-shift');
   if (resetShiftBtn) resetShiftBtn.addEventListener('click', () => { S.shiftCountedUSD=''; render(); });
@@ -4285,13 +5654,13 @@ function wirePOSEvents() {
 
     const chargeBtn = document.getElementById('btn-pos-charge');
     if (chargeBtn) {
-      chargeBtn.addEventListener('click', () => {
+      chargeBtn.addEventListener('click', async () => {
         if (S.posCart.length===0) return;
         if (['evc','edahab','zaad'].includes(S.posPaymentMethod)) {
           S.posMobileMoneyModal=true; S.mobilePhone=''; S.mobileTxId=''; S.mobileError='';
           render(); return;
         }
-        finalizeCharge();
+        await finalizeCharge();
       });
     }
     const clearBtn = document.getElementById('btn-pos-clear');
@@ -4305,13 +5674,13 @@ function wirePOSEvents() {
     if (txInput) txInput.addEventListener('input', () => { S.mobileTxId=txInput.value; });
     const confirmBtn = document.getElementById('btn-mm-confirm');
     if (confirmBtn) {
-      confirmBtn.addEventListener('click', () => {
+      confirmBtn.addEventListener('click', async () => {
         const phone=(S.mobilePhone||'').trim();
         const txid=(S.mobileTxId||'').trim();
         if (!/^[\d\s\-+]{7,}$/.test(phone)) { S.mobileError='Geli lambarka telefoonka saxda ah.'; render(); return; }
         if (!/^\d{4,8}$/.test(txid)) { S.mobileError='Transaction ID waa inuu noqdaa 4\u20138 lambar.'; render(); return; }
         S.posMobileMoneyModal=false;
-        finalizeCharge();
+        await finalizeCharge();
       });
     }
     const cancelBtn = document.getElementById('btn-mm-cancel');
@@ -4325,89 +5694,119 @@ function wirePOSEvents() {
     if (printBtn) printBtn.addEventListener('click', () => { window.print(); });
   }
 
-  // ---- Cashier shift toggle ----
+  // ---- Cashier shift toggle (routes through the Register Control modal) ----
   const shiftToggle = document.getElementById('btn-shift-toggle');
   if (shiftToggle) {
     shiftToggle.addEventListener('click', () => {
-      if (S.posShiftActive) {
-        S.posShiftActive = false;
-        S.posShiftStart = null;
-      } else {
-        S.posShiftActive = true;
-        S.posShiftStart = new Date();
+      openRegisterModal(S.posShiftActive ? 'close' : 'open');
+    });
+  }
+
+  // ---- Config → Payment Methods toggles ----
+  document.querySelectorAll('.pm-toggle').forEach(cb => {
+    cb.addEventListener('change', async () => {
+      const pmName = cb.dataset.pm;
+      if (!S.storeSettings.payments) S.storeSettings.payments = {};
+      S.storeSettings.payments[pmName] = cb.checked;
+      try { await posSaveSettings(S.storeSettings); }
+      catch (error) {
+        cb.checked = !cb.checked;
+        S.storeSettings.payments[pmName] = cb.checked;
+        alert(error.message);
       }
-      render();
     });
-  }
-
-  // ---- Staff credential creation ----
-  const scfName = document.getElementById('scf-name');
-  if (scfName) {
-    scfName.addEventListener('input', () => {
-      if (!S._staffCredForm) S._staffCredForm = {};
-      S._staffCredForm.name = scfName.value;
-      if (scfName.value.trim() && !S._staffCredForm.generatedPin) {
-        S._staffCredForm.generatedPin = String(Math.floor(1000 + Math.random() * 9000));
-      }
-      render();
+  });
+  document.getElementById('btn-save-payment-methods')?.addEventListener('click', async () => {
+    document.querySelectorAll('.pm-toggle').forEach(cb => {
+      if (!S.storeSettings.payments) S.storeSettings.payments = {};
+      S.storeSettings.payments[cb.dataset.pm] = cb.checked;
     });
-  }
-  const scfRole = document.getElementById('scf-role');
-  if (scfRole) scfRole.addEventListener('change', () => { if (!S._staffCredForm) S._staffCredForm = {}; S._staffCredForm.role = scfRole.value; });
-  const scfStore = document.getElementById('scf-store');
-  if (scfStore) scfStore.addEventListener('change', () => { if (!S._staffCredForm) S._staffCredForm = {}; S._staffCredForm.store = scfStore.value; });
-  const scfShift = document.getElementById('scf-shift');
-  if (scfShift) scfShift.addEventListener('change', () => { if (!S._staffCredForm) S._staffCredForm = {}; S._staffCredForm.shift = scfShift.value; });
+    try { await posSaveSettings(S.storeSettings); S._settingsSaved=true; render(); setTimeout(()=>{S._settingsSaved=false;render();},2500); }
+    catch (error) { alert(error.message); }
+  });
 
-  const regenPin = document.getElementById('btn-regen-pin');
-  if (regenPin) {
-    regenPin.addEventListener('click', () => {
-      if (!S._staffCredForm) S._staffCredForm = {};
-      S._staffCredForm.generatedPin = String(Math.floor(1000 + Math.random() * 9000));
-      render();
-    });
-  }
+  // ---- Config → Currencies ----
+  document.getElementById('btn-save-currencies')?.addEventListener('click', () => {
+    const rate = parseInt(document.getElementById('cfg-exchange-rate')?.value) || 11800;
+    const currency = document.getElementById('cfg-primary-currency')?.value || 'USD';
+    S.exchangeRate = rate;
+    S.primaryCurrency = currency;
+    S._settingsSaved = true;
+    render();
+    setTimeout(()=>{S._settingsSaved=false;render();},2500);
+  });
 
-  const createCredBtn = document.getElementById('btn-create-staff-cred');
-  if (createCredBtn) {
-    createCredBtn.addEventListener('click', () => {
-      const cf = S._staffCredForm || {};
-      const name = (cf.name || '').trim();
-      if (!name) { S._staffCredForm = cf; cf._error = 'Full name is required.'; render(); return; }
-      const parts = name.split(/\s+/);
-      const username = (parts[0] || '').toLowerCase() + '.' + (parts[1] ? parts[1][0].toLowerCase() : '');
-      const pin = cf.generatedPin || String(Math.floor(1000 + Math.random() * 9000));
-      const role = cf.role || 'Cashier';
-      const access = POS_ROLES[role] || POS_ROLES['Cashier'];
-      POS_STAFF.push({
-        id: Date.now(), name, username, pin, role,
-        store: cf.store || 'Bakaara Main', shift: cf.shift || 'Morning',
-        sales: 0, status: 'active', access: [...access]
-      });
-      S._staffCredForm = {};
-      render();
-    });
-  }
+  // ---- Back-office stock alert link ----
+  document.getElementById('btn-dashboard-stock-alerts')?.addEventListener('click', async () => {
+    S.posBackofficeTab = 'reports-stock'; render();
+    try { await posLoadStockAlerts(); } catch(error) { alert(error.message); }
+  });
 
-  const clearCredBtn = document.getElementById('btn-clear-staff-cred');
-  if (clearCredBtn) {
-    clearCredBtn.addEventListener('click', () => { S._staffCredForm = {}; render(); });
-  }
+  // ---- Categories tab placeholder events ----
+  document.getElementById('btn-add-category')?.addEventListener('click', () => {
+    const name = prompt('New category name:');
+    if (name && name.trim()) {
+      // Optimistically add a placeholder product to register category
+      alert(`Category "${name.trim()}" will be available when you add products to it.`);
+    }
+  });
+
+  // ---- Combos tab placeholder events ----
+  document.getElementById('btn-add-combo')?.addEventListener('click', () => {
+    alert('Combo creation coming soon! You will be able to bundle products into meal deals and family packs.');
+  });
+  document.getElementById('btn-add-combo-empty')?.addEventListener('click', () => {
+    alert('Combo creation coming soon! You will be able to bundle products into meal deals and family packs.');
+  });
+
 }
 
-function finalizeCharge() {
+
+async function finalizeCharge() {
+  if (S.isOffline) {
+    alert('Checkout needs a connection so stock and the receipt can be saved safely.');
+    return;
+  }
+  if (S.posPaymentMethod === 'deyn' && !S.posDebtCustomerId) {
+    alert('Select a customer before recording a credit sale.');
+    return;
+  }
+  if (!S.posSession || S.posSession.state !== 'OPENED') {
+    // Don't slip in a JS prompt mid-checkout — Odoo pattern is: block, force
+    // the operator through Opening Control, then let them retry the sale.
+    openRegisterModal('open');
+    alert('The register is closed. Open it (with the correct opening cash) before validating this sale.');
+    return;
+  }
+  const cart = S.posCart.map(item => ({ ...item }));
   const subtotal = S.posCart.reduce((s,item)=>{ const p=item.isWholesale?item.wholesalePrice:item.price; return s+p*item.qty; }, 0);
-  const tax = subtotal * 0.05;
+  const tax = subtotal * (Number(S.storeSettings.taxRate || 0) / 100);
   const total = subtotal + tax;
   const methodLabels = {cash:'Cash',evc:'EVC Plus',edahab:'eDahab',zaad:'Zaad',sahal:'Sahal',deyn:'Deyn (Credit)'};
-  if (S.posPaymentMethod==='deyn' && S.posDebtCustomerId) {
-    const cust = POS_CUSTOMERS.find(c=>c.id===S.posDebtCustomerId);
-    if (cust) cust.debtBalance = Math.round((cust.debtBalance+total)*100)/100;
+  try {
+    const result = await posCompleteCheckout(cart, S.posDebtCustomerId, S.posPaymentMethod);
+    S.posLastReceipt = {
+      id: result.reference_number,
+      date: new Date(result.created_at || Date.now()).toLocaleString(),
+      items: cart,
+      subtotal: Number(result.subtotal ?? subtotal),
+      tax: Number(result.tax_amount ?? tax),
+      total: Number(result.total_amount ?? total),
+      method: methodLabels[S.posPaymentMethod] || result.payment_method || 'Cash',
+      amountPaid: Number(result.amount_paid ?? total) + Number(result.amount_return ?? 0),
+      change: Number(result.amount_return ?? 0),
+      mobilePhone:S.mobilePhone||null,
+      mobileTxId:S.mobileTxId||null,
+    };
+    S.posReceiptVisible=true;
+    S.posCart=[];
+    S.posMobileMoneyModal=false;
+    await posBootstrap();
+  } catch (error) {
+    S.posMobileMoneyModal=false;
+    alert(error.message);
+    render();
   }
-  if (S.isOffline) S.syncQueue++;
-  S.posLastReceipt = { id:'TXN-'+(4821+Math.floor(Math.random()*100)), date:new Date().toLocaleString(), items:[...S.posCart], subtotal, tax, total, method:methodLabels[S.posPaymentMethod]||'Cash', mobilePhone:S.mobilePhone||null, mobileTxId:S.mobileTxId||null };
-  S.posReceiptVisible=true; S.posCart=[]; S.posMobileMoneyModal=false;
-  render();
 }
 
 function posIcon(type) {
@@ -4417,6 +5816,8 @@ function posIcon(type) {
     products:     `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 7H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/><path d="M16 3v4M8 3v4"/></svg>`,
     customers:    `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3.5-6 7-6s7 2 7 6"/><path d="M16 3c2 0 4 1 4 3s-2 3-4 3"/></svg>`,
     transactions: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h8"/></svg>`,
+    reports:      `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V9M10 19V5M16 19v-7M22 19H2"/></svg>`,
+    notifications:`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg>`,
     staff:        `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg>`,
   };
   return icons[type] || icons.dash;
@@ -4458,6 +5859,16 @@ setInterval(() => {
     if (timeEl && S.superTab==='infra') timeEl.textContent = '🔴 LIVE · '+liveTime;
   }
 }, 3000);
+
+// Keep manager stock notifications current while another register is selling.
+setInterval(async () => {
+  if (S.view !== 'pos' || !['Admin','Store Manager'].includes(S.posActiveUser?.role) || S.isOffline) return;
+  try {
+    const previous = JSON.stringify(S.posStockAlerts || []);
+    await posLoadStockAlerts(false);
+    if (previous !== JSON.stringify(S.posStockAlerts || [])) render();
+  } catch (_) {}
+}, 60000);
 
 // ============================================================
 // BOOT

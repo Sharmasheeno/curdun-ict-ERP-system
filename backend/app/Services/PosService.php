@@ -503,7 +503,30 @@ class PosService
             $methodName=(string)($data['payment_method']??($originalPayment['method_name']??($legacyDebt?'Deyn':'Cash')));$payment=$this->paymentMethod($methodName);
             $this->db->query("INSERT INTO pos_payments (company_id,session_id,order_id,user_id,payment_method_id,method_name,method_type,amount,reference_number,status) VALUES (:company,:session,:order,:user,:method,:name,:type,:amount,:reference,'COMPLETED')",
                 ['company'=>$companyId,'session'=>$session['id'],'order'=>$refundId,'user'=>$user['id'],'method'=>$payment['id'],'name'=>$payment['name'],'type'=>$payment['type'],'amount'=>$total,'reference'=>$reference]);
-            if(strtolower($payment['name'])==='deyn'&&$order['customer_id'])$this->db->query("UPDATE customers SET balance=GREATEST(0,balance+:total) WHERE id=:id AND company_id=:company",['total'=>$total,'id'=>$order['customer_id'],'company'=>$companyId]);
+            if(strtolower($payment['name'])==='deyn'&&$order['customer_id']){
+                // Ledger row for the refund reversal — signed negative so the
+                // customer's debt drops by the refunded amount.
+                $this->db->query(
+                    "INSERT INTO pos_credit_ledger
+                        (company_id, branch_id, session_id, customer_id, cashier_id,
+                         order_id, type, amount, reference, notes)
+                     VALUES
+                        (:company, :branch, :session, :customer, :cashier,
+                         :order, 'DEYN_REFUND_REVERSAL', :amount, :reference, :notes)",
+                    [
+                        'company'  => $companyId,
+                        'branch'   => $user['branch_id'] ?? null,
+                        'session'  => $session['id'],
+                        'customer' => $order['customer_id'],
+                        'cashier'  => $user['id'],
+                        'order'    => $refundId,
+                        'amount'   => -abs($total),
+                        'reference'=> $reference,
+                        'notes'    => 'Refund reversal of order '.$id,
+                    ]
+                );
+                $this->db->query("UPDATE customers SET balance=GREATEST(0,balance+:total) WHERE id=:id AND company_id=:company",['total'=>$total,'id'=>$order['customer_id'],'company'=>$companyId]);
+            }
             if($order['invoice_id'])$this->createInvoice($companyId,$user,$refundId,$order['customer_id']?(int)$order['customer_id']:null,$refundLines,$subtotal,$tax,$total,false,true);
             $this->log($user,$companyId,'ORDER_REFUND',$refundId,['original_order_id'=>$id,'reference'=>$reference,'total'=>$total]);$this->db->commit();
         } catch(\Throwable $e){if($this->db->getConnection()->inTransaction())$this->db->rollback();throw $e;}
@@ -561,7 +584,30 @@ class PosService
             foreach($payments as $paymentLine){$payment=$paymentLine['method'];$this->db->query("INSERT INTO pos_payments (company_id,session_id,order_id,user_id,payment_method_id,method_name,method_type,amount,reference_number,status) VALUES (:company,:session,:order,:user,:method,:name,:type,:amount,:reference,'COMPLETED')",['company'=>$companyId,'session'=>$session['id'],'order'=>$orderId,'user'=>$user['id'],'method'=>$payment['id'],'name'=>$payment['name'],'type'=>$payment['type'],'amount'=>$paymentLine['amount'],'reference'=>$paymentLine['reference']??$reference]);}
             if($change>0){$cash=$this->paymentMethod('Cash');$this->db->query("INSERT INTO pos_payments (company_id,session_id,order_id,user_id,payment_method_id,method_name,method_type,amount,is_change,reference_number,status) VALUES (:company,:session,:order,:user,:method,:name,'cash',:amount,1,:reference,'COMPLETED')",['company'=>$companyId,'session'=>$session['id'],'order'=>$orderId,'user'=>$user['id'],'method'=>$cash['id'],'name'=>$cash['name'],'amount'=>-$change,'reference'=>$reference.'-CHANGE']);}
             $invoiceId=null;$invoiceNo=null;if($toInvoice){[$invoiceId,$invoiceNo]=$this->createInvoice($companyId,$user,$orderId,$customerId,$normalized,$subtotal,$tax,$total,$hasDebt,false,$debtAmount);}
-            if($hasDebt)$this->db->query("UPDATE customers SET balance=balance+:total WHERE id=:id AND company_id=:company",['total'=>$debtAmount,'id'=>$customerId,'company'=>$companyId]);
+            if($hasDebt){
+                // Ledger row FIRST (atomic with the balance write inside this same
+                // transaction). Positive amount — sale INCREASES outstanding debt.
+                $this->db->query(
+                    "INSERT INTO pos_credit_ledger
+                        (company_id, branch_id, session_id, customer_id, cashier_id,
+                         order_id, type, amount, reference, notes)
+                     VALUES
+                        (:company, :branch, :session, :customer, :cashier,
+                         :order, 'DEYN_SALE', :amount, :reference, :notes)",
+                    [
+                        'company'  => $companyId,
+                        'branch'   => $user['branch_id'] ?? null,
+                        'session'  => $session['id'],
+                        'customer' => $customerId,
+                        'cashier'  => $user['id'],
+                        'order'    => $orderId,
+                        'amount'   => abs($debtAmount),
+                        'reference'=> $reference,
+                        'notes'    => 'Deyn portion of order ' . $reference,
+                    ]
+                );
+                $this->db->query("UPDATE customers SET balance=balance+:total WHERE id=:id AND company_id=:company",['total'=>$debtAmount,'id'=>$customerId,'company'=>$companyId]);
+            }
             $this->log($user,$companyId,'CHECKOUT',$orderId,['reference'=>$reference,'uuid'=>$clientUuid,'session_id'=>$session['id'],'total'=>$total,'payments'=>array_map(fn($p)=>['method'=>$p['method']['name'],'amount'=>$p['amount']],$payments),'change'=>$change]);$this->db->commit();
         }catch(\Throwable $e){if($this->db->getConnection()->inTransaction())$this->db->rollback();throw $e;}
         $this->syncStockAlerts($companyId);
@@ -620,10 +666,66 @@ class PosService
 
     public function collectDebt(int $customerId,array $data): array
     {
-        [$user,$companyId]=$this->context();$customer=$this->customer($customerId,$companyId);$amount=(float)($data['amount']??$customer['balance']);
-        if($amount<=0||$amount>(float)$customer['balance'])throw new Exception('Invalid collection amount.',422);
-        $this->db->query("UPDATE customers SET balance=balance-:amount WHERE id=:id AND company_id=:company",['amount'=>$amount,'id'=>$customerId,'company'=>$companyId]);
-        $this->log($user,$companyId,'DEBT_COLLECTION',$customerId,['amount'=>$amount,'method'=>$data['payment_method']??'Cash']);return $this->customer($customerId,$companyId);
+        [$user,$companyId]=$this->context();
+        $customer=$this->customer($customerId,$companyId);
+        $amount=(float)($data['amount']??$customer['balance']);
+        if($amount<=0||$amount>(float)$customer['balance']) throw new Exception('Invalid collection amount.',422);
+        $method = (string)($data['payment_method'] ?? 'Cash');
+
+        // Atomically: ledger entry + balance update — must succeed together.
+        $this->db->beginTransaction();
+        try {
+            $this->db->query(
+                "INSERT INTO pos_credit_ledger
+                    (company_id, branch_id, session_id, customer_id, cashier_id,
+                     type, amount, payment_method, reference, notes)
+                 VALUES
+                    (:company, :branch, :session, :customer, :cashier,
+                     'DEYN_PAYMENT', :amount, :method, :reference, :notes)",
+                [
+                    'company'  => $companyId,
+                    'branch'   => $user['branch_id'] ?? null,
+                    'session'  => $this->currentOpenSessionId($companyId, $user),
+                    'customer' => $customerId,
+                    'cashier'  => $user['id'],
+                    // Negative signed amount — payment REDUCES outstanding debt.
+                    'amount'   => -abs($amount),
+                    'method'   => $method,
+                    'reference'=> $data['reference'] ?? null,
+                    'notes'    => $data['notes'] ?? null,
+                ]
+            );
+            $this->db->query(
+                "UPDATE customers SET balance = balance - :amount
+                 WHERE id = :id AND company_id = :company",
+                ['amount'=>$amount,'id'=>$customerId,'company'=>$companyId]
+            );
+            $this->log($user, $companyId, 'DEBT_COLLECTION', $customerId, [
+                'amount' => $amount,
+                'method' => $method,
+                'ledger_id' => (int)$this->db->lastInsertId(),
+            ]);
+            $this->db->commit();
+        } catch (\Throwable $e) {
+            if ($this->db->getConnection()->inTransaction()) $this->db->rollback();
+            throw $e;
+        }
+        return $this->customer($customerId,$companyId);
+    }
+
+    /**
+     * Best-effort lookup of the current OPEN pos_session id for the acting
+     * user's branch — used to stamp ledger rows so a payment/sale is bound
+     * to the register session it happened on. Returns null if none open.
+     */
+    private function currentOpenSessionId(int $companyId, array $user): ?int
+    {
+        try {
+            $branchId = isset($user['branch_id']) ? (int)$user['branch_id'] : null;
+            $config = $this->resolveConfig($companyId, $branchId);
+            $sess = $this->currentSessionForConfig($companyId, (int)$config['id']);
+            return $sess && $sess['state'] === 'OPENED' ? (int)$sess['id'] : null;
+        } catch (\Throwable $e) { return null; }
     }
 
     public function closeShift(array $data): array

@@ -225,13 +225,30 @@ class AuthService
     }
 
     /**
-     * Verify a Manager+ PIN for approval overlays (Refund, Cash Out, close
-     * with variance, etc.) WITHOUT altering the current session. The calling
-     * cashier stays signed in; we just record who approved what and why.
-     * Returns the manager's { id, name, role } on success.
+     * Verify a Manager+ PIN for a specific restricted POS action and mint
+     * a one-time approval token bound to that action + target + cashier +
+     * amount. The token expires in 5 minutes and can be used exactly once.
+     *
+     * The calling cashier's session is NOT altered — POS authorization keeps
+     * running against the cashier's own role. Only the specific restricted
+     * operation named in { action, target } is unblocked, and only for the
+     * one attempt that presents this token via X-Manager-Approval.
+     *
+     * Extra params (all optional beyond action):
+     *   $target = ['type'=>'order','id'=>1054]
+     *   $amount = 20.00
+     *   $sessionId = 3
      */
-    public function verifyManagerPin(string $pin, string $action, string $reason, ?int $branchId, string $ip): array
-    {
+    public function verifyManagerPin(
+        string $pin,
+        string $action,
+        string $reason,
+        ?int   $branchId,
+        string $ip,
+        ?array $target = null,
+        ?float $amount = null,
+        ?int   $sessionId = null
+    ): array {
         if (!preg_match('/^\d{4}$/', $pin)) {
             throw new Exception('PIN must contain exactly 4 digits.', 400);
         }
@@ -265,8 +282,39 @@ class AuthService
         $this->session->remove($key);
         $this->session->remove("{$key}_last");
 
-        // Non-mutating action — just an audit line, no session swap.
-        $cashier = $this->session->get('user');
+        // Non-mutating: no session swap. Instead we persist a one-time,
+        // action-scoped approval token the caller must present when they
+        // retry the restricted operation.
+        // Prefer the ACTIVE POS cashier as requester (dual-identity), so
+        // an Admin browser session doesn't get credited for a cashier's
+        // approval request.
+        $cashier = $this->session->get('pos_cashier') ?: $this->session->get('user');
+        $token   = bin2hex(random_bytes(32));   // 64 hex chars
+        $expires = date('Y-m-d H:i:s', time() + 300);   // 5 minutes
+        $companyId = $cashier['company_id'] ?? $manager['company_id'] ?? null;
+
+        \Core\Database::getInstance()->query(
+            "INSERT INTO pos_manager_approvals
+                (company_id, token, action, target_type, target_id, amount,
+                 session_id, requested_by, approved_by, reason, expires_at)
+             VALUES
+                (:company, :token, :action, :ttype, :tid, :amount,
+                 :session, :req, :appr, :reason, :expires)",
+            [
+                'company' => $companyId,
+                'token'   => $token,
+                'action'  => $action,
+                'ttype'   => $target['type'] ?? null,
+                'tid'     => isset($target['id']) ? (int)$target['id'] : null,
+                'amount'  => $amount,
+                'session' => $sessionId,
+                'req'     => $cashier['id'] ?? 0,
+                'appr'    => $manager['id'],
+                'reason'  => $reason,
+                'expires' => $expires,
+            ]
+        );
+
         $this->auditLogRepository->create([
             'user_id'    => $cashier['id'] ?? null,
             'module'     => 'POS',
@@ -275,22 +323,101 @@ class AuthService
             'ip_address' => $ip,
             'new_values' => json_encode([
                 'approved_action' => $action,
+                'target'          => $target,
+                'amount'          => $amount,
+                'session_id'      => $sessionId,
                 'approved_by_id'  => $manager['id'],
                 'approved_by'     => $manager['name'] ?? null,
                 'requested_by_id' => $cashier['id'] ?? null,
+                'requested_by'    => $cashier['name'] ?? null,
                 'reason'          => $reason,
+                'token_prefix'    => substr($token, 0, 8),  // last 56 chars kept secret
+                'expires_at'      => $expires,
             ]),
             'created_at' => date('Y-m-d H:i:s'),
         ]);
 
         return [
+            'approval' => [
+                'token'      => $token,
+                'action'     => $action,
+                'target'     => $target,
+                'amount'     => $amount,
+                'session_id' => $sessionId,
+                'expires_at' => $expires,
+                'one_time'   => true,
+            ],
             'approved_by' => [
-                'id'    => (int)$manager['id'],
-                'name'  => $manager['name'] ?? '',
-                'role'  => $manager['role_name'] ?? '',
+                'id'   => (int)$manager['id'],
+                'name' => $manager['name'] ?? '',
+                'role' => $manager['role_name'] ?? '',
             ],
             'action' => $action,
             'reason' => $reason,
+        ];
+    }
+
+    /**
+     * Consume a Manager-approval token. Restricted operations call this
+     * on the way in — the token has to match the exact action + target
+     * they're about to perform, be PENDING, and not expired. On success
+     * the row flips to USED with used_at/used_ip stamped. Never used
+     * more than once.
+     *
+     *   $constraints = ['action'=>'refund', 'target_id'=>1054, 'amount'=>20.00]
+     *
+     * Throws with a clear message on any mismatch (403).
+     */
+    public function consumeApproval(?string $token, array $constraints, string $ip): array
+    {
+        if (!$token) {
+            throw new Exception('Manager approval token is required for this action.', 403);
+        }
+        $db = \Core\Database::getInstance();
+        $row = $db->query(
+            "SELECT * FROM pos_manager_approvals WHERE token = :token LIMIT 1",
+            ['token' => $token]
+        )->fetch();
+        if (!$row) throw new Exception('Manager approval token is not valid.', 403);
+        if ($row['status'] !== 'PENDING') {
+            throw new Exception('Manager approval was already used or revoked.', 403);
+        }
+        if (strtotime($row['expires_at']) < time()) {
+            $db->query("UPDATE pos_manager_approvals SET status='EXPIRED' WHERE id=:id",['id'=>$row['id']]);
+            throw new Exception('Manager approval has expired. Ask the manager again.', 403);
+        }
+        // Action must match exactly.
+        if (isset($constraints['action']) && $row['action'] !== $constraints['action']) {
+            throw new Exception('Manager approval is for a different action.', 403);
+        }
+        // If the approval was scoped to a specific target, enforce it.
+        if (!empty($row['target_id'])
+            && isset($constraints['target_id'])
+            && (int)$row['target_id'] !== (int)$constraints['target_id']) {
+            throw new Exception('Manager approval is for a different record.', 403);
+        }
+        // Amount tolerance: if approval set an amount, actual must be <= approved (rounded).
+        if ($row['amount'] !== null && isset($constraints['amount'])
+            && round((float)$constraints['amount'], 2) > round((float)$row['amount'], 2) + 0.01) {
+            throw new Exception('Manager approval was for a smaller amount.', 403);
+        }
+        // The approval must have been requested by the current cashier.
+        $cashier = $this->session->get('pos_cashier') ?: $this->session->get('user');
+        if ((int)$row['requested_by'] !== (int)($cashier['id'] ?? 0)) {
+            throw new Exception('Manager approval was requested by a different cashier.', 403);
+        }
+
+        $db->query(
+            "UPDATE pos_manager_approvals
+             SET status='USED', used_at=NOW(), used_ip=:ip
+             WHERE id=:id AND status='PENDING'",
+            ['ip' => $ip, 'id' => $row['id']]
+        );
+        return [
+            'approval_id' => (int)$row['id'],
+            'approved_by' => (int)$row['approved_by'],
+            'requested_by'=> (int)$row['requested_by'],
+            'action'      => $row['action'],
         ];
     }
 

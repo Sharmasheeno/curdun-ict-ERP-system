@@ -6,6 +6,7 @@ use App\Controllers\PlatformController;
 use App\Controllers\PosController;
 use App\Middleware\AuthMiddleware;
 use App\Middleware\PosRoleMiddleware;
+use App\Middleware\PosCashierRequiredMiddleware;
 
 $authMiddleware = new AuthMiddleware();
 
@@ -34,6 +35,10 @@ $router->group('/api/v1', function($router) {
     $MGR_UP     = fn() => new PosRoleMiddleware('admin', 'store_manager');
     $SENIOR_UP  = fn() => new PosRoleMiddleware('admin', 'store_manager', 'senior_cashier');
     $ADMIN_ONLY = fn() => new PosRoleMiddleware('admin');
+
+    // Operational-endpoint gate — a live cashier must be PINned into the
+    // terminal. A locked POS returns 401 even for an Admin account.
+    $NEEDS_CASHIER = fn() => new PosCashierRequiredMiddleware();
 
     // AUTH
     $router->post('/auth/logout', [AuthController::class, 'logout']);
@@ -66,26 +71,34 @@ $router->group('/api/v1', function($router) {
     $router->get('/pos/sessions/{id}/summary', [PosController::class, 'sessionSummary']);
     $router->get('/pos/staff', [PosController::class, 'staff']);
 
-    // --- Sell (any signed-in cashier) ---
-    $router->post('/pos/checkout',                       [PosController::class, 'checkout']);
-    $router->post('/pos/customers/{id}/collect-debt',    [PosController::class, 'collectDebt']);
+    // --- OPERATIONAL POS ACTIONS ---------------------------------
+    // These endpoints only make sense while a cashier is at the terminal.
+    // NEEDS_CASHIER rejects with 401 if the terminal is locked, even for
+    // an Admin browser account — otherwise Lock would be defeated.
+    //
+    // Sell (any signed-in cashier)
+    $router->post('/pos/checkout',                       [PosController::class, 'checkout'],       [$NEEDS_CASHIER()]);
+    $router->post('/pos/customers/{id}/collect-debt',    [PosController::class, 'collectDebt'],    [$NEEDS_CASHIER()]);
 
-    // --- Manager+ only: product catalog + register session lifecycle + refunds ---
+    // Register session lifecycle + refunds (Manager+ AND live cashier)
+    $router->post   ('/pos/sessions/open',                  [PosController::class, 'openSession'],    [$NEEDS_CASHIER(), $MGR_UP()]);
+    $router->post   ('/pos/sessions/{id}/close',            [PosController::class, 'closeSession'],   [$NEEDS_CASHIER(), $MGR_UP()]);
+    $router->post   ('/pos/shifts/close',                   [PosController::class, 'closeShift'],     [$NEEDS_CASHIER(), $MGR_UP()]);
+    $router->post   ('/pos/transactions/{id}/void',         [PosController::class, 'voidTransaction'],[$NEEDS_CASHIER(), $MGR_UP()]);
+    $router->post   ('/pos/orders/{id}/refund',             [PosController::class, 'refundOrder'],    [$NEEDS_CASHIER(), $MGR_UP()]);
+
+    // Cash movements (Senior Cashier+ AND live cashier)
+    $router->post   ('/pos/sessions/{id}/cash-movements',   [PosController::class, 'cashMovement'],   [$NEEDS_CASHIER(), $SENIOR_UP()]);
+
+    // --- BACK-OFFICE CONFIGURATION -------------------------------
+    // Account permissions govern these. They intentionally do NOT require
+    // a live cashier — an Admin can edit products from any browser tab.
     $router->post   ('/pos/products',                       [PosController::class, 'createProduct'],   [$MGR_UP()]);
     $router->put    ('/pos/products/{id}',                  [PosController::class, 'updateProduct'],   [$MGR_UP()]);
     $router->delete ('/pos/products/{id}',                  [PosController::class, 'deleteProduct'],   [$MGR_UP()]);
     $router->post   ('/pos/customers',                      [PosController::class, 'createCustomer'], [$MGR_UP()]);
     $router->put    ('/pos/customers/{id}',                 [PosController::class, 'updateCustomer'], [$MGR_UP()]);
     $router->delete ('/pos/customers/{id}',                 [PosController::class, 'deleteCustomer'], [$MGR_UP()]);
-    $router->post   ('/pos/sessions/open',                  [PosController::class, 'openSession'],    [$MGR_UP()]);
-    $router->post   ('/pos/sessions/{id}/close',            [PosController::class, 'closeSession'],   [$MGR_UP()]);
-    $router->post   ('/pos/shifts/close',                   [PosController::class, 'closeShift'],     [$MGR_UP()]);
-    $router->post   ('/pos/transactions/{id}/void',         [PosController::class, 'voidTransaction'],[$MGR_UP()]);
-    $router->post   ('/pos/orders/{id}/refund',             [PosController::class, 'refundOrder'],    [$MGR_UP()]);
-
-    // --- Senior Cashier+ (cash movements) — the Manager-PIN overlay on the
-    //     frontend is a UX; server enforcement is still by role here.
-    $router->post   ('/pos/sessions/{id}/cash-movements',   [PosController::class, 'cashMovement'],   [$SENIOR_UP()]);
 
     // --- Admin-only: staff, settings ---
     $router->get    ('/pos/settings',           [PosController::class, 'settings'],     [$ADMIN_ONLY()]);

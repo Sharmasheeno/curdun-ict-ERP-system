@@ -55,13 +55,28 @@ class AuthController extends BaseController
         $reason   = trim((string)($data['reason'] ?? ''));
         $branchId = isset($data['branch_id']) ? (int)$data['branch_id'] : null;
 
+        // Optional scoping — the approval token will be bound to whichever of
+        // these the client provides. Downstream endpoints re-check that the
+        // action + target + amount they're about to perform match the token.
+        $target = null;
+        if (!empty($data['target_type']) || !empty($data['target_id'])) {
+            $target = [
+                'type' => $data['target_type'] ?? null,
+                'id'   => isset($data['target_id']) ? (int)$data['target_id'] : null,
+            ];
+        }
+        $amount    = isset($data['amount'])     ? (float)$data['amount']     : null;
+        $sessionId = isset($data['session_id']) ? (int)$data['session_id']   : null;
+
         if ($pin === '' || $action === '') {
             Response::error('PIN and action are required.', ['pin'=>'Required','action'=>'Required'], 400);
             return;
         }
 
         $ip = $request->getIp();
-        $result = $this->authService->verifyManagerPin($pin, $action, $reason, $branchId, $ip);
+        $result = $this->authService->verifyManagerPin(
+            $pin, $action, $reason, $branchId, $ip, $target, $amount, $sessionId
+        );
         Response::success('Manager approval recorded.', $result);
     }
 

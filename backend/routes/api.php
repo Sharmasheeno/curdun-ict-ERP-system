@@ -37,6 +37,7 @@ $router->group('/api/v1', function($router) {
 
     // AUTH
     $router->post('/auth/logout', [AuthController::class, 'logout']);
+    $router->post('/auth/pos-lock', [AuthController::class, 'posLock']);
     $router->get('/auth/me', [AuthController::class, 'me']);
     $router->post('/auth/change-password', [AuthController::class, 'changePassword']);
     // CURDUN PLATFORM CORE + TENANT USER MANAGEMENT

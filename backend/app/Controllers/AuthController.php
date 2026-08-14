@@ -65,6 +65,24 @@ class AuthController extends BaseController
         Response::success('Manager approval recorded.', $result);
     }
 
+    /**
+     * Drop the currently-active POS cashier (Lock button) WITHOUT logging
+     * the account holder out. The browser session stays valid for whoever
+     * PINned in with email + password originally, so another cashier can
+     * simply PIN in and take over the terminal.
+     */
+    public function posLock(Request $request): void
+    {
+        $cashier = \Core\Auth::posCashier();
+        \Core\Session::remove('pos_cashier');
+        if ($cashier) {
+            $this->authService->auditCashierLock((int)$cashier['id'], $request->getIp());
+        }
+        Response::success('POS cashier locked.', [
+            'account_still_signed_in' => \Core\Auth::user() !== null,
+        ]);
+    }
+
     public function logout(Request $request): void
     {
         $userId = $this->getAuthUserId();

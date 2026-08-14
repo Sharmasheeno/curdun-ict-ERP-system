@@ -179,8 +179,33 @@ class AuthService
             throw new Exception('Unable to load authenticated user.', 500);
         }
 
+        // ── Dual-identity model ──────────────────────────────────────
+        // A POS terminal can be shared by many cashiers throughout one
+        // browser session. The account owner (Curdun user who signed in
+        // with email + password) stays in session['user'] as long as they
+        // exist; the currently-operating POS employee lives in a separate
+        // slot session['pos_cashier'] and drives POS authorization.
+        //
+        // Cases:
+        //   (a) No prior account session — a cashier is walking up to a
+        //       shared terminal.  Both slots get set to the same context
+        //       so downstream code still works when nothing else signed in.
+        //   (b) An account session already exists (Ahmed = Admin) and now
+        //       Nimco PINs in.  session['user'] stays as Ahmed; only
+        //       session['pos_cashier'] becomes Nimco.  Backend authorization
+        //       for POS endpoints uses Nimco's Cashier role — the account
+        //       does NOT elevate the cashier.
+        // ─────────────────────────────────────────────────────────────
+        $existingUser = $this->session->get('user');
         $this->session->regenerate();
-        $this->session->set('user', $context);
+        $this->session->set('pos_cashier', $context);
+        if (!$existingUser) {
+            // Fresh terminal — no browser account session yet.
+            $this->session->set('user', $context);
+        } else {
+            // Preserve the account holder.
+            $this->session->set('user', $existingUser);
+        }
         $this->session->set('auth_method', 'pin');
 
         $this->auditLogRepository->create([
@@ -267,6 +292,22 @@ class AuthService
             'action' => $action,
             'reason' => $reason,
         ];
+    }
+
+    /**
+     * Audit trail for the POS Lock button. The cashier walks away from the
+     * terminal — session[pos_cashier] is dropped but session[user] stays
+     * so the account holder can still work in other modules.
+     */
+    public function auditCashierLock(int $cashierId, string $ip): void
+    {
+        $this->auditLogRepository->create([
+            'user_id'    => $cashierId,
+            'module'     => 'POS',
+            'action'     => 'CASHIER_LOCK',
+            'ip_address' => $ip,
+            'created_at' => date('Y-m-d H:i:s'),
+        ]);
     }
 
     public function logout(int $userId): void

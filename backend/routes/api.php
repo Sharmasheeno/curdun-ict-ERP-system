@@ -5,6 +5,7 @@ use App\Controllers\AuthController;
 use App\Controllers\PlatformController;
 use App\Controllers\PosController;
 use App\Middleware\AuthMiddleware;
+use App\Middleware\PosRoleMiddleware;
 
 $authMiddleware = new AuthMiddleware();
 
@@ -28,6 +29,12 @@ $router->post('/api/v1/auth/reset-password', [AuthController::class, 'resetPassw
 
 $router->group('/api/v1', function($router) {
 
+    // Role-gate presets. superadmin is auto-bypassed inside PosRoleMiddleware.
+    // Defined inside the group closure so `$router` and these live in the same scope.
+    $MGR_UP     = fn() => new PosRoleMiddleware('admin', 'store_manager');
+    $SENIOR_UP  = fn() => new PosRoleMiddleware('admin', 'store_manager', 'senior_cashier');
+    $ADMIN_ONLY = fn() => new PosRoleMiddleware('admin');
+
     // AUTH
     $router->post('/auth/logout', [AuthController::class, 'logout']);
     $router->get('/auth/me', [AuthController::class, 'me']);
@@ -48,32 +55,42 @@ $router->group('/api/v1', function($router) {
     // RETAIL POS - the only live tenant module
     $router->get('/pos/bootstrap', [PosController::class, 'bootstrap']);
     $router->get('/pos/dashboard', [PosController::class, 'dashboard']);
+    // --- Read endpoints (everyone signed in can view) ---
     $router->get('/pos/products', [PosController::class, 'products']);
-    $router->post('/pos/products', [PosController::class, 'createProduct']);
-    $router->put('/pos/products/{id}', [PosController::class, 'updateProduct']);
-    $router->delete('/pos/products/{id}', [PosController::class, 'deleteProduct']);
     $router->get('/pos/customers', [PosController::class, 'customers']);
-    $router->post('/pos/customers', [PosController::class, 'createCustomer']);
-    $router->put('/pos/customers/{id}', [PosController::class, 'updateCustomer']);
-    $router->delete('/pos/customers/{id}', [PosController::class, 'deleteCustomer']);
     $router->get('/pos/transactions', [PosController::class, 'transactions']);
     $router->get('/pos/sessions', [PosController::class, 'sessions']);
     $router->get('/pos/payments', [PosController::class, 'payments']);
-    $router->post('/pos/transactions/{id}/void', [PosController::class, 'voidTransaction']);
-    $router->post('/pos/orders/{id}/refund', [PosController::class, 'refundOrder']);
-    $router->post('/pos/checkout', [PosController::class, 'checkout']);
-    $router->post('/pos/customers/{id}/collect-debt', [PosController::class, 'collectDebt']);
-    $router->post('/pos/shifts/close', [PosController::class, 'closeShift']);
     $router->get('/pos/session/current', [PosController::class, 'currentSession']);
-    $router->post('/pos/sessions/open', [PosController::class, 'openSession']);
     $router->get('/pos/sessions/{id}/summary', [PosController::class, 'sessionSummary']);
-    $router->post('/pos/sessions/{id}/cash-movements', [PosController::class, 'cashMovement']);
-    $router->post('/pos/sessions/{id}/close', [PosController::class, 'closeSession']);
     $router->get('/pos/staff', [PosController::class, 'staff']);
-    $router->post('/pos/staff', [PosController::class, 'createStaff']);
-    $router->put('/pos/staff/{id}', [PosController::class, 'updateStaff']);
-    $router->get('/pos/settings', [PosController::class, 'settings']);
-    $router->put('/pos/settings', [PosController::class, 'updateSettings']);
+
+    // --- Sell (any signed-in cashier) ---
+    $router->post('/pos/checkout',                       [PosController::class, 'checkout']);
+    $router->post('/pos/customers/{id}/collect-debt',    [PosController::class, 'collectDebt']);
+
+    // --- Manager+ only: product catalog + register session lifecycle + refunds ---
+    $router->post   ('/pos/products',                       [PosController::class, 'createProduct'],   [$MGR_UP()]);
+    $router->put    ('/pos/products/{id}',                  [PosController::class, 'updateProduct'],   [$MGR_UP()]);
+    $router->delete ('/pos/products/{id}',                  [PosController::class, 'deleteProduct'],   [$MGR_UP()]);
+    $router->post   ('/pos/customers',                      [PosController::class, 'createCustomer'], [$MGR_UP()]);
+    $router->put    ('/pos/customers/{id}',                 [PosController::class, 'updateCustomer'], [$MGR_UP()]);
+    $router->delete ('/pos/customers/{id}',                 [PosController::class, 'deleteCustomer'], [$MGR_UP()]);
+    $router->post   ('/pos/sessions/open',                  [PosController::class, 'openSession'],    [$MGR_UP()]);
+    $router->post   ('/pos/sessions/{id}/close',            [PosController::class, 'closeSession'],   [$MGR_UP()]);
+    $router->post   ('/pos/shifts/close',                   [PosController::class, 'closeShift'],     [$MGR_UP()]);
+    $router->post   ('/pos/transactions/{id}/void',         [PosController::class, 'voidTransaction'],[$MGR_UP()]);
+    $router->post   ('/pos/orders/{id}/refund',             [PosController::class, 'refundOrder'],    [$MGR_UP()]);
+
+    // --- Senior Cashier+ (cash movements) — the Manager-PIN overlay on the
+    //     frontend is a UX; server enforcement is still by role here.
+    $router->post   ('/pos/sessions/{id}/cash-movements',   [PosController::class, 'cashMovement'],   [$SENIOR_UP()]);
+
+    // --- Admin-only: staff, settings ---
+    $router->get    ('/pos/settings',           [PosController::class, 'settings'],     [$ADMIN_ONLY()]);
+    $router->put    ('/pos/settings',           [PosController::class, 'updateSettings'],[$ADMIN_ONLY()]);
+    $router->post   ('/pos/staff',              [PosController::class, 'createStaff'],  [$ADMIN_ONLY()]);
+    $router->put    ('/pos/staff/{id}',         [PosController::class, 'updateStaff'],  [$ADMIN_ONLY()]);
     $router->get('/pos/reports', [PosController::class, 'reports']);
     $router->get('/pos/stock-alerts', [PosController::class, 'stockAlerts']);
     $router->post('/pos/stock-alerts/read-all', [PosController::class, 'markAllStockAlertsRead']);

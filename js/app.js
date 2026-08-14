@@ -3723,6 +3723,14 @@ function renderPOSTopNav() {
   const isOpen = S.posSession?.state === 'OPENED';
   const notifCount = (S.posStockAlerts||[]).filter(a=>Number(a.unread)).length;
 
+  // Role-gate the navigation dropdowns. Backend still enforces (that's the
+  // real security); hiding here is just UX so cashiers aren't confronted
+  // with menus that will bounce them with 403.
+  const canEditProducts = posCan('editProducts') === true;
+  const canManageStaff  = posCan('manageStaff')  === true;
+  const canOpenSettings = posCan('settings')     === true;
+  const canReports      = posCan('viewMargin')   === true; // reports leak margin — same gate
+
   const navItem = (key, label, hasChild) => {
     const menuTabs = { orders:['orders','sessions','payments','customers'], products:['products','categories','combos'], reporting:['reports-orders','reports-sales','reports-session','reports-stock'], configuration:['config-settings','config-payments','config-staff','config-currencies'] };
     const active = menuTabs[key]?.includes(tab) || tab === key;
@@ -3738,22 +3746,26 @@ function renderPOSTopNav() {
             <button class="pos-dd-item" data-bo-tab="customers">Customers</button>
           ` : key === 'products' ? `
             <button class="pos-dd-item" data-bo-tab="products">Products</button>
-            <button class="pos-dd-item" data-bo-tab="categories">Categories</button>
-            <button class="pos-dd-item" data-bo-tab="combos">Combo Choices</button>
+            ${canEditProducts ? `<button class="pos-dd-item" data-bo-tab="categories">Categories</button>` : ''}
+            ${canEditProducts ? `<button class="pos-dd-item" data-bo-tab="combos">Combo Choices</button>` : ''}
           ` : key === 'reporting' ? `
             <button class="pos-dd-item" data-bo-tab="reports-orders">Orders</button>
-            <button class="pos-dd-item" data-bo-tab="reports-sales">Sales Details</button>
-            <button class="pos-dd-item" data-bo-tab="reports-session">Session Report</button>
+            ${canReports ? `<button class="pos-dd-item" data-bo-tab="reports-sales">Sales Details</button>` : ''}
+            ${canReports ? `<button class="pos-dd-item" data-bo-tab="reports-session">Session Report</button>` : ''}
             <button class="pos-dd-item" data-bo-tab="reports-stock">Stock Report</button>
           ` : `
-            <button class="pos-dd-item" data-bo-tab="config-settings">Settings</button>
-            <button class="pos-dd-item" data-bo-tab="config-payments">Payment Methods</button>
-            <button class="pos-dd-item" data-bo-tab="config-staff">Staff & Users</button>
-            <button class="pos-dd-item" data-bo-tab="config-currencies">Currencies</button>
+            ${canOpenSettings ? `<button class="pos-dd-item" data-bo-tab="config-settings">Settings</button>` : ''}
+            ${canOpenSettings ? `<button class="pos-dd-item" data-bo-tab="config-payments">Payment Methods</button>` : ''}
+            ${canManageStaff  ? `<button class="pos-dd-item" data-bo-tab="config-staff">Staff & Users</button>` : ''}
+            ${canOpenSettings ? `<button class="pos-dd-item" data-bo-tab="config-currencies">Currencies</button>` : ''}
+            ${!(canOpenSettings || canManageStaff) ? `<div style="padding:12px 14px;color:var(--text-muted);font-size:12px;font-style:italic">No configuration options available for your role.</div>` : ''}
           `}
         </div>` : ''}
       </div>`;
   };
+
+  // Whole Configuration menu is hidden for pure Cashiers (no config access at all).
+  const showConfigMenu = canOpenSettings || canManageStaff;
 
   return `
     <div class="pos-topnav-left">
@@ -3767,7 +3779,7 @@ function renderPOSTopNav() {
       ${navItem('orders','Orders',true)}
       ${navItem('products','Products',true)}
       ${navItem('reporting','Reporting',true)}
-      ${navItem('configuration','Configuration',true)}
+      ${showConfigMenu ? navItem('configuration','Configuration',true) : ''}
     </div>
 
     <div class="pos-topnav-right">
@@ -3876,6 +3888,19 @@ function wirePOSTopNav(wrap) {
 
 // ---- Back-office tab content router ----
 function renderPOSBackofficeTab() {
+  // Server enforces the real gate; this stops a cashier from ending up on
+  // a tab they can't use because the frontend menu was manipulated.
+  const TAB_ROLE_GATE = {
+    'config-settings':   () => posCan('settings')     === true,
+    'config-payments':   () => posCan('settings')     === true,
+    'config-staff':      () => posCan('manageStaff')  === true,
+    'config-currencies': () => posCan('settings')     === true,
+    'categories':        () => posCan('editProducts') === true,
+    'combos':            () => posCan('editProducts') === true,
+  };
+  const gate = TAB_ROLE_GATE[S.posBackofficeTab];
+  if (gate && !gate()) S.posBackofficeTab = 'dashboard';
+
   switch (S.posBackofficeTab) {
     case 'dashboard':        return renderPOSDash();
     case 'orders':           return renderPOSTransactions();

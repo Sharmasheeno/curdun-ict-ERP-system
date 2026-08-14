@@ -7,24 +7,24 @@ class Router {
     private array $routes = [];
     private array $groupStack = [];
 
-    public function get(string $pattern, $handler): void {
-        $this->addRoute('GET', $pattern, $handler);
+    public function get(string $pattern, $handler, array $middlewares = []): void {
+        $this->addRoute('GET', $pattern, $handler, $middlewares);
     }
 
-    public function post(string $pattern, $handler): void {
-        $this->addRoute('POST', $pattern, $handler);
+    public function post(string $pattern, $handler, array $middlewares = []): void {
+        $this->addRoute('POST', $pattern, $handler, $middlewares);
     }
 
-    public function put(string $pattern, $handler): void {
-        $this->addRoute('PUT', $pattern, $handler);
+    public function put(string $pattern, $handler, array $middlewares = []): void {
+        $this->addRoute('PUT', $pattern, $handler, $middlewares);
     }
 
-    public function patch(string $pattern, $handler): void {
-        $this->addRoute('PATCH', $pattern, $handler);
+    public function patch(string $pattern, $handler, array $middlewares = []): void {
+        $this->addRoute('PATCH', $pattern, $handler, $middlewares);
     }
 
-    public function delete(string $pattern, $handler): void {
-        $this->addRoute('DELETE', $pattern, $handler);
+    public function delete(string $pattern, $handler, array $middlewares = []): void {
+        $this->addRoute('DELETE', $pattern, $handler, $middlewares);
     }
 
     public function group(string $prefix, callable $callback, array $middlewares = []): void {
@@ -40,17 +40,20 @@ class Router {
         array_pop($this->groupStack);
     }
 
-    private function addRoute(string $method, string $pattern, $handler): void {
+    private function addRoute(string $method, string $pattern, $handler, array $routeMiddlewares = []): void {
         $group = end($this->groupStack) ?: ['prefix' => '', 'middlewares' => []];
-        
+
         $pattern = $group['prefix'] . $pattern;
         $pattern = rtrim($pattern, '/') ?: '/';
-        
+
+        // Group middlewares run first (typically AuthMiddleware), then any
+        // per-route middleware (typically PosRoleMiddleware) — so the auth
+        // guard rejects unauthenticated requests before the role check runs.
         $this->routes[] = [
             'method' => $method,
             'pattern' => $pattern,
             'handler' => $handler,
-            'middlewares' => $group['middlewares']
+            'middlewares' => array_merge($group['middlewares'], $routeMiddlewares),
         ];
     }
 

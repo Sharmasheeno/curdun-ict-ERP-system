@@ -42,6 +42,7 @@ Curdun ERP provides a comprehensive resource planning and operational system tai
    Import the schema and seed data:
    ```bash
    mysql -u root -p curdun_erp < database/curdun_erp.sql
+   php database/seed_pos.php
    ```
 5. **Web Server Setup**:
    - **Apache**: Point your VirtualHost DocumentRoot to `backend/public/`. Ensure `mod_rewrite` is enabled.
@@ -64,25 +65,35 @@ The system uses Roles and Permissions to secure endpoints.
 - **Permissions**: Granular control over actions (e.g., `create_user`, `delete_invoice`).
 Middleware checks these permissions before controller execution.
 
-## 8. All API Endpoints
+## 8. Active API Endpoints
+
+Only Curdun platform-core and Retail POS routes are active. Older ERP module controllers remain in the repository for later development, but their routes are intentionally disabled until their tenant and permission contracts are completed.
 
 | Method | Endpoint | Description |
 |---|---|---|
 | POST | `/api/v1/auth/login` | Authenticate user and start session |
 | POST | `/api/v1/auth/logout` | End session |
 | GET | `/api/v1/auth/me` | Get current logged-in user details |
-| GET | `/api/v1/users` | List users |
-| POST | `/api/v1/users` | Create user |
-| GET | `/api/v1/users/{id}` | Get specific user |
-| PUT | `/api/v1/users/{id}` | Update user |
-| DELETE | `/api/v1/users/{id}` | Delete user |
-| GET | `/api/v1/customers` | List customers |
-| GET | `/api/v1/products` | List products |
-| GET | `/api/v1/orders` | List sales orders |
-| POST | `/api/v1/orders` | Create sales order |
-| GET | `/api/v1/invoices` | List invoices |
-| POST | `/api/v1/payments` | Process payment |
-| ... | *See `routes/api.php` for complete list of 80+ endpoints* | |
+| GET/POST | `/api/v1/platform/companies` | List/provision tenant companies (Super Admin) |
+| PUT/DELETE | `/api/v1/platform/companies/{id}` | Update/deactivate a company (Super Admin) |
+| GET/POST | `/api/v1/platform/users` | Tenant-scoped user management |
+| PUT | `/api/v1/platform/users/{id}` | Update a tenant-scoped user |
+| POST | `/api/v1/platform/users/{id}/reset-password` | Deliver reset by email link or SMS OTP (`channel`) |
+| POST | `/api/v1/auth/verify-reset-otp` | Verify a 6-digit SMS OTP and receive a reset token |
+| GET | `/api/v1/pos/bootstrap` | Load the authorized POS workspace |
+| GET/POST/PUT/DELETE | `/api/v1/pos/products[...]` | Tenant-scoped products and stock |
+| GET/POST/PUT/DELETE | `/api/v1/pos/customers[...]` | Tenant-scoped customers and debt |
+| POST | `/api/v1/pos/checkout` | Idempotent register sale with server-side totals, stock and split payments |
+| GET/POST | `/api/v1/pos/session/current`, `/api/v1/pos/sessions/open` | Read/open the branch register session |
+| GET/POST | `/api/v1/pos/sessions/{id}/summary`, `/api/v1/pos/sessions/{id}/close` | Reconcile and close a register |
+| POST | `/api/v1/pos/sessions/{id}/cash-movements` | Register a reasoned cash in/out operation |
+| POST | `/api/v1/pos/orders/{id}/refund` | Create an immutable linked negative refund order |
+| GET/POST/PUT | `/api/v1/pos/staff[...]` | Company Admin/Store Manager staff controls |
+| GET/PUT | `/api/v1/pos/settings` | Persistent POS settings |
+| GET | `/api/v1/pos/reports?from=YYYY-MM-DD&to=YYYY-MM-DD` | Tenant-scoped sales, payment, product, inventory, customer, staff and shift report (Admin/Store Manager) |
+| GET | `/api/v1/pos/stock-alerts` | Open low/out-of-stock notifications for the signed-in manager |
+| POST | `/api/v1/pos/stock-alerts/{id}/read` | Mark one notification read for the signed-in manager |
+| POST | `/api/v1/pos/stock-alerts/read-all` | Mark all open stock notifications read for the signed-in manager |
 
 ## 9. Request/Response Examples
 
@@ -166,6 +177,19 @@ Before going live:
 2. Change the default Admin password immediately.
 3. Use HTTPS (SSL) everywhere.
 4. Ensure `CORS` headers in `public/index.php` are restricted to your exact frontend domain, rather than `*`.
+
+### Password email and SMS delivery
+
+Local development defaults to `MAIL_TRANSPORT=log` and `SMS_TRANSPORT=log`. Messages are written to `storage/logs/delivery-outbox.log`, and the Super Admin UI clearly labels them as previews. To send externally in production:
+
+1. Set `APP_PUBLIC_URL` to the HTTPS frontend origin.
+2. Set `MAIL_TRANSPORT=smtp` plus `MAIL_HOST`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, `MAIL_ENCRYPTION`, and the sender identity.
+3. Set `SMS_TRANSPORT=http` plus `SMS_GATEWAY_URL`, `SMS_GATEWAY_TOKEN`, and `SMS_SENDER_ID`. The gateway receives JSON containing `to`, `message`, and `sender` with a Bearer token.
+4. Run `database/migrations/2026_08_12_password_delivery.sql`.
+5. Run `database/migrations/2026_08_12_odoo_pos_core.sql` for the Retail POS register/order lifecycle.
+6. Confirm a real email and SMS OTP in staging before enabling production traffic.
+
+Reset email links expire after 60 minutes. SMS OTPs expire after 10 minutes, allow five attempts, and are stored only as password hashes. All Super Admin delivery attempts are recorded in `delivery_logs` and `audit_logs`.
 
 ---
 *© Curdun ICT Solutions - All Rights Reserved*

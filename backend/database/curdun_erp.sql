@@ -3,6 +3,10 @@ USE curdun_erp;
 
 SET FOREIGN_KEY_CHECKS = 0;
 
+DROP TABLE IF EXISTS pos_stock_alert_reads;
+DROP TABLE IF EXISTS pos_stock_alerts;
+DROP TABLE IF EXISTS pos_shift_closures;
+DROP TABLE IF EXISTS company_modules;
 DROP TABLE IF EXISTS audit_logs;
 DROP TABLE IF EXISTS settings;
 DROP TABLE IF EXISTS notifications;
@@ -130,6 +134,7 @@ CREATE TABLE IF NOT EXISTS users (
     phone VARCHAR(30),
     avatar VARCHAR(255),
     password VARCHAR(255) NOT NULL,
+    must_change_password TINYINT(1) NOT NULL DEFAULT 0,
     pin_hash VARCHAR(255) NULL,
     pin_last_used_at TIMESTAMP NULL DEFAULT NULL,
     status ENUM('active','inactive','suspended') DEFAULT 'active',
@@ -144,6 +149,40 @@ CREATE TABLE IF NOT EXISTS users (
     FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE SET NULL,
     FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE SET NULL,
     FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Active module subscriptions. Retail POS is currently the only live module.
+CREATE TABLE IF NOT EXISTS company_modules (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    company_id BIGINT UNSIGNED NOT NULL,
+    module_key VARCHAR(50) NOT NULL,
+    status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+    starts_at DATE NULL,
+    ends_at DATE NULL,
+    settings JSON NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY company_module_unique (company_id,module_key),
+    FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Persisted Retail POS register reconciliation records.
+CREATE TABLE IF NOT EXISTS pos_shift_closures (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    company_id BIGINT UNSIGNED NOT NULL,
+    branch_id BIGINT UNSIGNED NULL,
+    cashier_id BIGINT UNSIGNED NOT NULL,
+    closed_by BIGINT UNSIGNED NOT NULL,
+    system_cash DECIMAL(15,2) NOT NULL DEFAULT 0,
+    counted_cash DECIMAL(15,2) NOT NULL DEFAULT 0,
+    variance DECIMAL(15,2) NOT NULL DEFAULT 0,
+    notes VARCHAR(500) NULL,
+    closed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
+    FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE SET NULL,
+    FOREIGN KEY (cashier_id) REFERENCES users(id) ON DELETE RESTRICT,
+    FOREIGN KEY (closed_by) REFERENCES users(id) ON DELETE RESTRICT,
+    INDEX idx_pos_shift_company_date (company_id,closed_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 8. user_roles
@@ -184,11 +223,30 @@ CREATE TABLE IF NOT EXISTS password_resets (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     email VARCHAR(150) NOT NULL,
     token VARCHAR(255) NOT NULL,
+    channel ENUM('email','sms') NOT NULL DEFAULT 'email',
+    otp_hash VARCHAR(255) NULL,
+    attempts TINYINT UNSIGNED NOT NULL DEFAULT 0,
     expires_at TIMESTAMP NOT NULL,
     used_at TIMESTAMP NULL DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX (email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS delivery_logs (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT UNSIGNED NULL,
+    company_id BIGINT UNSIGNED NULL,
+    purpose VARCHAR(50) NOT NULL,
+    channel ENUM('email','sms') NOT NULL,
+    destination VARCHAR(190) NOT NULL,
+    status ENUM('sent','preview','failed') NOT NULL,
+    provider_message VARCHAR(500) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_delivery_user_created (user_id,created_at),
+    INDEX idx_delivery_company_created (company_id,created_at),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+    FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 12. customers
@@ -313,6 +371,33 @@ CREATE TABLE IF NOT EXISTS products (
     FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL,
     FOREIGN KEY (unit_id) REFERENCES units(id) ON DELETE SET NULL,
     FOREIGN KEY (tax_id) REFERENCES taxes(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Product replenishment alerts shared by Company Admins and Store Managers.
+CREATE TABLE IF NOT EXISTS pos_stock_alerts (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    company_id BIGINT UNSIGNED NOT NULL,
+    product_id BIGINT UNSIGNED NOT NULL,
+    severity ENUM('low','out') NOT NULL,
+    current_stock DECIMAL(15,3) NOT NULL DEFAULT 0,
+    minimum_stock DECIMAL(15,3) NOT NULL DEFAULT 0,
+    status ENUM('open','resolved') NOT NULL DEFAULT 'open',
+    detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TIMESTAMP NULL DEFAULT NULL,
+    UNIQUE KEY pos_stock_alert_product (company_id,product_id),
+    INDEX idx_pos_stock_alert_status (company_id,status,severity),
+    FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS pos_stock_alert_reads (
+    alert_id BIGINT UNSIGNED NOT NULL,
+    user_id BIGINT UNSIGNED NOT NULL,
+    read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (alert_id,user_id),
+    FOREIGN KEY (alert_id) REFERENCES pos_stock_alerts(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 19. stock_movements
@@ -639,7 +724,10 @@ INSERT INTO roles (name, display_name, description, is_system) VALUES
 ('accountant', 'Accountant', 'Finance and accounting', 0),
 ('sales', 'Sales Rep', 'Sales and orders', 0),
 ('inventory', 'Inventory Manager', 'Stock management', 0),
-('staff', 'Staff', 'Regular staff', 0);
+('staff', 'Staff', 'Regular staff', 0),
+('store_manager', 'Store Manager', 'Retail POS store and user management', 0),
+('senior_cashier', 'Senior Cashier', 'Retail POS checkout and transaction access', 0),
+('cashier', 'Cashier', 'Retail POS checkout access', 0);
 
 -- Insert permissions
 INSERT INTO permissions (module, name, display_name) VALUES
@@ -758,7 +846,7 @@ INSERT INTO companies (id, name, email, phone, city, country, status) VALUES
 
 -- Insert default admin user
 INSERT INTO users (id, company_id, name, email, password, status) VALUES
-(1, 1, 'System Administrator', 'admin@curdun.so', '$2y$12$LCnHxpnfuDmcRNz.LSFU4.wS1dFV/1IKLQJiL1s8hHU8XOHGO6zS', 'active');
+(1, 1, 'System Administrator', 'admin@curdun.so', '$2y$12$37QHxp9vDprPJv/d6fqiIuScOugZYgSOnr2cPyssRw7tlEFw6EnFu', 'active');
 
 -- Assign superadmin role to admin user
 INSERT INTO user_roles (user_id, role_id) VALUES (1, 1);

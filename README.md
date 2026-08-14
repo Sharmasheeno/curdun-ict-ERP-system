@@ -1,6 +1,6 @@
 # Curdun ICT — Cor Platform
 
-A production-style **multi-tenant ERP + Retail POS** for Somali businesses. Vanilla **PHP 8+ backend** (REST API, MySQL 8, PDO, RBAC) with a vanilla **HTML/CSS/JavaScript frontend** — no frameworks, no build step, no bundler.
+A multi-tenant Curdun core platform with a working **Retail POS** for Somali businesses. The other module cards are intentionally marked **Coming Soon** and their legacy APIs are not registered yet. The stack is a vanilla **PHP 8+ backend** (REST API, MySQL 8, PDO, RBAC) with a vanilla **HTML/CSS/JavaScript frontend**.
 
 **Scope in this repo**: marketing site → Cor Platform sign-in → Super Admin console → Company Workspace → **Retail POS** (with staff PIN + admin email/password auth, force-change-on-first-login for temp passwords).
 
@@ -13,7 +13,7 @@ Backend and frontend both serve from **one port** (single `public/` directory), 
 - **Zero framework** — pure PHP 8 MVC (custom Router, PSR-4 autoload, PDO prepared statements) + vanilla JS state-machine on the client.
 - **Two-tier auth** — email + password for the platform sign-in; 4-digit PIN for POS cashier stations; force-change-on-first-login for any admin issued a temporary password.
 - **RBAC** — `superadmin`, `Admin`, `Store Manager`, `Senior Cashier`, `Cashier` roles each get filtered sidebar tabs and role-specific dashboards.
-- **34-table MySQL schema** — Auth & ACL, Organization, CRM, Inventory, Purchases, Sales, Finance, System — with row-locked stock updates and atomic order completion.
+- **36-table MySQL schema** — Auth & ACL, Organization, Retail POS, Inventory, Sales, Finance, and System, with row-locked stock updates and atomic order completion.
 - **Mobile-responsive** — sidebars collapse into a fixed bottom tab bar at ≤720px; header stays sticky with a compact user + logout pill.
 - **USD-only pricing** (Somalia's practical trade currency); wholesale pricing per product; per-store defaults; audit logs on every mutation.
 
@@ -37,13 +37,12 @@ composer install
 # 2. Configure the database
 cp .env.example .env               # then edit DB_USERNAME / DB_PASSWORD
 
-# 3. Create + import the schema (34 tables + seed data)
+# 3. Create + import the schema (36 tables + core seed data)
 mysql -u root -e "CREATE DATABASE curdun_erp CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 mysql -u root curdun_erp < database/curdun_erp.sql
 
-# 4. Seed a PIN for the default admin (so POS PIN login works)
-HASH=$(php -r "echo password_hash('1234', PASSWORD_BCRYPT);")
-mysql -u root curdun_erp -e "UPDATE users SET pin_hash = '$HASH' WHERE email = 'admin@curdun.so';"
+# 4. Seed the sample Retail POS company, staff, products and customers
+php database/seed_pos.php
 
 # 5. Run the whole app on ONE port
 php -S localhost:8000 -t public/ public/router.php
@@ -70,7 +69,7 @@ There are **no demo cards** on the sign-in screen anymore. Type real credentials
 | Email | Password | Lands on |
 |---|---|---|
 | `admin@curdun.so` | `Admin@1234` | Curdun Super Admin console |
-| `admin@shifo.so` | `Cor-7441GS-24` | Shifo Pharmacy workspace |
+| `admin@shifo.so` | `Cor-7441GS-24` | Shifo Retail workspace (first sign-in only) |
 
 Any other credential is rejected with **"Invalid email or password."**
 
@@ -89,9 +88,9 @@ Open Retail POS from the workspace and tap a staff avatar:
 
 ### Retail POS — Company Admin (email + password)
 
-Click **"Sign in as Admin (email)"** below the staff grid: `admin@shifo.so` / `Cor-7441GS-24` → forced to set a new POS password → full Admin access (Dashboard, Checkout, Products, Customers, Transactions, Staff, Settings).
+Sign in through the main Cor door with `admin@shifo.so` / `Cor-7441GS-24`. The account is forced to choose a personal password before any platform or POS API can be used, then receives full tenant Admin access.
 
-The temp password **`Cor-7441GS-24`** works forever in the Core workspace but only **once** in the Retail POS — after the first login the admin sets a new POS password and only that one works for POS from then on.
+The temporary password works once. After it is changed, the old password is invalid everywhere.
 
 ### Backend REST API — quick smoke test
 
@@ -99,7 +98,7 @@ The temp password **`Cor-7441GS-24`** works forever in the Core workspace but on
 # PIN login (POS cashier station)
 curl -X POST http://localhost:8000/api/v1/auth/pin-login \
   -H "Content-Type: application/json" \
-  -d '{"pin":"1234"}' -c /tmp/cookies.txt
+  -d '{"user_id":3,"pin":"1234"}' -c /tmp/cookies.txt
 
 # Email login (any admin)
 curl -X POST http://localhost:8000/api/v1/auth/login \
@@ -107,7 +106,7 @@ curl -X POST http://localhost:8000/api/v1/auth/login \
   -d '{"email":"admin@curdun.so","password":"Admin@1234"}' -c /tmp/cookies.txt
 
 # Create product with wholesale price
-curl -X POST http://localhost:8000/api/v1/products \
+curl -X POST http://localhost:8000/api/v1/pos/products \
   -H "Content-Type: application/json" -b /tmp/cookies.txt \
   -d '{"name":"Basmati Rice 5kg","selling_price":12.00,"wholesale_price":11.00}'
 ```
@@ -132,7 +131,7 @@ curdun-ict-ERP-system/
     │                               ExceptionHandler, ApiException
     ├── config/                     .env-driven config + constants
     ├── database/
-    │   ├── curdun_erp.sql          34-table schema + seed data
+    │   ├── curdun_erp.sql          36-table schema + core seed data
     │   ├── migrations/             Additive migrations (dated files)
     │   └── seed.php                Optional programmatic seeder
     ├── routes/api.php              REST API v1 endpoints
@@ -205,7 +204,7 @@ Full endpoint table with permission requirements in [backend/CURDUN_ERP_BACKEND_
 | **Super Admin** | Overview, Companies, Company Admins, **Platform Admins** (new), Systems Catalog, Infrastructure, Billing & Subs, Audit & Compliance |
 | **Company Workspace** | Module launcher, user pill, sign-out |
 | **Pharmacy** | Dashboard, Users, Branches, Reports, Settings |
-| **Retail POS** | Dashboard (role-specific), Checkout, Products, Customers, Transactions, Staff, Settings (dynamic) |
+| **Retail POS** | Dashboard (role-specific), Checkout, Products, Customers, Transactions, Reports, Stock Notifications, Staff, Settings |
 
 **Platform Admins tab** (Super Admin): list Cor-level operators, create new super admin with auto-generated temp password (`Cor-XXXXXX-26`), new admin forced to reset on first sign-in.
 
@@ -217,15 +216,15 @@ Full endpoint table with permission requirements in [backend/CURDUN_ERP_BACKEND_
 const POS_ROLES = {
   'Cashier':        ['dash','checkout','transactions'],
   'Senior Cashier': ['dash','checkout','transactions'],
-  'Store Manager':  ['dash','checkout','products','customers','transactions','staff'],
-  'Admin':          ['dash','checkout','products','customers','transactions','staff','settings'],
+  'Store Manager':  ['dash','checkout','products','customers','transactions','reports','notifications','staff'],
+  'Admin':          ['dash','checkout','products','customers','transactions','reports','notifications','staff','settings'],
 };
 ```
 
 - **Cashiers** see a personal shift dashboard (My Sales, My Transactions, Start/End Shift).
-- **Managers/Admins** see the global store dashboard (Today's Sales, Transactions, Avg Ticket, Active Staff, Hourly Sales chart, Payment Methods, Top Sellers).
+- **Managers/Admins** see the global store dashboard, a date-filtered operational report with CSV/JSON/PDF export, and persistent low/out-of-stock notifications. Notifications are unread per manager and resolve automatically when stock rises above the product's configured minimum.
 
-New staff created from the "Create Staff Account" panel get an auto-generated username (`firstname.lastInitial`) and a random 4-digit PIN, shown once.
+New POS staff are created from **Staff → Add Staff**. The manager can enter or generate the required four-digit PIN, assign the company store and role, then copy the one-time credential card. Locking the POS register opens the staff selector, where the employee chooses their name and enters that PIN.
 
 ---
 
@@ -265,7 +264,7 @@ Before going live:
 
 **Backend**: PHP 8+ (strict types), MySQL 8+, PDO prepared statements, session-based auth, bcrypt hashing (cost 12), custom router with reflection-based DI, PSR-4 autoload via Composer. Zero framework dependencies beyond `vlucas/phpdotenv`.
 
-**Frontend**: HTML5, CSS3 (CSS custom properties for design tokens, no preprocessor), vanilla JS state-machine (one global `S` object, `render()` router, template-literal HTML). No build step, no bundler, no npm — open `app.html` directly.
+**Frontend**: HTML5, CSS3 (CSS custom properties for design tokens, no preprocessor), vanilla JS state-machine (one global `S` object, `render()` router, template-literal HTML). No build step or npm is required; serve it through the PHP entry point so authentication and APIs are available.
 
 ---
 

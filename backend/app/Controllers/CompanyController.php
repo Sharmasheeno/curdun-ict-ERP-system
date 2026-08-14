@@ -34,20 +34,20 @@ class CompanyController extends BaseController
     public function store(Request $request)
     {
         $data = $request->all();
-        $company = $this->companyService->createCompany($data);
+        $company = $this->companyService->create($data);
         return Response::json(true, 'Company created successfully', $company, null, 201);
     }
 
     public function update(Request $request, int $id)
     {
         $data = $request->all();
-        $company = $this->companyService->updateCompany($id, $data);
+        $company = $this->companyService->update($id, $data);
         return Response::json(true, 'Company updated successfully', $company, null, 200);
     }
 
     public function destroy(Request $request, int $id)
     {
-        $this->companyService->deleteCompany($id);
+        $this->companyService->delete($id);
         return Response::json(true, 'Company deleted successfully', null, null, 200);
     }
 }

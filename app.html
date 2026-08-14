@@ -7,8 +7,8 @@
   <meta name="robots" content="noindex"/>
   <meta name="theme-color" content="#2D1859"/>
   <title>Curdun Cor — Sign in</title>
-  <link rel="stylesheet" href="css/base.css"/>
-  <link rel="stylesheet" href="css/app.css"/>
+  <link rel="stylesheet" href="css/base.css?v=20260812-3"/>
+  <link rel="stylesheet" href="css/app.css?v=20260812-3"/>
   <style>
     /* Extra micro-details */
     .gap-11 { gap: 11px; }
@@ -32,6 +32,14 @@
   -->
   <div id="app-root"></div>
 
-  <script src="js/app.js"></script>
+  <!-- POS API service layer: must load BEFORE app.js -->
+  <script src="js/pos-api.js?v=20260812-3"></script>
+  <script src="js/app.js?v=20260812-3"></script>
+  <script>
+    // Restore POS session on page refresh (GET /auth/me)
+    document.addEventListener('DOMContentLoaded', () => {
+      if (typeof posCheckSession === 'function') posCheckSession();
+    });
+  </script>
 </body>
 </html>

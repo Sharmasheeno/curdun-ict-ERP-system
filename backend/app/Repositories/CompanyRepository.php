@@ -4,6 +4,12 @@ namespace App\Repositories;
 
 class CompanyRepository extends BaseRepository
 {
+    protected string $table = 'companies';
+    protected bool   $softDelete = true;
+    protected array  $fillable = [
+        'name', 'email', 'phone', 'address', 'city', 'country', 'logo', 'status',
+    ];
+
     public function findAll(array $filters = [], int $page = 1, int $limit = 20): array
     {
         $params = [];

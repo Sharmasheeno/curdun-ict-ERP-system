@@ -298,12 +298,15 @@ h1, h2, h3, h4, h5 {
   background: rgba(27,18,51,0.6);
   backdrop-filter: blur(4px);
   display: flex; align-items: center; justify-content: center;
-  padding: 24px;
+  width: 100vw; height: 100vh; height: 100dvh;
+  padding: clamp(10px, 2.5vh, 24px);
+  overflow: hidden;
   animation: fadeIn 0.2s ease;
 }
 .modal-box {
   background: #FFF; border-radius: var(--radius-xl);
-  width: 100%; max-height: 92vh; overflow-y: auto;
+  width: 100%; max-height: calc(100vh - 20px); max-height: calc(100dvh - 20px);
+  overflow: hidden; display: flex; flex-direction: column; min-height: 0;
   box-shadow: 0 30px 80px -20px rgba(0,0,0,0.4);
   animation: scaleIn 0.25s ease;
 }
@@ -312,9 +315,10 @@ h1, h2, h3, h4, h5 {
   background: var(--purple-800); color: #FFF;
   display: flex; align-items: center; gap: 14px;
   border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  flex: 0 0 auto;
 }
-.modal-body { padding: 22px 26px; }
-.modal-footer { padding: 0 26px 22px; display: flex; gap: 10px; justify-content: flex-end; }
+.modal-body { padding: 22px 26px; overflow-y: auto; min-height: 0; overscroll-behavior: contain; }
+.modal-footer { padding: 14px 26px 22px; display: flex; gap: 10px; justify-content: flex-end; flex: 0 0 auto; background:#FFF; }
 .modal-icon {
   width: 44px; height: 44px; border-radius: var(--radius-md);
   background: var(--gold); color: var(--purple-800);

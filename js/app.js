@@ -212,6 +212,9 @@ const S = {
   //   { mode: 'open' | 'close' | 'cash-in' | 'cash-out' | 'closed-summary',
   //     amount, note, counted, managerPin, error, result }
   posRegisterModal: null,
+  posCashTendered: '',       // USD amount entered by cashier for cash payment
+  posHeldOrders: [],         // [{ id, cashier, items, customer, ts }]
+  posShowHeld: false,        // toggle held orders panel
   posPayments: [],
   posPendingOrderId: null,
 
@@ -260,6 +263,40 @@ function copyInputValue(inputId, button) {
 
 function initials(name) {
   return (name||'').split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
+}
+
+/**
+ * Single source of truth for POS stock status.
+ * Every screen — KPI cards, product table, checkout tile, notifications —
+ * must call these helpers so numbers can never contradict each other.
+ *
+ * A product is:
+ *   OUT of stock  when stock <= 0
+ *   LOW  in stock when stock > 0 AND stock <= minimum_stock (default min = 5)
+ *   OK   otherwise
+ *
+ * The backend uses `current_stock <= minimum_stock` in
+ * ProductRepository::getLowStockProducts and DashboardService — matches.
+ */
+function posStockThreshold(product) {
+  const raw = product?.minimumStock ?? product?.minimum_stock ?? 5;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 5;
+}
+function posIsOutOfStock(product) {
+  return Number(product?.stock ?? product?.current_stock ?? 0) <= 0;
+}
+function posIsLowStock(product) {
+  const stock = Number(product?.stock ?? product?.current_stock ?? 0);
+  return stock > 0 && stock <= posStockThreshold(product);
+}
+function posStockStatus(product) {
+  if (posIsOutOfStock(product)) return 'OUT_OF_STOCK';
+  if (posIsLowStock(product))   return 'LOW';
+  return 'OK';
+}
+function posCountLowStock() {
+  return POS_PRODUCTS.filter(p => posIsLowStock(p) || posIsOutOfStock(p)).length;
 }
 
 /**
@@ -3932,14 +3969,13 @@ function renderPOSTab() {
 function renderPOSCategories() {
   const cats = [...new Set(POS_PRODUCTS.map(p => p.cat || 'General'))].sort();
   return `
-    <div class="pharm-topbar">
-      <div class="pharm-tab-label">PoS Product Categories</div>
-      <button class="btn btn-gold btn-sm" id="btn-add-category">+ New Category</button>
-    </div>
     <div class="pharm-content">
+      <div style="display:flex;justify-content:flex-end;margin-bottom:16px">
+        <button class="btn btn-gold btn-sm" id="btn-add-category">+ New Category</button>
+      </div>
       <div class="pos-table-wrap">
         <table class="pos-table">
-          <thead><tr><th>#</th><th>Category Name</th><th>Products</th><th>Actions</th></tr></thead>
+          <thead><tr><th>#</th><th>Category Name</th><th>Products</th><th>Status</th><th>Actions</th></tr></thead>
           <tbody>
             ${cats.map((cat, i) => {
               const count = POS_PRODUCTS.filter(p => (p.cat||'General') === cat).length;
@@ -3947,6 +3983,7 @@ function renderPOSCategories() {
                 <td>${i+1}</td>
                 <td><strong>${esc(cat)}</strong></td>
                 <td>${count} product${count!==1?'s':''}</td>
+                <td><span class="pill pill-green">Active</span></td>
                 <td>
                   <button class="btn btn-outline btn-sm" data-edit-cat="${esc(cat)}">Edit</button>
                   <button class="btn btn-sm" style="color:#e53e3e;background:rgba(229,62,62,0.1)" data-delete-cat="${esc(cat)}">Delete</button>
@@ -3987,14 +4024,54 @@ function renderPOSCombos() {
 
 function renderPOSReportSales() {
   const txns = POS_TRANSACTIONS || [];
-  const byCashier = {};
+  // Aggregate real transactions per cashier — refunds are stored as separate
+  // rows with total < 0 (or with a `refund_of` link if the backend stores them that way).
+  const stats = {};
   txns.forEach(t => {
-    const k = t.cashier || 'Unknown';
-    if (!byCashier[k]) byCashier[k] = { count:0, total:0 };
-    byCashier[k].count++;
-    byCashier[k].total += Number(t.total||0);
+    const k = (t.cashier || t.cashier_name || 'Unknown');
+    if (!stats[k]) stats[k] = { count:0, gross:0, refunds:0 };
+    const total = Number(t.total || 0);
+    const isRefund = total < 0 || t.type === 'refund' || t.status === 'refunded';
+    if (isRefund) {
+      stats[k].refunds += Math.abs(total);
+    } else {
+      stats[k].count  += 1;
+      stats[k].gross  += total;
+    }
   });
-  const rows = Object.entries(byCashier).sort((a,b) => b[1].total - a[1].total);
+
+  // Merge in staff who haven't rung anything yet, so the table lists ALL
+  // active cashiers dynamically (not just those who happened to make sales).
+  (POS_STAFF || []).forEach(s => {
+    if (s.status === 'inactive') return;
+    if (!stats[s.name]) stats[s.name] = { count:0, gross:0, refunds:0 };
+  });
+
+  const rows = Object.entries(stats)
+    .map(([name, d]) => ({
+      name,
+      count:  d.count,
+      gross:  d.gross,
+      refunds:d.refunds,
+      net:    d.gross - d.refunds,
+      avg:    d.count ? d.gross / d.count : 0,
+    }))
+    .sort((a, b) => b.net - a.net);
+
+  const grandGross   = rows.reduce((s, r) => s + r.gross, 0);
+  const grandRefunds = rows.reduce((s, r) => s + r.refunds, 0);
+  const grandNet     = grandGross - grandRefunds;
+  const grandCount   = rows.reduce((s, r) => s + r.count, 0);
+
+  // "Active Cashiers" = staff who have an active shift or PIN-signed-in today
+  // (identified by having transactions today OR being the current cashier of an
+  // open session). Falls back to all staff with any transactions if session
+  // data isn't loaded.
+  const currentCashierName = S.posActiveUser?.name;
+  const activeCashiers = rows.filter(r =>
+    r.count > 0 || r.name === currentCashierName
+  ).length;
+
   return `
     <div class="pharm-topbar">
       <div class="pharm-tab-label">Sales Details · Per Cashier</div>
@@ -4006,23 +4083,39 @@ function renderPOSReportSales() {
     </div>
     <div class="pharm-content">
       <div class="kpi-grid" style="margin-bottom:20px">
-        <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Total Sales</div><div class="kpi-value">$${txns.reduce((s,t)=>s+Number(t.total||0),0).toFixed(2)}</div></div>
-        <div class="kpi-card light"><div class="kpi-eyebrow">Transactions</div><div class="kpi-value">${txns.length}</div></div>
-        <div class="kpi-card light"><div class="kpi-eyebrow">Avg. Ticket</div><div class="kpi-value">$${txns.length?(txns.reduce((s,t)=>s+Number(t.total||0),0)/txns.length).toFixed(2):'0.00'}</div></div>
-        <div class="kpi-card light"><div class="kpi-eyebrow">Active Cashiers</div><div class="kpi-value">${rows.length}</div></div>
+        <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Gross Sales</div><div class="kpi-value">$${grandGross.toFixed(2)}</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Refunds</div><div class="kpi-value trend-warn">$${grandRefunds.toFixed(2)}</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Net Sales</div><div class="kpi-value">$${grandNet.toFixed(2)}</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Active Cashiers</div><div class="kpi-value">${activeCashiers}</div></div>
       </div>
       <div class="pos-table-wrap">
         <table class="pos-table">
-          <thead><tr><th>Cashier</th><th>Transactions</th><th>Total Sales</th><th>Avg. Ticket</th><th>%</th></tr></thead>
+          <thead><tr>
+            <th>Cashier</th>
+            <th>Transactions</th>
+            <th>Gross Sales</th>
+            <th>Refunds</th>
+            <th>Net Sales</th>
+            <th>Avg. Ticket</th>
+            <th>%</th>
+          </tr></thead>
           <tbody>
-            ${rows.map(([name,d]) => {
-              const grandTotal = txns.reduce((s,t)=>s+Number(t.total||0),0) || 1;
-              const pct = Math.round((d.total/grandTotal)*100);
-              return `<tr>
-                <td><strong>${esc(name)}</strong></td>
-                <td>${d.count}</td>
-                <td style="color:var(--gold);font-weight:700">$${d.total.toFixed(2)}</td>
-                <td>$${(d.total/d.count).toFixed(2)}</td>
+            ${rows.length === 0 ? `
+              <tr><td colspan="7" style="padding:24px;text-align:center;color:var(--text-muted);font-style:italic">No cashier activity in this period.</td></tr>
+            ` : rows.map(r => {
+              const pct = grandNet > 0 ? Math.round((r.net / grandNet) * 100) : 0;
+              const isCurrent = r.name === currentCashierName;
+              return `<tr${isCurrent ? ' style="background:rgba(245,196,17,0.06)"' : ''}>
+                <td>
+                  <strong>${esc(r.name)}</strong>
+                  ${isCurrent ? ' <span style="font-size:10px;color:var(--gold);font-weight:800">● NOW</span>' : ''}
+                  ${r.count === 0 ? ' <span style="font-size:10px;color:var(--text-muted)">(no sales yet)</span>' : ''}
+                </td>
+                <td>${r.count}</td>
+                <td style="color:var(--gold);font-weight:700">$${r.gross.toFixed(2)}</td>
+                <td style="color:${r.refunds>0?'#B91C1C':'var(--text-muted)'};font-weight:${r.refunds>0?'700':'400'}">$${r.refunds.toFixed(2)}</td>
+                <td style="font-weight:800">$${r.net.toFixed(2)}</td>
+                <td>$${r.avg.toFixed(2)}</td>
                 <td><div style="display:flex;align-items:center;gap:6px"><div style="flex:1;height:6px;background:var(--border);border-radius:3px"><div style="width:${pct}%;height:100%;background:#F5C411;border-radius:3px"></div></div><span style="font-size:11px">${pct}%</span></div></td>
               </tr>`;
             }).join('')}
@@ -4320,29 +4413,36 @@ function renderPOSDash() {
 
 function renderPOSCheckout() {
   const cart = S.posCart;
-  const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
   const subtotal = cart.reduce((s,item)=>{ const p = item.isWholesale ? item.wholesalePrice : item.price; return s + p * item.qty; }, 0);
   const taxRate = Number(S.storeSettings.taxRate || 0);
   const tax = subtotal * taxRate / 100;
-  const paymentEnabled = label => Object.entries(S.storeSettings.payments || {}).some(([name, enabled]) => name.toLowerCase() === label.toLowerCase() && enabled);
   const total = subtotal + tax;
+  const paymentEnabled = label => Object.entries(S.storeSettings.payments || {}).some(([name, enabled]) => name.toLowerCase() === label.toLowerCase() && enabled);
+  const isCash = S.posPaymentMethod === 'cash';
+  const isMobile = ['evc','edahab','zaad','sahal'].includes(S.posPaymentMethod);
+  const isDeyn = S.posPaymentMethod === 'deyn';
+  // Cash tendered / change logic
+  const tendered = parseFloat(S.posCashTendered) || 0;
+  const change = isCash && tendered > 0 ? Math.max(0, tendered - total) : 0;
+  const tenderedShort = isCash && tendered > 0 && tendered < total;
   const term = (S.posSearchTerm||'').toLowerCase();
   const filtered = term ? POS_PRODUCTS.filter(p=>p.name.toLowerCase().includes(term)||p.barcode.includes(term)||p.cat.toLowerCase().includes(term)) : POS_PRODUCTS;
   const catEmoji = {Groceries:'\ud83d\uded2',Beverages:'\ud83e\udd64',Household:'\ud83c\udfe0','Personal Care':'\ud83e\uddf4',Snacks:'\ud83c\udf6a',Bakery:'\ud83c\udf5e',Fresh:'\ud83e\udd6c'};
+  const canViewMargin = posCan('viewMargin');
 
   if (S.posReceiptVisible && S.posLastReceipt) return renderPOSReceipt();
 
-  const debtCustomer = S.posPaymentMethod==='deyn' && S.posDebtCustomerId ? POS_CUSTOMERS.find(c=>c.id===S.posDebtCustomerId) : null;
+  const debtCustomer = isDeyn && S.posDebtCustomerId ? POS_CUSTOMERS.find(c=>c.id===S.posDebtCustomerId) : null;
   const overLimit = debtCustomer && (debtCustomer.debtBalance + total) > debtCustomer.creditLimit;
 
   return `
-    ${S.posSession?.state==='OPENED' ? `<div class="cashier-shift-banner" style="margin-bottom:12px"><span>🟢 Register #${S.posSession.id} open · ${esc(S.posSession.config_name||S.posConfig?.name||'Main Register')}</span><span class="shift-duration-badge">Expected cash $${Number(S.posSessionSummary?.expected_cash||S.posSession.opening_cash||0).toFixed(2)}</span></div>` : `<div class="cashier-shift-banner cashier-shift-idle" style="margin-bottom:12px;display:flex;align-items:center"><span style="flex:1">🔒 Register closed — open it before validating an order</span><button class="btn btn-primary btn-sm" id="btn-checkout-open-register">Open register</button></div>`}
+    ${S.posSession?.state==='OPENED' ? `<div class="cashier-shift-banner" style="margin-bottom:12px"><span>🟢 Register #${S.posSession.id} open · ${esc(S.posSession.config_name||S.posConfig?.name||'Main Register')}</span><span class="shift-duration-badge">Expected $${Number(S.posSessionSummary?.expected_cash||S.posSession.opening_cash||0).toFixed(2)}</span></div>` : `<div class="cashier-shift-banner cashier-shift-idle" style="margin-bottom:12px;display:flex;align-items:center"><span style="flex:1">🔒 Register closed — open it before validating an order</span><button class="btn btn-primary btn-sm" id="btn-checkout-open-register">Open register</button></div>`}
     <div class="pos-checkout-layout">
       <div class="pos-product-panel">
         <div class="pos-product-search-bar">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
-          <input class="pos-search-input" id="pos-search" type="text" placeholder="Raadi alaab ama scan barcode..." value="${esc(S.posSearchTerm||'')}"/>
-          <span style="font-size:11px;color:var(--text-muted)">${filtered.length} alaab</span>
+          <input class="pos-search-input" id="pos-search" type="text" placeholder="Search products or scan barcode..." value="${esc(S.posSearchTerm||'')}"/>
+          <span style="font-size:11px;color:var(--text-muted)">${filtered.length} items</span>
         </div>
         <div class="pos-categories">
           ${['All','Groceries','Beverages','Household','Personal Care','Snacks','Bakery','Fresh'].map(cat=>`<button class="pos-cat-btn" data-pos-cat="${cat}">${cat}</button>`).join('')}
@@ -4353,7 +4453,7 @@ function renderPOSCheckout() {
               <div class="pos-tile-emoji">${catEmoji[p.cat]||'\ud83d\udce6'}</div>
               <div class="pos-tile-name">${esc(p.name)}</div>
               <div class="pos-tile-price">$${p.price.toFixed(2)}</div>
-              <div class="pos-tile-wholesale">Jumlo: $${p.wholesalePrice.toFixed(2)}</div>
+              ${canViewMargin && p.wholesalePrice ? `<div class="pos-tile-wholesale">Cost: $${p.wholesalePrice.toFixed(2)}</div>` : `<div class="pos-tile-stock-inline">${p.stock} in stock</div>`}
               <div class="pos-tile-stock">${p.stock} stock</div>
             </button>
           `).join('')}
@@ -4362,16 +4462,41 @@ function renderPOSCheckout() {
 
       <div class="pos-cart-panel">
         <div class="pos-cart-header">
-          <h3 style="font-size:16px;font-weight:800;color:#FFF">Iibka hadda</h3>
-          <span style="font-size:12px;color:rgba(255,255,255,0.6)">${cart.length} alaab</span>
+          <h3 style="font-size:16px;font-weight:800;color:#FFF">Current Order</h3>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="font-size:12px;color:rgba(255,255,255,0.6)">${cart.length} items</span>
+            ${cart.length > 0 ? `<button class="btn btn-outline btn-sm" id="btn-hold-order" style="font-size:11px;padding:4px 10px;color:rgba(255,255,255,0.8);border-color:rgba(255,255,255,0.3)">⏸ Hold</button>` : ''}
+            ${(S.posHeldOrders||[]).length > 0 ? `<button class="btn btn-outline btn-sm" id="btn-show-held" style="font-size:11px;padding:4px 10px;color:#F5C411;border-color:rgba(245,196,17,0.5)">📋 Held (${(S.posHeldOrders||[]).length})</button>` : ''}
+          </div>
         </div>
+
+        ${S.posShowHeld ? `
+        <div class="held-orders-panel">
+          <div class="held-orders-title">Held Orders — tap to resume</div>
+          ${(S.posHeldOrders||[]).map((o,idx)=>`
+            <div class="held-order-card">
+              <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+                <span style="font-weight:700;font-size:12px">#${idx+1} · ${esc(o.cashier)}</span>
+                <span style="font-size:11px;color:var(--text-muted)">${new Date(o.ts).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</span>
+              </div>
+              <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${o.items.map(i=>`${i.qty}× ${i.name}`).join(', ')}</div>
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <span style="font-weight:800;color:#2D1859">$${o.items.reduce((s,i)=>s+(i.price*i.qty),0).toFixed(2)}</span>
+                <div style="display:flex;gap:6px">
+                  <button class="btn btn-outline btn-sm" data-discard-held="${idx}">Discard</button>
+                  <button class="btn btn-primary btn-sm" data-resume-held="${idx}">Resume</button>
+                </div>
+              </div>
+            </div>
+          `).join('')}
+        </div>` : ''}
 
         <div class="pos-cart-items" id="pos-cart-items">
           ${cart.length===0 ? `
             <div class="pos-cart-empty">
               <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="1.5"><path d="M3 3h18l-2 12H5L3 3z"/><circle cx="9" cy="20" r="1.5"/><circle cx="17" cy="20" r="1.5"/></svg>
-              <div style="font-size:13px;color:rgba(255,255,255,0.4);margin-top:8px">Cart ma jirto</div>
-              <div style="font-size:11px;color:rgba(255,255,255,0.25)">Taabo alaab si aad u darto</div>
+              <div style="font-size:13px;color:rgba(255,255,255,0.4);margin-top:8px">Cart is empty</div>
+              <div style="font-size:11px;color:rgba(255,255,255,0.25)">Tap a product to add it</div>
             </div>
           ` : cart.map((item,i)=>{ const effPrice=item.isWholesale?item.wholesalePrice:item.price; const rowTotal=effPrice*item.qty; return `
             <div class="pos-cart-row">
@@ -4379,11 +4504,12 @@ function renderPOSCheckout() {
                 <div class="pos-cart-item-name">${esc(item.name)}</div>
                 <div class="pos-cart-item-price">$${effPrice.toFixed(2)}</div>
               </div>
+              ${canViewMargin ? `
               <div class="pos-wholesale-toggle">
-                <span class="pos-wt-label ${!item.isWholesale?'active':''}">Xabo</span>
+                <span class="pos-wt-label ${!item.isWholesale?'active':''}">Retail</span>
                 <label class="pos-wt-switch"><input type="checkbox" class="pos-wholesale-cb" data-cart-idx="${i}" ${item.isWholesale?'checked':''}><span class="pos-wt-track"></span></label>
-                <span class="pos-wt-label ${item.isWholesale?'active':''}">Karto</span>
-              </div>
+                <span class="pos-wt-label ${item.isWholesale?'active':''}">Wholesale</span>
+              </div>` : ''}
               <div class="pos-cart-qty">
                 <button class="pos-qty-btn" data-qty-minus="${i}">\u2212</button>
                 <span class="pos-qty-val">${item.qty}</span>
@@ -4396,39 +4522,70 @@ function renderPOSCheckout() {
         </div>
 
         <div class="pos-cart-summary">
-          <div class="pos-summary-row"><span>Wadarta yar</span><span>$${subtotal.toFixed(2)}</span></div>
-          <div class="pos-summary-row"><span>Canshuur (${taxRate}%)</span><span>$${tax.toFixed(2)}</span></div>
-          <div class="pos-summary-row pos-summary-total"><span>WADARTA</span><span>$${total.toFixed(2)}</span></div>
+          <div class="pos-summary-row"><span>Subtotal</span><span>$${subtotal.toFixed(2)}</span></div>
+          ${taxRate > 0 ? `<div class="pos-summary-row"><span>Tax (${taxRate}%)</span><span>$${tax.toFixed(2)}</span></div>` : ''}
+          <div class="pos-summary-row pos-summary-total"><span>TOTAL</span><span>$${total.toFixed(2)}</span></div>
         </div>
 
         <div class="pos-payment-methods">
-          <div class="pos-pay-section-label">Hab lacag-bixinta</div>
+          <div class="pos-pay-section-label">Payment method</div>
           <div class="pos-pay-options">
-            <button class="pos-pay-btn${S.posPaymentMethod==='cash'?' active':''}" data-pay-method="cash" ${paymentEnabled('Cash')?'':'disabled'}>\ud83d\udcb5 Cash</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='evc'?' active':''} pos-pay-mobile" data-pay-method="evc" ${paymentEnabled('EVC Plus')?'':'disabled'}>\ud83d\udcf1 EVC Plus</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='edahab'?' active':''} pos-pay-mobile" data-pay-method="edahab" ${paymentEnabled('eDahab')?'':'disabled'}>\ud83d\udcb3 eDahab</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='zaad'?' active':''} pos-pay-mobile" data-pay-method="zaad" ${paymentEnabled('ZAAD')?'':'disabled'}>\ud83d\udcf2 Zaad</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='sahal'?' active':''}" data-pay-method="sahal" ${paymentEnabled('Sahal')?'':'disabled'}>\ud83d\udcb3 Sahal</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='deyn'?' active':''} pos-pay-deyn" data-pay-method="deyn" ${paymentEnabled('Deyn')?'':'disabled'}>\ud83d\udcd2 Deyn</button>
+            <button class="pos-pay-btn${isCash?' active':''}" data-pay-method="cash" ${paymentEnabled('Cash')?'':'disabled'}>💵 Cash</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='evc'?' active':''} pos-pay-mobile" data-pay-method="evc" ${paymentEnabled('EVC Plus')?'':'disabled'}>📱 EVC Plus</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='edahab'?' active':''} pos-pay-mobile" data-pay-method="edahab" ${paymentEnabled('eDahab')?'':'disabled'}>💳 eDahab</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='zaad'?' active':''} pos-pay-mobile" data-pay-method="zaad" ${paymentEnabled('ZAAD')?'':'disabled'}>📲 Zaad</button>
+            <button class="pos-pay-btn${S.posPaymentMethod==='sahal'?' active':''}" data-pay-method="sahal" ${paymentEnabled('Sahal')?'':'disabled'}>💳 Sahal</button>
+            <button class="pos-pay-btn${isDeyn?' active':''} pos-pay-deyn" data-pay-method="deyn" ${paymentEnabled('Deyn')?'':'disabled'}>📒 Deyn</button>
           </div>
-          ${S.posPaymentMethod==='deyn' ? `
+
+          ${isCash && cart.length > 0 ? `
+          <div class="pos-cash-tendered-box">
+            <div class="pos-cash-tendered-label">💵 Cash received from customer</div>
+            <div class="pos-cash-tendered-row">
+              <span class="pos-cash-currency">$</span>
+              <input class="pos-cash-tendered-input" id="pos-cash-tendered"
+                type="number" min="${total.toFixed(2)}" step="0.50" placeholder="${total.toFixed(2)}"
+                value="${S.posCashTendered||''}" />
+              <div class="pos-cash-quick-btns">
+                ${[Math.ceil(total), Math.ceil(total/5)*5, Math.ceil(total/10)*10].filter((v,i,a)=>a.indexOf(v)===i).map(v=>`<button class="pos-quick-cash" data-quick-cash="${v}">$${v}</button>`).join('')}
+              </div>
+            </div>
+            ${tendered > 0 && !tenderedShort ? `
+            <div class="pos-change-display">
+              <div class="pos-change-row"><span>Tendered</span><span class="pos-change-amount">$${tendered.toFixed(2)}</span></div>
+              <div class="pos-change-row pos-change-highlight"><span>🔁 Change</span><span class="pos-change-amount" style="color:#22c55e;font-size:20px">$${change.toFixed(2)}</span></div>
+            </div>` : ''}
+            ${tenderedShort ? `<div class="pos-cash-short">⚠ Short by $${(total-tendered).toFixed(2)}</div>` : ''}
+          </div>` : ''}
+
+          ${isMobile && cart.length > 0 ? `
+          <div class="pos-mobile-info-box">
+            <div class="pos-mobile-info-icon">📱</div>
+            <div>
+              <div class="pos-mobile-info-title">Send exact amount via ${S.posPaymentMethod==='evc'?'EVC Plus':S.posPaymentMethod==='edahab'?'eDahab':S.posPaymentMethod==='zaad'?'Zaad':'Sahal'}</div>
+              <div class="pos-mobile-amount">$${total.toFixed(2)} USD</div>
+              <div class="pos-mobile-info-note">Customer sends the exact amount — no change needed.</div>
+            </div>
+          </div>` : ''}
+
+          ${isDeyn ? `
             <div class="pos-deyn-selector">
-              <label class="pos-pay-section-label">Magaca macmiilka (Buugga Deynta)</label>
+              <label class="pos-pay-section-label">Customer (Buugga Deynta)</label>
               <select id="pos-deyn-customer" class="pos-deyn-select">
-                <option value="">\u2014 Dooro macmiil \u2014</option>
-                ${POS_CUSTOMERS.map(c=>{ const used=c.debtBalance+total; const over=used>c.creditLimit; return `<option value="${c.id}" ${S.posDebtCustomerId===c.id?'selected':''}>${esc(c.name)} \u2014 Deyn: $${c.debtBalance.toFixed(2)} / Xad: $${c.creditLimit} ${over?'\u26a0':'\u2713'}</option>`; }).join('')}
+                <option value="">— Select customer —</option>
+                ${POS_CUSTOMERS.map(c=>{ const used=c.debtBalance+total; const over=used>c.creditLimit; return `<option value="${c.id}" ${S.posDebtCustomerId===c.id?'selected':''}>${esc(c.name)} — Debt: $${c.debtBalance.toFixed(2)} / Limit: $${c.creditLimit} ${over?'⚠':'✓'}</option>`; }).join('')}
               </select>
-              ${overLimit ? `<div class="pos-deyn-warning">\u26a0 Xadka deynta waa la dhaafay! Macmiilku xad: $${debtCustomer.creditLimit}, guud ahaan: $${(debtCustomer.debtBalance+total).toFixed(2)}.</div>` : ''}
-              ${debtCustomer && !overLimit ? `<div class="pos-deyn-ok">\u2713 ${debtCustomer.name} \u00b7 Deyn cusub: $${(debtCustomer.debtBalance+total).toFixed(2)} / $${debtCustomer.creditLimit} xad</div>` : ''}
+              ${overLimit ? `<div class="pos-deyn-warning">⚠ Credit limit exceeded! Limit: $${debtCustomer.creditLimit}, total would be: $${(debtCustomer.debtBalance+total).toFixed(2)}.</div>` : ''}
+              ${debtCustomer && !overLimit ? `<div class="pos-deyn-ok">✓ ${debtCustomer.name} · New debt: $${(debtCustomer.debtBalance+total).toFixed(2)} / $${debtCustomer.creditLimit} limit</div>` : ''}
             </div>
           ` : ''}
         </div>
 
         <div class="pos-cart-actions">
-          <button class="pos-charge-btn" id="btn-pos-charge" ${cart.length===0||overLimit||S.posSession?.state!=='OPENED'?'disabled':''}>
-            ${['evc','edahab','zaad'].includes(S.posPaymentMethod) ? 'Soo dir OTP \u2192' : `Bixso $${total.toFixed(2)}`}
+          <button class="pos-charge-btn" id="btn-pos-charge" ${cart.length===0||overLimit||(isDeyn&&!S.posDebtCustomerId)||S.posSession?.state!=='OPENED'||(isCash&&tenderedShort)?'disabled':''}>
+            ${isCash && tendered > 0 ? `Collect $${total.toFixed(2)} · Change $${change.toFixed(2)}` : isMobile ? `Send $${total.toFixed(2)} →` : isDeyn ? `Record Deyn $${total.toFixed(2)}` : `Charge $${total.toFixed(2)}`}
           </button>
-          <button class="pos-clear-btn" id="btn-pos-clear" ${cart.length===0?'disabled':''}>Tirtir cart</button>
+          <button class="pos-clear-btn" id="btn-pos-clear" ${cart.length===0?'disabled':''}>Clear</button>
         </div>
       </div>
     </div>
@@ -4573,7 +4730,7 @@ function renderPOSProducts() {
     <div class="kpi-grid">
       <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Total products</div><div class="kpi-value">${POS_PRODUCTS.length}</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Categories</div><div class="kpi-value">${cats.length}</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Low stock</div><div class="kpi-value trend-warn">${POS_PRODUCTS.filter(p=>p.stock<=p.minimumStock).length}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Low stock</div><div class="kpi-value trend-warn">${posCountLowStock()}</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Total value</div><div class="kpi-value">$${POS_PRODUCTS.reduce((s,p)=>s+p.price*p.stock,0).toFixed(0)}</div></div>
     </div>
     <div class="data-section">
@@ -4879,12 +5036,6 @@ function renderStaffCredentialResult() {
 }
 
 function renderPOSStaff() {
-  const systemCashUSD = Number(S.posSessionSummary?.expected_cash||0);
-  const countedUSD = parseFloat(S.shiftCountedUSD)||0;
-  const variance = countedUSD - systemCashUSD;
-  const varianceClass = variance===0?'shift-var-zero':variance>0?'shift-var-over':'shift-var-short';
-  const varianceLabel = variance===0 ? '\u2713 Sax' : variance>0 ? `\u25b2 Kordhay $${Math.abs(variance).toFixed(2)}` : `\u25bc Dhimay $${Math.abs(variance).toFixed(2)}`;
-
   return `
     ${renderStaffCredentialResult()}
     <div class="kpi-grid">
@@ -4894,40 +5045,6 @@ function renderPOSStaff() {
       <div class="kpi-card light"><div class="kpi-eyebrow">Iibka maanta</div><div class="kpi-value">${POS_STAFF.reduce((s,st)=>s+st.sales,0)}</div></div>
     </div>
 
-    <div class="shift-panel">
-      <div class="shift-panel-header">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-        <h3 class="shift-panel-title">Xirida Shiftiga \u2014 Shift Reconciliation</h3>
-      </div>
-      <div class="shift-cashier-select">
-        <label class="form-label" style="color:rgba(255,255,255,0.7)">Cashier-ka shiftiga xira</label>
-        <select class="form-select" id="shift-cashier-sel" style="max-width:280px;background:rgba(255,255,255,0.1);border-color:rgba(255,255,255,0.2);color:#FFF">
-          <option value="">\u2014 Dooro cashier \u2014</option>
-          ${POS_STAFF.map(s=>`<option value="${s.id}" ${S.shiftCashier===s.id?'selected':''}>${esc(s.name)} \u00b7 ${esc(s.store)}</option>`).join('')}
-        </select>
-      </div>
-      <div class="shift-system-totals">
-        <div class="shift-sys-row"><span class="shift-sys-label">Register session</span><span class="shift-sys-val">${S.posSession?.state==='OPENED'?`#${S.posSession.id} · OPEN`:'CLOSED'}</span></div>
-        <div class="shift-sys-row"><span class="shift-sys-label">Opening cash</span><span class="shift-sys-val">$${Number(S.posSession?.opening_cash||0).toFixed(2)}</span></div>
-        <div class="shift-sys-row"><span class="shift-sys-label">Nidaamka: Cash USD</span><span class="shift-sys-val">$${systemCashUSD.toFixed(2)}</span></div>
-      </div>
-      <div class="shift-count-grid">
-        <div class="shift-count-col">
-          <label class="form-label" style="color:rgba(255,255,255,0.7)">La tirisay \u2014 USD</label>
-          <input class="form-input shift-count-input" id="shift-usd" type="number" step="0.01" min="0" placeholder="0.00" value="${S.shiftCountedUSD||''}">
-        </div>
-      </div>
-      ${countedUSD>0 ? `
-      <div class="shift-variance-card ${varianceClass}">
-        <div style="flex:1"><div class="shift-var-label">Kala duwanaanshaha</div><div class="shift-var-value">${varianceLabel}</div></div>
-        <div style="text-align:right"><div style="font-size:11px;opacity:0.7">La tirisay</div><div style="font-weight:800">$${countedUSD.toFixed(2)}</div></div>
-        <div style="text-align:right"><div style="font-size:11px;opacity:0.7">Nidaamka</div><div style="font-weight:800">$${systemCashUSD.toFixed(2)}</div></div>
-      </div>` : ''}
-      <div style="display:flex;gap:10px;margin-top:14px">
-        <button class="btn btn-gold" id="btn-close-shift" ${S.posSession?.state==='OPENED'?'':'disabled'}>Xir Shiftiga \u2713</button>
-        <button class="btn btn-ghost" id="btn-reset-shift" style="color:#EFEAFB">Dib u bilow</button>
-      </div>
-    </div>
 
     <!-- STAFF CRUD MODAL -->
     ${(()=>{
@@ -5093,6 +5210,7 @@ function renderPOSSettings() {
     : '';
 
   return `
+    <div class="section-header-bar" style="margin-bottom:16px"><h3 class="chart-title">⚙️ Configuration Settings</h3></div>
     <div style="max-width:600px">
       ${savedBanner}
 
@@ -5813,10 +5931,43 @@ function wirePOSEvents() {
       btn.addEventListener('click', () => { S.posSearchTerm = btn.dataset.posCat==='All'?'':btn.dataset.posCat; render(); });
     });
     document.querySelectorAll('[data-pay-method]').forEach(btn => {
-      btn.addEventListener('click', () => { S.posPaymentMethod=btn.dataset.payMethod; S.posDebtCustomerId=null; render(); });
+      btn.addEventListener('click', () => { S.posPaymentMethod=btn.dataset.payMethod; S.posDebtCustomerId=null; S.posCashTendered=''; render(); });
     });
     const deynSel = document.getElementById('pos-deyn-customer');
     if (deynSel) deynSel.addEventListener('change', () => { S.posDebtCustomerId=parseInt(deynSel.value)||null; render(); });
+
+    // ---- Cash tendered / change ----
+    const tenderedInput = document.getElementById('pos-cash-tendered');
+    if (tenderedInput) {
+      tenderedInput.addEventListener('input', () => { S.posCashTendered = tenderedInput.value; render(); });
+      tenderedInput.addEventListener('focus', () => tenderedInput.select());
+    }
+    document.querySelectorAll('[data-quick-cash]').forEach(btn => {
+      btn.addEventListener('click', () => { S.posCashTendered = btn.dataset.quickCash; render(); });
+    });
+
+    // ---- Hold / Resume / Discard ----
+    document.getElementById('btn-hold-order')?.addEventListener('click', () => {
+      if (!S.posCart.length) return;
+      if (!S.posHeldOrders) S.posHeldOrders = [];
+      S.posHeldOrders.push({ id: Date.now(), cashier: S.posActiveUser?.name||'?', items: [...S.posCart], customer: S.posDebtCustomerId, ts: Date.now() });
+      S.posCart = []; S.posDebtCustomerId = null; S.posCashTendered = ''; S.posReceiptVisible = false; S.posShowHeld = false;
+      render();
+    });
+    document.getElementById('btn-show-held')?.addEventListener('click', () => { S.posShowHeld = !S.posShowHeld; render(); });
+    document.querySelectorAll('[data-resume-held]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const idx = parseInt(btn.dataset.resumeHeld);
+        const held = (S.posHeldOrders||[])[idx];
+        if (!held) return;
+        if (S.posCart.length > 0 && !confirm('Replace current cart with held order?')) return;
+        S.posCart = [...held.items]; S.posDebtCustomerId = held.customer; S.posCashTendered = '';
+        S.posHeldOrders.splice(idx, 1); S.posShowHeld = false; render();
+      });
+    });
+    document.querySelectorAll('[data-discard-held]').forEach(btn => {
+      btn.addEventListener('click', () => { const idx=parseInt(btn.dataset.discardHeld); if(S.posHeldOrders) S.posHeldOrders.splice(idx,1); render(); });
+    });
 
     const chargeBtn = document.getElementById('btn-pos-charge');
     if (chargeBtn) {
@@ -5830,7 +5981,7 @@ function wirePOSEvents() {
       });
     }
     const clearBtn = document.getElementById('btn-pos-clear');
-    if (clearBtn) clearBtn.addEventListener('click', () => { S.posCart=[]; render(); });
+    if (clearBtn) clearBtn.addEventListener('click', () => { S.posCart=[]; S.posCashTendered=''; render(); });
   }
 
   if (S.posMobileMoneyModal) {

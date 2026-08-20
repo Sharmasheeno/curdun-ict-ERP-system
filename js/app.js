@@ -4560,7 +4560,10 @@ function renderPOSCheckout() {
             <button class="pos-pay-btn${S.posPaymentMethod==='edahab'?' active':''} pos-pay-mobile" data-pay-method="edahab" ${paymentEnabled('eDahab')?'':'disabled'}>💳 eDahab</button>
             <button class="pos-pay-btn${S.posPaymentMethod==='zaad'?' active':''} pos-pay-mobile" data-pay-method="zaad" ${paymentEnabled('ZAAD')?'':'disabled'}>📲 Zaad</button>
             <button class="pos-pay-btn${S.posPaymentMethod==='sahal'?' active':''}" data-pay-method="sahal" ${paymentEnabled('Sahal')?'':'disabled'}>💳 Sahal</button>
-            <button class="pos-pay-btn${isDeyn?' active':''} pos-pay-deyn" data-pay-method="deyn" ${paymentEnabled('Deyn')?'':'disabled'}>📒 Deyn</button>
+            <button class="pos-pay-btn pos-pay-btn-stacked${isDeyn?' active':''} pos-pay-deyn" data-pay-method="deyn" ${paymentEnabled('Deyn')?'':'disabled'} title="Customer Credit — Pay Later">
+              <span class="pos-pay-btn-title">📒 Deyn</span>
+              <span class="pos-pay-btn-sub">Customer Credit · Pay Later</span>
+            </button>
           </div>
 
           ${isCash && cart.length > 0 ? `
@@ -4595,6 +4598,10 @@ function renderPOSCheckout() {
 
           ${isDeyn ? `
             <div class="pos-deyn-selector">
+              <div class="pos-deyn-banner">
+                <strong>Deyn — Customer Credit · Pay Later</strong>
+                <span>No cash or mobile-money is collected now. The sale is booked against the customer's account and must be settled later.</span>
+              </div>
               <label class="pos-pay-section-label">Customer (Buugga Deynta)</label>
               <select id="pos-deyn-customer" class="pos-deyn-select">
                 <option value="">— Select customer —</option>

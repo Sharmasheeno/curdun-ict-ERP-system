@@ -119,7 +119,7 @@ class PosService
             'summary'=>$summary,
             'daily_sales'=>$this->db->query("SELECT order_date date,COUNT(*) orders,ROUND(SUM(subtotal),2) subtotal,ROUND(SUM(tax_amount),2) tax,ROUND(SUM(total_amount),2) total FROM orders WHERE company_id=:company AND status='COMPLETED' AND order_date BETWEEN :from AND :to GROUP BY order_date ORDER BY order_date",$range)->fetchAll(),
             'payments'=>$this->db->query("SELECT payment_method,SUM(transactions) transactions,ROUND(SUM(amount),2) amount FROM (
-                    SELECT pp.method_name payment_method,COUNT(DISTINCT pp.order_id) transactions,SUM(pp.amount) amount FROM pos_payments pp JOIN orders o ON o.id=pp.order_id WHERE pp.company_id=:company AND pp.status='COMPLETED' AND o.order_date BETWEEN :from AND :to GROUP BY pp.method_name
+                    SELECT pp.method_name payment_method,COUNT(DISTINCT pp.order_id) transactions,SUM(pp.amount) amount FROM pos_payments pp JOIN orders o ON o.id=pp.order_id WHERE pp.company_id=:company AND pp.status='COMPLETED' AND pp.is_change=0 AND o.order_date BETWEEN :from AND :to GROUP BY pp.method_name
                     UNION ALL
                     SELECT COALESCE(pm.name,'Deyn'),COUNT(DISTINCT o.id),SUM(o.total_amount) FROM orders o LEFT JOIN invoices i ON i.id=o.invoice_id LEFT JOIN payments pay ON pay.invoice_id=i.id AND pay.status='COMPLETED' LEFT JOIN payment_methods pm ON pm.id=pay.payment_method_id WHERE o.company_id=:legacy_company AND o.status='COMPLETED' AND o.order_date BETWEEN :legacy_from AND :legacy_to AND NOT EXISTS (SELECT 1 FROM pos_payments pp2 WHERE pp2.order_id=o.id) GROUP BY COALESCE(pm.name,'Deyn')
                 ) methods GROUP BY payment_method ORDER BY amount DESC",['company'=>$companyId,'from'=>$from,'to'=>$to,'legacy_company'=>$companyId,'legacy_from'=>$from,'legacy_to'=>$to])->fetchAll(),
@@ -203,7 +203,7 @@ class PosService
             'active_staff'=>(int)$this->db->query("SELECT COUNT(*) FROM users WHERE company_id=:company AND deleted_at IS NULL AND status='active'",$params)->fetchColumn(),
             'outstanding_debt'=>(float)($this->db->query("SELECT COALESCE(SUM(balance),0) FROM customers WHERE company_id=:company AND deleted_at IS NULL",$params)->fetchColumn() ?: 0),
             'hourly_sales'=>$this->db->query("SELECT HOUR(created_at) hour,ROUND(SUM(total_amount),2) total,COUNT(*) orders FROM orders WHERE company_id=:company AND status='COMPLETED' AND order_date=CURDATE() GROUP BY HOUR(created_at) ORDER BY hour",$params)->fetchAll(),
-            'payment_methods'=>$this->db->query("SELECT method_name name,ROUND(SUM(amount),2) amount,COUNT(DISTINCT order_id) transactions FROM pos_payments WHERE company_id=:company AND status='COMPLETED' AND DATE(created_at)=CURDATE() GROUP BY method_name ORDER BY amount DESC",$params)->fetchAll(),
+            'payment_methods'=>$this->db->query("SELECT method_name name,ROUND(SUM(amount),2) amount,COUNT(DISTINCT order_id) transactions FROM pos_payments WHERE company_id=:company AND status='COMPLETED' AND is_change=0 AND DATE(created_at)=CURDATE() GROUP BY method_name ORDER BY amount DESC",$params)->fetchAll(),
             'top_products'=>$this->db->query("SELECT p.name,ROUND(SUM(oi.quantity),3) quantity,ROUND(SUM(oi.total),2) sales FROM order_items oi JOIN orders o ON o.id=oi.order_id JOIN products p ON p.id=oi.product_id WHERE o.company_id=:company AND o.status='COMPLETED' AND o.order_date=CURDATE() GROUP BY p.id,p.name ORDER BY quantity DESC LIMIT 4",$params)->fetchAll(),
             'open_sessions'=>(int)$this->db->query("SELECT COUNT(*) FROM pos_sessions WHERE company_id=:company AND state IN ('OPENING_CONTROL','OPENED','CLOSING_CONTROL')",$params)->fetchColumn(),
         ];
@@ -214,7 +214,7 @@ class PosService
         return $this->db->query("SELECT s.id,s.uuid,s.state,s.opening_cash,s.expected_cash,s.counted_cash,s.difference_amount,s.opening_note,s.closing_note,s.opened_at,s.closed_at,
                 pc.name config_name,COALESCE(b.name,'Main') branch_name,opener.name opened_by_name,closer.name closed_by_name,
                 COUNT(DISTINCT o.id) orders,ROUND(COALESCE(SUM(o.total_amount),0),2) net_sales,
-                ROUND(s.opening_cash+COALESCE((SELECT SUM(pp.amount) FROM pos_payments pp WHERE pp.session_id=s.id AND pp.status='COMPLETED' AND pp.method_type='cash'),0)
+                ROUND(s.opening_cash+COALESCE((SELECT SUM(pp.amount) FROM pos_payments pp WHERE pp.session_id=s.id AND pp.status='COMPLETED' AND pp.method_type='cash' AND pp.is_change=0),0)
                     +COALESCE((SELECT SUM(cm.amount) FROM pos_cash_movements cm WHERE cm.session_id=s.id AND cm.movement_type='IN'),0)
                     -COALESCE((SELECT SUM(cm.amount) FROM pos_cash_movements cm WHERE cm.session_id=s.id AND cm.movement_type='OUT'),0),2) calculated_cash
              FROM pos_sessions s JOIN pos_configs pc ON pc.id=s.config_id LEFT JOIN branches b ON b.id=s.branch_id
@@ -563,11 +563,40 @@ class PosService
             $discount=round(array_sum(array_map(fn($line)=>$line['unit_price']*$line['quantity']-$line['subtotal'],$normalized)),2);$total=round($subtotal+$tax,2);
             $paymentLines=$data['payments']??[['method'=>$data['payment_method']??'Cash','amount'=>$total,'reference'=>$data['payment_reference']??null]];
             if(!is_array($paymentLines)||!$paymentLines)throw new Exception('At least one payment line is required.',422);
-            $payments=[];$tendered=0.0;$cashTendered=0.0;$debtAmount=0.0;$hasCash=false;$hasDebt=false;
-            foreach($paymentLines as $paymentLine){$payment=$this->paymentMethod((string)($paymentLine['method']??$paymentLine['payment_method']??'Cash'));$this->assertPaymentEnabled($companyId,$payment['name']);$amount=round((float)($paymentLine['amount']??0),2);if($amount<=0)throw new Exception('Payment amounts must be greater than zero.',422);$tendered+=$amount;$hasCash=$hasCash||$payment['type']==='cash';if($payment['type']==='cash')$cashTendered+=$amount;$isDebt=strtolower($payment['name'])==='deyn';$hasDebt=$hasDebt||$isDebt;if($isDebt)$debtAmount+=$amount;$payments[]=['method'=>$payment,'amount'=>$amount,'reference'=>$paymentLine['reference']??$data['payment_reference']??null];}
+            // Point 12/13 model: each payment line stands on its own. For cash lines,
+            // `tendered` is what the customer physically handed over; change belongs
+            // to that specific cash line (tendered - amount). Non-cash lines cannot
+            // carry tender/change — reject explicitly so it can't be smuggled in.
+            $payments=[];$applied=0.0;$change=0.0;$debtAmount=0.0;$hasCash=false;$hasDebt=false;
+            foreach($paymentLines as $paymentLine){
+                $payment=$this->paymentMethod((string)($paymentLine['method']??$paymentLine['payment_method']??'Cash'));
+                $this->assertPaymentEnabled($companyId,$payment['name']);
+                $amount=round((float)($paymentLine['amount']??0),2);
+                if($amount<=0)throw new Exception('Payment amounts must be greater than zero.',422);
+                $isCash=($payment['type']==='cash');
+                $tenderedRaw=$paymentLine['tendered']??$paymentLine['tendered_amount']??null;
+                $lineTendered=null;$lineChange=null;
+                if($tenderedRaw!==null&&$tenderedRaw!==''){
+                    if(!$isCash)throw new Exception('Only cash payment lines may include a tendered amount.',422);
+                    $lineTendered=round((float)$tenderedRaw,2);
+                    if($lineTendered+0.0001<$amount)throw new Exception('Cash tendered for this line is less than the line amount.',422);
+                    $lineChange=round($lineTendered-$amount,2);
+                }elseif($isCash){
+                    // Legacy caller sent `amount` > line share: treat the excess as
+                    // change on this line so old UIs keep working. Split-aware
+                    // callers should pass `tendered` explicitly.
+                    $lineTendered=$amount;$lineChange=0.0;
+                }
+                $applied+=$amount;$change+=($lineChange??0);
+                $hasCash=$hasCash||$isCash;
+                $isDebt=strtolower($payment['name'])==='deyn';$hasDebt=$hasDebt||$isDebt;
+                if($isDebt)$debtAmount+=$amount;
+                $payments[]=['method'=>$payment,'amount'=>$amount,'tendered'=>$lineTendered,'line_change'=>$lineChange,'reference'=>$paymentLine['reference']??$data['payment_reference']??null];
+            }
             if($hasDebt&&!$customerId)throw new Exception('A customer is required for credit sales.',422);
-            if($tendered+0.0001<$total)throw new Exception('The order is not fully paid.',422);
-            $change=round($tendered-$total,2);if($change>0&&(!$hasCash||$cashTendered+0.0001<$change))throw new Exception('The cash tender is not enough to return this change.',422);
+            if(round($applied,2)+0.0001<$total)throw new Exception('The order is not fully paid.',422);
+            if(round($applied,2)>$total+0.0001)throw new Exception('Payment amounts exceed the order total. Use the tendered field for cash overpayment, not the amount.',422);
+            $tendered=$applied+$change; // for legacy fields in orders row
             if($hasDebt){
                 $limit=(float)($customer['credit_limit']??0);$balance=(float)($customer['balance']??0);
                 if($limit<=0||$balance+$debtAmount>$limit)throw new Exception('This sale exceeds the customer credit limit.',422);
@@ -581,8 +610,18 @@ class PosService
                 $this->db->query("UPDATE products SET current_stock=:stock WHERE id=:id",['stock'=>$after,'id'=>$p['id']]);
                 $this->db->query("INSERT INTO stock_movements (product_id,warehouse_id,user_id,reference_type,reference_id,type,quantity,quantity_before,quantity_after,notes) VALUES (:product,:warehouse,:user,'POS_ORDER',:reference,'SALE',:quantity,:before,:after,'Retail POS sale')",['product'=>$p['id'],'warehouse'=>$data['warehouse_id']??null,'user'=>$user['id'],'reference'=>$orderId,'quantity'=>-$line['quantity'],'before'=>$p['current_stock'],'after'=>$after]);
             }
-            foreach($payments as $paymentLine){$payment=$paymentLine['method'];$this->db->query("INSERT INTO pos_payments (company_id,session_id,order_id,user_id,payment_method_id,method_name,method_type,amount,reference_number,status) VALUES (:company,:session,:order,:user,:method,:name,:type,:amount,:reference,'COMPLETED')",['company'=>$companyId,'session'=>$session['id'],'order'=>$orderId,'user'=>$user['id'],'method'=>$payment['id'],'name'=>$payment['name'],'type'=>$payment['type'],'amount'=>$paymentLine['amount'],'reference'=>$paymentLine['reference']??$reference]);}
-            if($change>0){$cash=$this->paymentMethod('Cash');$this->db->query("INSERT INTO pos_payments (company_id,session_id,order_id,user_id,payment_method_id,method_name,method_type,amount,is_change,reference_number,status) VALUES (:company,:session,:order,:user,:method,:name,'cash',:amount,1,:reference,'COMPLETED')",['company'=>$companyId,'session'=>$session['id'],'order'=>$orderId,'user'=>$user['id'],'method'=>$cash['id'],'name'=>$cash['name'],'amount'=>-$change,'reference'=>$reference.'-CHANGE']);}
+            foreach($payments as $paymentLine){
+                $payment=$paymentLine['method'];
+                $this->db->query(
+                    "INSERT INTO pos_payments (company_id,session_id,order_id,user_id,payment_method_id,method_name,method_type,amount,tendered_amount,change_amount,reference_number,status)
+                     VALUES (:company,:session,:order,:user,:method,:name,:type,:amount,:tendered,:change,:reference,'COMPLETED')",
+                    ['company'=>$companyId,'session'=>$session['id'],'order'=>$orderId,'user'=>$user['id'],'method'=>$payment['id'],'name'=>$payment['name'],'type'=>$payment['type'],'amount'=>$paymentLine['amount'],'tendered'=>$paymentLine['tendered'],'change'=>$paymentLine['line_change'],'reference'=>$paymentLine['reference']??$reference]
+                );
+            }
+            // No separate is_change=1 row: from Point 12 onward, change_amount is
+            // stored directly on the CASH line, and amount already equals the true
+            // cash contribution (net gain to the drawer). Reporting sums pp.amount
+            // and filters is_change=0 defensively for any legacy rows.
             $invoiceId=null;$invoiceNo=null;if($toInvoice){[$invoiceId,$invoiceNo]=$this->createInvoice($companyId,$user,$orderId,$customerId,$normalized,$subtotal,$tax,$total,$hasDebt,false,$debtAmount);}
             if($hasDebt){
                 // Ledger row FIRST (atomic with the balance write inside this same

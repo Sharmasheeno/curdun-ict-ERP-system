@@ -497,19 +497,197 @@ class PosService
         } catch(\Throwable $e){if($this->db->getConnection()->inTransaction())$this->db->rollback();throw $e;}
     }
 
+    /**
+     * P5 — Odoo-style Session Report (Rule #46).
+     *
+     * CLOSED sessions → the canonical Odoo post-close report (this is the
+     * ODOO-ALIGNED half). OPEN sessions → running totals, marked live
+     * (CURDUN EXTENSION). Every number here is derived from the
+     * authoritative tables (orders, pos_payments, pos_cash_movements,
+     * pos_credit_ledger) — never from cached frontend totals or per-cashier
+     * shift objects. Cash reconciliation strictly uses payment amounts,
+     * NOT tendered_amount (Rule #4 / #19).
+     */
     public function sessionSummary(int $sessionId=0): array
     {
         [$user,$companyId]=$this->context();
-        if(!$sessionId){$config=$this->resolveConfig($companyId,isset($user['branch_id'])?(int)$user['branch_id']:null);$session=$this->currentSessionForConfig($companyId,(int)$config['id']);}
-        else{$session=$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company",['id'=>$sessionId,'company'=>$companyId])->fetch();}
-        if(!$session)throw new Exception('No open POS register session was found.',404);
-        $methods=$this->db->query("SELECT method_name,method_type,ROUND(SUM(amount),2) amount,COUNT(DISTINCT order_id) transactions FROM pos_payments WHERE company_id=:company AND session_id=:session AND status='COMPLETED' GROUP BY method_name,method_type ORDER BY method_name",['company'=>$companyId,'session'=>$session['id']])->fetchAll();
-        $cashPayments=0.0;foreach($methods as $method)if($method['method_type']==='cash')$cashPayments+=(float)$method['amount'];
-        $movements=$this->db->query("SELECT movement_type,ROUND(SUM(amount),2) amount FROM pos_cash_movements WHERE company_id=:company AND session_id=:session GROUP BY movement_type",['company'=>$companyId,'session'=>$session['id']])->fetchAll();
-        $cashIn=0.0;$cashOut=0.0;foreach($movements as $movement){if($movement['movement_type']==='IN')$cashIn=(float)$movement['amount'];else$cashOut=(float)$movement['amount'];}
-        $expected=round((float)$session['opening_cash']+$cashPayments+$cashIn-$cashOut,2);
-        $orders=$this->db->query("SELECT COUNT(*) orders,COALESCE(SUM(total_amount),0) net_sales FROM orders WHERE company_id=:company AND pos_session_id=:session AND pos_state='done'",['company'=>$companyId,'session'=>$session['id']])->fetch();
-        return ['session'=>$session,'payment_methods'=>$methods,'cash_movements'=>['in'=>$cashIn,'out'=>$cashOut],'expected_cash'=>$expected,'orders'=>(int)$orders['orders'],'net_sales'=>(float)$orders['net_sales']];
+        // Resolve session — either explicit id (any historical session
+        // belonging to this company) or the currently-open one for the
+        // acting cashier's POS config.
+        if(!$sessionId){
+            $config=$this->resolveConfig($companyId,isset($user['branch_id'])?(int)$user['branch_id']:null);
+            $session=$this->currentSessionForConfig($companyId,(int)$config['id']);
+        } else {
+            $session=$this->db->query(
+                "SELECT s.*, u.name opened_by_name, closer.name closed_by_name,
+                        c.name config_name, b.name branch_name
+                 FROM pos_sessions s
+                 JOIN users u ON u.id=s.opened_by
+                 LEFT JOIN users closer ON closer.id=s.closed_by
+                 JOIN pos_configs c ON c.id=s.config_id
+                 LEFT JOIN branches b ON b.id=s.branch_id
+                 WHERE s.id=:id AND s.company_id=:company",
+                ['id'=>$sessionId,'company'=>$companyId]
+            )->fetch();
+        }
+        if(!$session) throw new Exception('Session not found.', 404);
+
+        $sid = (int)$session['id'];
+        $params = ['company'=>$companyId,'session'=>$sid];
+
+        // ---- Payment methods (dynamic — every method with recorded lines
+        //      shows up; a configured method with no rows shows $0 on the
+        //      frontend by merging with the settings.payments list).
+        $methods = $this->db->query(
+            "SELECT method_name, method_type,
+                    ROUND(SUM(amount),2)                        AS amount,
+                    ROUND(SUM(CASE WHEN amount>0 THEN amount END),2) AS gross,
+                    ROUND(SUM(CASE WHEN amount<0 THEN amount END),2) AS refunded,
+                    COUNT(DISTINCT order_id)                    AS transactions
+             FROM pos_payments
+             WHERE company_id=:company AND session_id=:session AND status='COMPLETED' AND is_change=0
+             GROUP BY method_name, method_type
+             ORDER BY method_name",
+            $params
+        )->fetchAll();
+
+        // Cash payments only — the number that feeds Expected Cash. Uses
+        // AMOUNT never TENDERED (Rule #19 / #43).
+        $cashPayments = 0.0;
+        foreach ($methods as $m) if ($m['method_type'] === 'cash') $cashPayments += (float)$m['amount'];
+
+        // ---- Cash movements — aggregate + individual records for the list
+        $movementsAgg = $this->db->query(
+            "SELECT movement_type, ROUND(SUM(amount),2) amount
+             FROM pos_cash_movements
+             WHERE company_id=:company AND session_id=:session
+             GROUP BY movement_type",
+            $params
+        )->fetchAll();
+        $cashIn = 0.0; $cashOut = 0.0;
+        foreach ($movementsAgg as $mv) {
+            if ($mv['movement_type'] === 'IN')  $cashIn  = (float)$mv['amount'];
+            else                                 $cashOut = (float)$mv['amount'];
+        }
+        $movementList = $this->db->query(
+            "SELECT cm.id, cm.movement_type, cm.amount, cm.reason, cm.created_at, u.name AS employee_name
+             FROM pos_cash_movements cm
+             JOIN users u ON u.id = cm.user_id
+             WHERE cm.company_id=:company AND cm.session_id=:session
+             ORDER BY cm.created_at DESC, cm.id DESC",
+            $params
+        )->fetchAll();
+
+        // ---- Sales — gross (positive orders) vs refunds (negative orders)
+        //      vs net. Order attribution is the trusted server-side field.
+        $sales = $this->db->query(
+            "SELECT
+                COUNT(*) AS orders,
+                COALESCE(SUM(CASE WHEN total_amount>0 THEN total_amount END),0) AS gross_sales,
+                COALESCE(SUM(CASE WHEN total_amount<0 THEN total_amount END),0) AS refund_amount_signed,
+                COALESCE(SUM(total_amount),0)                                    AS net_sales,
+                COALESCE(AVG(CASE WHEN total_amount>0 THEN total_amount END),0) AS average_order,
+                SUM(CASE WHEN total_amount>0 THEN 1 ELSE 0 END) AS sale_orders,
+                SUM(CASE WHEN total_amount<0 THEN 1 ELSE 0 END) AS refund_orders
+             FROM orders
+             WHERE company_id=:company AND pos_session_id=:session AND pos_state='done'",
+            $params
+        )->fetch();
+        $refundAmount = abs((float)$sales['refund_amount_signed']);
+        $expected = round((float)$session['opening_cash'] + $cashPayments + $cashIn - $cashOut, 2);
+
+        // ---- Employees who transacted on this session — derived from the
+        //      real orders, not any per-cashier shift object (Rule #47 / #6).
+        $employees = $this->db->query(
+            "SELECT
+                u.id, u.name AS employee_name,
+                COUNT(o.id) AS orders,
+                COALESCE(SUM(CASE WHEN o.total_amount>0 THEN o.total_amount END),0) AS gross_sales,
+                COALESCE(SUM(CASE WHEN o.total_amount<0 THEN o.total_amount END),0) AS refund_amount_signed,
+                COALESCE(SUM(o.total_amount),0)                                     AS net_sales
+             FROM orders o
+             JOIN users u ON u.id = o.user_id
+             WHERE o.company_id=:company AND o.pos_session_id=:session AND o.pos_state='done'
+             GROUP BY u.id, u.name
+             ORDER BY net_sales DESC",
+            $params
+        )->fetchAll();
+        // Add unsigned refund_amount for display convenience.
+        foreach ($employees as &$emp) { $emp['refund_amount'] = abs((float)$emp['refund_amount_signed']); }
+        unset($emp);
+
+        // ---- Orders detail list for this session
+        $orders = $this->db->query(
+            "SELECT
+                o.id, o.reference_number, o.order_date, o.created_at,
+                o.status, o.pos_state, o.refunded_order_id,
+                o.subtotal, o.tax_amount, o.total_amount,
+                COALESCE(c.name,'Walk-in') AS customer_name,
+                u.name AS cashier_name,
+                COUNT(DISTINCT oi.id) AS items,
+                COALESCE(GROUP_CONCAT(DISTINCT pp.method_name ORDER BY pp.id SEPARATOR ' + '), 'Deyn') AS payment_method
+             FROM orders o
+             JOIN users u ON u.id = o.user_id
+             LEFT JOIN customers c ON c.id = o.customer_id
+             LEFT JOIN order_items oi ON oi.order_id = o.id
+             LEFT JOIN pos_payments pp ON pp.order_id = o.id AND pp.status='COMPLETED' AND pp.is_change=0
+             WHERE o.company_id=:company AND o.pos_session_id=:session
+             GROUP BY o.id
+             ORDER BY o.created_at DESC, o.id DESC",
+            $params
+        )->fetchAll();
+
+        // ---- Customer Account (Deyn) activity on this session
+        $deynActivity = $this->db->query(
+            "SELECT type, ROUND(SUM(amount),2) AS amount, COUNT(*) AS entries
+             FROM pos_credit_ledger
+             WHERE company_id=:company AND session_id=:session
+             GROUP BY type",
+            $params
+        )->fetchAll();
+        $deynSales = 0.0; $deynPayments = 0.0; $deynReversals = 0.0;
+        foreach ($deynActivity as $d) {
+            $amt = (float)$d['amount'];
+            if     ($d['type'] === 'DEYN_SALE')             $deynSales     = $amt;
+            elseif ($d['type'] === 'DEYN_PAYMENT')          $deynPayments  = abs($amt);
+            elseif ($d['type'] === 'DEYN_REFUND_REVERSAL') $deynReversals = abs($amt);
+        }
+
+        return [
+            'session'          => $session,
+            'is_open'          => ($session['state'] ?? '') === 'OPENED',
+            'sales'            => [
+                'orders'         => (int)$sales['orders'],
+                'sale_orders'    => (int)$sales['sale_orders'],
+                'refund_orders'  => (int)$sales['refund_orders'],
+                'gross_sales'    => round((float)$sales['gross_sales'], 2),
+                'refunds'        => round($refundAmount, 2),
+                'net_sales'      => round((float)$sales['net_sales'], 2),
+                'average_order'  => round((float)$sales['average_order'], 2),
+            ],
+            'payment_methods'  => $methods,
+            'cash_reconciliation' => [
+                'opening_cash'   => round((float)$session['opening_cash'], 2),
+                'cash_payments'  => round($cashPayments, 2),
+                'cash_in'        => $cashIn,
+                'cash_out'       => $cashOut,
+                'expected_cash'  => $expected,
+                'counted_cash'   => $session['counted_cash'] === null ? null : round((float)$session['counted_cash'], 2),
+                'difference'     => $session['difference_amount'] === null ? null : round((float)$session['difference_amount'], 2),
+            ],
+            'cash_movements'   => ['in' => $cashIn, 'out' => $cashOut, 'items' => $movementList],
+            'employees'        => $employees,
+            'orders_list'      => $orders,
+            'customer_account' => [
+                'sales'            => $deynSales,
+                'collections'      => $deynPayments,
+                'refund_reversals' => $deynReversals,
+            ],
+            // Back-compat top-level fields consumed by older frontend paths.
+            'expected_cash'    => $expected,
+            'orders'           => (int)$sales['orders'],
+            'net_sales'        => round((float)$sales['net_sales'], 2),
+        ];
     }
 
     public function cashMovement(int $sessionId,array $data): array

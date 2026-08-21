@@ -4343,74 +4343,248 @@ function renderPOSReportSales() {
     </div>`;
 }
 
+// P5 — CSV export for a session summary. Rows mirror the on-screen sections
+// so exported totals match the report exactly (Rule #14).
+function exportSessionReportCSV(sum) {
+  if (!sum || !sum.session) return;
+  const s = sum.session;
+  const sales = sum.sales || {};
+  const cr = sum.cash_reconciliation || {};
+  const rows = [];
+  const q = v => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+  const line = (...cells) => rows.push(cells.map(q).join(','));
+  line('Session', `#${s.id}`);
+  line('State', s.state);
+  line('Register', s.config_name);
+  line('Branch', s.branch_name);
+  line('Opened By', s.opened_by_name);
+  line('Opened At', s.opened_at);
+  line('Closed By', s.closed_by_name || '');
+  line('Closed At', s.closed_at || '');
+  line('');
+  line('== SALES ==');
+  line('Orders', sales.orders);
+  line('Sale orders', sales.sale_orders);
+  line('Refund orders', sales.refund_orders);
+  line('Gross sales', sales.gross_sales);
+  line('Refunds', sales.refunds);
+  line('Net sales', sales.net_sales);
+  line('Average order', sales.average_order);
+  line('');
+  line('== PAYMENT METHODS ==');
+  line('Method', 'Type', 'Transactions', 'Amount');
+  (sum.payment_methods || []).forEach(m => line(m.method_name, m.method_type, m.transactions, m.amount));
+  line('');
+  line('== CASH RECONCILIATION ==');
+  line('Opening cash', cr.opening_cash);
+  line('+ Cash payments', cr.cash_payments);
+  line('+ Cash in', cr.cash_in);
+  line('- Cash out', cr.cash_out);
+  line('= Expected cash', cr.expected_cash);
+  line('Counted cash', cr.counted_cash);
+  line('Difference', cr.difference);
+  line('');
+  line('== EMPLOYEES ==');
+  line('Employee', 'Orders', 'Gross sales', 'Refunds', 'Net sales');
+  (sum.employees || []).forEach(e => line(e.employee_name, e.orders, e.gross_sales, e.refund_amount, e.net_sales));
+  line('');
+  line('== CASH MOVEMENTS ==');
+  line('Time', 'Type', 'Amount', 'Reason', 'Employee');
+  (sum.cash_movements?.items || []).forEach(m => line(m.created_at, m.movement_type, m.amount, m.reason, m.employee_name));
+  line('');
+  line('== ORDERS ==');
+  line('Reference', 'Date', 'Customer', 'Employee', 'Items', 'Total', 'Payment', 'Status');
+  (sum.orders_list || []).forEach(o => line(o.reference_number, o.created_at, o.customer_name, o.cashier_name, o.items, o.total_amount, o.payment_method, o.refunded_order_id ? 'REFUND' : o.status));
+  const csv = rows.join('\r\n');
+  const blob = new Blob([csv], { type:'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `session-${s.id}-report.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 function renderPOSReportSession() {
-  // Split current OPEN session from CLOSED history (Rule #11 / #17).
+  // Session Report screen — P5.
+  //  - CLOSED sessions: comprehensive final report (Odoo-aligned).
+  //  - OPEN session:    live running totals (Curdun extension), marked as such.
+  // Structure follows Rule #46 / #16 sections: Session Overview → Sales →
+  // Payment Methods → Cash Reconciliation → Employees → Cash Movements → Orders.
   const all = S.posSessions || [];
   const current = S.posSession && S.posSession.state === 'OPENED' ? S.posSession : null;
-  const summary = S.posSessionSummary || {};
   const closed = all.filter(s => s.state === 'CLOSED');
 
-  const currentBlock = current ? `
-    <div class="card" style="padding:20px;margin-bottom:16px;border:2px solid #22C55E">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-        <span class="pill pill-green" style="font-weight:900">Session #${current.id} — OPEN</span>
-        <span style="font-size:12px;color:var(--text-muted)">Running totals</span>
-      </div>
-      <h3 class="chart-title">${esc(current.config_name || S.posConfig?.name || 'Main Register')}</h3>
-      <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px">Opened by <strong>${esc(current.opened_by_name || '—')}</strong> at ${esc(current.opened_at || '—')}</div>
-      <div class="txn-detail-grid">
-        <div class="txn-detail-row"><span>Opening Cash</span><strong>$${Number(current.opening_cash || 0).toFixed(2)}</strong></div>
-        <div class="txn-detail-row"><span>Orders</span><strong>${Number(summary.orders || 0)}</strong></div>
-        <div class="txn-detail-row"><span>Net Sales</span><strong>$${Number(summary.net_sales || 0).toFixed(2)}</strong></div>
-        <div class="txn-detail-row"><span>Cash In</span><strong>$${Number(summary.cash_movements?.in || 0).toFixed(2)}</strong></div>
-        <div class="txn-detail-row"><span>Cash Out</span><strong>$${Number(summary.cash_movements?.out || 0).toFixed(2)}</strong></div>
-        <div class="txn-detail-row"><span>Expected Cash</span><strong>$${Number(summary.expected_cash || 0).toFixed(2)}</strong></div>
-      </div>
-      ${Array.isArray(summary.payment_methods) && summary.payment_methods.length ? `
-        <div style="margin-top:14px">
-          <div style="font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted);font-weight:800;margin-bottom:6px">Payment methods</div>
-          <table class="data-table" style="min-width:400px"><thead><tr><th>Method</th><th>Type</th><th>Transactions</th><th>Amount</th></tr></thead>
-            <tbody>
-              ${summary.payment_methods.map(m => `<tr><td>${esc(m.method_name)}</td><td><span class="pill ${m.method_type==='cash'?'pill-green':m.method_type==='credit'?'pill-gold':'pill-amber'}">${esc(m.method_type)}</span></td><td>${Number(m.transactions || 0)}</td><td style="font-weight:700">$${Number(m.amount || 0).toFixed(2)}</td></tr>`).join('')}
-            </tbody>
-          </table>
-        </div>
-      ` : ''}
-    </div>` : '';
+  // If the user picked a specific historical session, render it in full.
+  // Otherwise show the live OPEN session (if any) plus the closed list.
+  const selectedId = S.posReportSelectedSessionId
+    || (current ? current.id : (closed[0]?.id || null));
+  const summary = (S.posReportSelectedSummary && S.posReportSelectedSummary.session && Number(S.posReportSelectedSummary.session.id) === Number(selectedId))
+    ? S.posReportSelectedSummary
+    : (current && Number(selectedId) === Number(current.id) ? (S.posSessionSummary || {}) : null);
 
-  const closedBlock = closed.length === 0
-    ? (current
-        ? `<div style="text-align:center;padding:40px 20px;color:var(--text-muted);font-size:13px">No closed register sessions yet.</div>`
-        : `<div style="text-align:center;padding:60px 20px;color:var(--text-muted)"><div style="font-size:48px;margin-bottom:12px">📋</div><div style="font-size:16px;font-weight:700">No register sessions have been recorded yet.</div><div style="margin-top:8px;font-size:13px">Open the register from the Sessions screen to start.</div></div>`)
-    : `<div class="pos-table-wrap"><table class="pos-table">
-        <thead><tr><th>Session #</th><th>Register</th><th>Opened by</th><th>Closed by</th><th>Opened</th><th>Closed</th><th>Opening</th><th>Expected</th><th>Counted</th><th>Difference</th></tr></thead>
-        <tbody>
-          ${closed.map(s => {
-            const diff = Number(s.difference_amount || 0);
-            return `<tr>
-              <td style="font-family:var(--font-mono);font-weight:800">#${s.id}</td>
-              <td>${esc(s.config_name || '—')}</td>
-              <td>${esc(s.opened_by_name || '—')}</td>
-              <td>${esc(s.closed_by_name || '—')}</td>
-              <td>${esc(s.opened_at || '—')}</td>
-              <td>${esc(s.closed_at || '—')}</td>
-              <td>$${Number(s.opening_cash || 0).toFixed(2)}</td>
-              <td>$${Number(s.expected_cash || 0).toFixed(2)}</td>
-              <td>${s.counted_cash == null ? '—' : `$${Number(s.counted_cash).toFixed(2)}`}</td>
-              <td style="color:${diff >= 0 ? '#22C55E' : '#B91C1C'};font-weight:800">${diff >= 0 ? '+' : ''}$${diff.toFixed(2)}</td>
-            </tr>`;
-          }).join('')}
-        </tbody>
-      </table></div>`;
+  const money = n => `$${Number(n || 0).toFixed(2)}`;
+  const selectHtml = closed.length + (current ? 1 : 0) === 0 ? '' : `
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px">
+      <label style="font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:800;color:var(--text-muted)">Session</label>
+      <select id="report-session-select" class="form-select" style="max-width:320px">
+        ${current ? `<option value="${current.id}" ${Number(selectedId)===Number(current.id)?'selected':''}>#${current.id} — OPEN (live)</option>` : ''}
+        ${closed.map(s => `<option value="${s.id}" ${Number(selectedId)===Number(s.id)?'selected':''}>#${s.id} — CLOSED · ${esc(s.opened_at || '')} · ${esc(s.opened_by_name || '')}</option>`).join('')}
+      </select>
+      <button class="btn btn-outline btn-sm" id="btn-report-export-csv">Export CSV</button>
+    </div>`;
+
+  // -------- render helper for one session summary --------
+  const renderReport = (data) => {
+    if (!data || !data.session) return `<div style="text-align:center;padding:40px;color:var(--text-muted)">Loading session…</div>`;
+    const s = data.session;
+    const isOpen = !!data.is_open;
+    const cr = data.cash_reconciliation || {};
+    const sales = data.sales || {};
+    const ca = data.customer_account || {};
+    const configuredMethods = Object.keys(S.storeSettings?.payments || {});
+    const methodMap = new Map((data.payment_methods || []).map(m => [String(m.method_name).toLowerCase(), m]));
+    // Combine configured methods + observed methods so a configured method
+    // with no rows displays $0 (Rule #3 dynamic).
+    const rowsMethod = Array.from(new Set([...(data.payment_methods || []).map(m => m.method_name), ...configuredMethods]));
+
+    return `
+      <!-- SESSION OVERVIEW -->
+      <div class="card" style="padding:20px;margin-bottom:16px;border-left:6px solid ${isOpen ? '#22C55E' : 'var(--purple-800)'}">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+          <span class="pill ${isOpen?'pill-green':'pill-gold'}" style="font-weight:900">Session #${s.id} — ${isOpen ? 'OPEN' : 'CLOSED'}</span>
+          ${isOpen ? `<span style="font-size:11px;color:var(--amber);font-weight:700">🟢 Live — figures update until the register is closed (Curdun extension)</span>` : ''}
+        </div>
+        <h3 class="chart-title" style="margin-top:4px">${esc(s.config_name || 'Main Register')}</h3>
+        <div class="txn-detail-grid" style="margin-top:12px">
+          <div class="txn-detail-row"><span>Store / Branch</span><strong>${esc(s.branch_name || '—')}</strong></div>
+          <div class="txn-detail-row"><span>Opened By</span><strong>${esc(s.opened_by_name || '—')}</strong></div>
+          <div class="txn-detail-row"><span>Opened At</span><strong>${esc(s.opened_at || '—')}</strong></div>
+          <div class="txn-detail-row"><span>Closed By</span><strong>${esc(s.closed_by_name || (isOpen ? '—' : ''))}</strong></div>
+          <div class="txn-detail-row"><span>Closed At</span><strong>${esc(s.closed_at || (isOpen ? '—' : ''))}</strong></div>
+          <div class="txn-detail-row"><span>Opening Note</span><strong>${esc(s.opening_note || '—')}</strong></div>
+        </div>
+      </div>
+
+      <!-- SALES -->
+      <div class="kpi-grid" style="margin-bottom:16px">
+        <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Net Sales</div><div class="kpi-value">${money(sales.net_sales)}</div><div class="kpi-trend" style="color:#EFEAFB">${sales.orders} orders</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Gross Sales</div><div class="kpi-value">${money(sales.gross_sales)}</div><div class="kpi-trend">${sales.sale_orders || 0} sale orders</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Refunds</div><div class="kpi-value trend-warn">${money(sales.refunds)}</div><div class="kpi-trend">${sales.refund_orders || 0} refund orders</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Average Order</div><div class="kpi-value">${money(sales.average_order)}</div><div class="kpi-trend">Excluding refunds</div></div>
+      </div>
+
+      <!-- PAYMENT METHODS -->
+      <div class="data-section" style="margin-bottom:16px">
+        <div class="section-header-bar"><h3 class="chart-title">Payment Methods</h3></div>
+        <div class="overflow-x-auto"><table class="data-table" style="min-width:520px">
+          <thead><tr><th>Method</th><th>Type</th><th>Transactions</th><th>Amount</th></tr></thead>
+          <tbody>
+            ${rowsMethod.map(name => {
+              const m = methodMap.get(String(name).toLowerCase()) || { method_name:name, method_type:posMethodType(name), amount:0, transactions:0 };
+              return `<tr><td style="font-weight:700">${esc(m.method_name)}</td><td><span class="pill ${m.method_type==='cash'?'pill-green':m.method_type==='credit'?'pill-gold':'pill-amber'}">${esc(m.method_type)}</span></td><td>${Number(m.transactions || 0)}</td><td style="font-weight:800">${money(m.amount)}</td></tr>`;
+            }).join('')}
+          </tbody>
+        </table></div>
+      </div>
+
+      <!-- CASH RECONCILIATION -->
+      <div class="card" style="padding:20px;margin-bottom:16px">
+        <h3 class="chart-title" style="margin-bottom:12px">Cash Reconciliation</h3>
+        <div class="txn-detail-grid">
+          <div class="txn-detail-row"><span>Opening Cash</span><strong>${money(cr.opening_cash)}</strong></div>
+          <div class="txn-detail-row"><span>+ Cash Payments</span><strong>${money(cr.cash_payments)}</strong></div>
+          <div class="txn-detail-row"><span>+ Cash In</span><strong>${money(cr.cash_in)}</strong></div>
+          <div class="txn-detail-row"><span>− Cash Out</span><strong>${money(cr.cash_out)}</strong></div>
+          <div class="txn-detail-row" style="border-top:1px solid var(--border);padding-top:8px;margin-top:6px"><span style="font-weight:900">= Expected Cash</span><strong style="color:var(--purple-800);font-size:16px">${money(cr.expected_cash)}</strong></div>
+          ${!isOpen ? `
+            <div class="txn-detail-row"><span>Counted Cash</span><strong>${cr.counted_cash === null ? '—' : money(cr.counted_cash)}</strong></div>
+            <div class="txn-detail-row"><span>Difference</span><strong style="color:${Number(cr.difference||0)<0?'#B91C1C':'#22C55E'};font-weight:900">${cr.difference === null ? '—' : (Number(cr.difference)>=0?'+':'') + money(cr.difference).replace('$','') + ' USD'}</strong></div>
+            <div class="txn-detail-row"><span>Closing Note</span><strong>${esc(s.closing_note || '—')}</strong></div>
+          ` : `<div class="txn-detail-row"><span>Cash Reconciliation</span><strong style="color:var(--amber)">Available after closing</strong></div>`}
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:10px">Uses the actual Cash <em>amount</em> per payment line (never tendered cash — that would inflate Expected Cash).</div>
+      </div>
+
+      <!-- EMPLOYEES WHO WORKED THE SESSION -->
+      <div class="data-section" style="margin-bottom:16px">
+        <div class="section-header-bar"><h3 class="chart-title">Employees</h3><span class="ml-auto" style="font-size:11px;color:var(--text-muted)">Derived from validated orders</span></div>
+        ${(data.employees || []).length === 0
+          ? `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:13px">No employees transacted on this session yet.</div>`
+          : `<div class="overflow-x-auto"><table class="data-table" style="min-width:600px">
+              <thead><tr><th>Employee</th><th>Orders</th><th>Gross Sales</th><th>Refunds</th><th>Net Sales</th></tr></thead>
+              <tbody>
+                ${data.employees.map(e => `<tr><td style="font-weight:700">${esc(e.employee_name)}</td><td>${Number(e.orders)}</td><td>${money(e.gross_sales)}</td><td class="trend-warn">${money(e.refund_amount)}</td><td style="font-weight:800">${money(e.net_sales)}</td></tr>`).join('')}
+              </tbody>
+            </table></div>`}
+      </div>
+
+      <!-- CASH MOVEMENTS -->
+      <div class="data-section" style="margin-bottom:16px">
+        <div class="section-header-bar"><h3 class="chart-title">Cash Movements</h3></div>
+        ${(data.cash_movements?.items || []).length === 0
+          ? `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:13px">No cash in/out on this session.</div>`
+          : `<div class="overflow-x-auto"><table class="data-table" style="min-width:600px">
+              <thead><tr><th>Time</th><th>Type</th><th>Amount</th><th>Reason</th><th>Employee</th></tr></thead>
+              <tbody>
+                ${data.cash_movements.items.map(m => `<tr><td>${esc(m.created_at)}</td><td><span class="pill ${m.movement_type==='IN'?'pill-green':'pill-red'}">${m.movement_type}</span></td><td style="font-weight:800">${money(m.amount)}</td><td>${esc(m.reason)}</td><td>${esc(m.employee_name)}</td></tr>`).join('')}
+              </tbody>
+            </table></div>`}
+      </div>
+
+      <!-- CUSTOMER ACCOUNT / DEYN activity -->
+      ${(ca.sales || ca.collections || ca.refund_reversals) ? `
+        <div class="card" style="padding:16px;margin-bottom:16px">
+          <h3 class="chart-title" style="margin-bottom:10px">Customer Account (Deyn)</h3>
+          <div class="txn-detail-grid">
+            <div class="txn-detail-row"><span>Customer-account sales</span><strong>${money(ca.sales)}</strong></div>
+            <div class="txn-detail-row"><span>Customer-account collections</span><strong>${money(ca.collections)}</strong></div>
+            <div class="txn-detail-row"><span>Refund reversals</span><strong>${money(ca.refund_reversals)}</strong></div>
+          </div>
+        </div>` : ''}
+
+      <!-- ORDERS -->
+      <div class="data-section">
+        <div class="section-header-bar"><h3 class="chart-title">Orders</h3><span class="ml-auto" style="font-size:11px;color:var(--text-muted)">${(data.orders_list || []).length} order${(data.orders_list||[]).length===1?'':'s'}</span></div>
+        ${(data.orders_list || []).length === 0
+          ? `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:13px">No orders on this session yet.</div>`
+          : `<div class="overflow-x-auto"><table class="data-table" style="min-width:900px">
+              <thead><tr><th>Ref</th><th>Date</th><th>Customer</th><th>Employee</th><th>Items</th><th>Total</th><th>Payment</th><th>Status</th></tr></thead>
+              <tbody>
+                ${data.orders_list.map(o => `<tr>
+                  <td style="font-family:var(--font-mono);font-weight:700">${esc(o.reference_number)}</td>
+                  <td>${esc(o.created_at)}</td>
+                  <td>${esc(o.customer_name)}</td>
+                  <td>${esc(o.cashier_name)}</td>
+                  <td>${Number(o.items)}</td>
+                  <td style="font-weight:800;color:${Number(o.total_amount)<0?'#B91C1C':'inherit'}">${money(o.total_amount)}</td>
+                  <td>${esc(o.payment_method)}</td>
+                  <td><span class="pill ${o.refunded_order_id?'pill-red':o.status==='COMPLETED'?'pill-green':'pill-gold'}">${esc(o.refunded_order_id?'REFUND':o.status)}</span></td>
+                </tr>`).join('')}
+              </tbody>
+            </table></div>`}
+      </div>`;
+  };
+
+  const emptyBlock = `
+    <div style="text-align:center;padding:60px 20px;color:var(--text-muted)">
+      <div style="font-size:48px;margin-bottom:12px">📋</div>
+      <div style="font-size:16px;font-weight:700">No register sessions have been recorded yet.</div>
+      <div style="margin-top:8px;font-size:13px">Open the register from the Sessions screen to start.</div>
+    </div>`;
+
+  // Report body: either the resolved summary, a loading state, or empty.
+  const body = closed.length + (current ? 1 : 0) === 0
+    ? emptyBlock
+    : (summary ? renderReport(summary) : `<div style="text-align:center;padding:40px;color:var(--text-muted)">Loading session #${selectedId}…</div>`);
 
   return `
     <div class="pharm-topbar"><div class="pharm-tab-label">Session Report</div></div>
     <div class="pharm-content">
-      ${currentBlock}
-      <div class="data-section">
-        <div class="section-header-bar"><h3 class="chart-title">Closed Sessions</h3><span class="ml-auto" style="font-size:11px;color:var(--text-muted)">${closed.length} closed</span></div>
-        ${closedBlock}
-      </div>
+      ${selectHtml}
+      ${body}
     </div>`;
 }
 
@@ -5905,6 +6079,34 @@ function wirePOSLoginEvents() {
 }
 
 function wirePOSEvents() {
+  // Session Report — session selector + CSV export (P5).
+  const reportSel = document.getElementById('report-session-select');
+  if (reportSel) {
+    reportSel.addEventListener('change', async () => {
+      const id = parseInt(reportSel.value, 10);
+      S.posReportSelectedSessionId = id;
+      const current = S.posSession && S.posSession.state === 'OPENED' ? S.posSession : null;
+      if (current && id === Number(current.id)) {
+        // Live session — reuse the running summary; keep it fresh.
+        await refreshPOSSessionState();
+      } else {
+        try {
+          S.posReportSelectedSummary = await posApiFetch(`/pos/sessions/${id}/summary`);
+        } catch (e) {
+          alert(e.message || 'Could not load session report.');
+        }
+      }
+      render();
+    });
+  }
+  document.getElementById('btn-report-export-csv')?.addEventListener('click', () => {
+    const sum = S.posReportSelectedSummary && S.posReportSelectedSummary.session && Number(S.posReportSelectedSummary.session.id) === Number(S.posReportSelectedSessionId)
+      ? S.posReportSelectedSummary
+      : (S.posSession && (S.posReportSelectedSessionId ? Number(S.posReportSelectedSessionId) === Number(S.posSession.id) : true) ? S.posSessionSummary : null);
+    if (!sum) { alert('Select a session first.'); return; }
+    exportSessionReportCSV(sum);
+  });
+
   // Opening Control (Odoo-style modal, replaces prompt()).
   document.getElementById('btn-checkout-open-register')?.addEventListener('click', () => openRegisterModal('open'));
   document.getElementById('btn-session-open')?.addEventListener('click',           () => openRegisterModal('open'));

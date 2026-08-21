@@ -55,7 +55,25 @@ function mapTransaction(order) {
     method: order.payment_method || 'Deyn', time: order.created_at ? new Date(order.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—',
     date: order.order_date || '', status: order.status || 'COMPLETED', isRefund:Boolean(Number(order.refunded_order_id)),
     posState:order.pos_state || null, amountPaid:Number(order.amount_paid || 0), change:Number(order.amount_return || 0),
+    // P6 — computed original-order refund status ('' | PARTIALLY_REFUNDED | REFUNDED).
+    // The row action button uses this to decide whether to show "Refund",
+    // "Refund more", or nothing.
+    refund_status: order.refund_status || null,
+    pos_session_id: order.pos_session_id ? Number(order.pos_session_id) : null,
   };
+}
+
+// P6 — Fetch the refundable-shape (original lines + refundable qty + prior
+// refunds + original payments) for the Odoo-style refund modal.
+async function posLoadRefundable(orderId) {
+  return posApiFetch(`/pos/orders/${orderId}/refundable`);
+}
+// Post the refund with a payments[] split.
+async function posSubmitRefund(orderId, payload) {
+  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body:payload });
+  await refreshPOSSessionState();
+  await posBootstrap();
+  return row;
 }
 
 function mapStaff(user) {

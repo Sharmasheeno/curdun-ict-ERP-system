@@ -94,6 +94,7 @@ $router->group('/api/v1', function($router) {
     // Odoo BASIC — open register, refunds, cash movements.
     $router->post   ('/pos/sessions/open',                  [PosController::class, 'openSession'],    [$NEEDS_CASHIER(), $CAP('pos.register_open')]);
     $router->post   ('/pos/transactions/{id}/void',         [PosController::class, 'voidTransaction'],[$NEEDS_CASHIER(), $CAP('pos.refund')]);
+    $router->get    ('/pos/orders/{id}/refundable',         [PosController::class, 'refundable']);
     $router->post   ('/pos/orders/{id}/refund',             [PosController::class, 'refundOrder'],    [$NEEDS_CASHIER(), $CAP('pos.refund')]);
     $router->post   ('/pos/sessions/{id}/cash-movements',   [PosController::class, 'cashMovement'],   [$NEEDS_CASHIER(), $CAP('pos.cash_in')]);
 

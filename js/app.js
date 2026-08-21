@@ -3535,6 +3535,13 @@ function renderPOSRouter() {
     wrap.appendChild(modalHost);
     setTimeout(() => wireRegisterModal(), 0);
   }
+  // P6 — Refund modal overlay
+  if (S.posRefundModal) {
+    const refundHost = document.createElement('div');
+    refundHost.innerHTML = renderPOSRefundModal();
+    wrap.appendChild(refundHost);
+    setTimeout(() => wireRefundModal(), 0);
+  }
   return wrap;
 }
 
@@ -5067,12 +5074,14 @@ function renderMobileMoneyModal() {
 
 function renderPOSReceipt() {
   const r = S.posLastReceipt;
+  const isRefund = !!r.isRefund;
   return `
     <div class="pos-receipt-overlay">
       <div class="pos-receipt-card">
-        <div class="pos-receipt-header">
-          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#22C55E" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 12l3 3 5-5"/></svg>
-          <h3 style="font-size:18px;font-weight:900;color:var(--text-primary);margin-top:8px">Payment successful!</h3>
+        <div class="pos-receipt-header" style="${isRefund ? 'background:#FEF2F2;border-bottom:2px solid #DC2626' : ''}">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="${isRefund ? '#DC2626' : '#22C55E'}" stroke-width="2">${isRefund ? '<path d="M9 14l-5-5 5-5"/><path d="M20 19v-6a5 5 0 0 0-5-5H4"/>' : '<circle cx="12" cy="12" r="10"/><path d="M8 12l3 3 5-5"/>'}</svg>
+          <h3 style="font-size:18px;font-weight:900;color:${isRefund ? '#DC2626' : 'var(--text-primary)'};margin-top:8px">${isRefund ? 'Refund validated' : 'Payment successful!'}</h3>
+          ${isRefund && r.originalOrder ? `<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Refund of order <strong>${esc(r.originalOrder.reference_number)}</strong></div>` : ''}
         </div>
         <div class="pos-receipt-body">
           <div style="text-align:center;padding:16px 0;border-bottom:1px dashed var(--border)">
@@ -5460,7 +5469,8 @@ function renderPOSTransactions() {
                 <td class="col-right" onclick="event.stopPropagation()">
                   <div class="crud-actions">
                     <button class="crud-btn" data-view-txn-btn="${t.id}" title="View details" style="color:var(--purple-800)">👁️</button>
-                    ${['Admin','Store Manager'].includes(S.posActiveUser?.role) && t.status==='COMPLETED' && !t.isRefund ? `<button class="crud-btn crud-btn-delete" data-delete-txn="${t.id}" title="Refund">🗑️</button>` : ''}
+                    ${posCan('pos.refund') && t.status==='COMPLETED' && !t.isRefund && t.refund_status !== 'REFUNDED' ? `<button class="btn btn-outline btn-sm" data-refund-txn="${t.id}" title="Refund lines from this sale" style="padding:4px 10px;font-size:12px"><span aria-hidden="true">↩</span> Refund${t.refund_status==='PARTIALLY_REFUNDED'?' more':''}</button>` : ''}
+                    ${t.refund_status ? `<span class="pill ${t.refund_status==='REFUNDED'?'pill-red':'pill-gold'}" title="${t.refund_status}">${t.refund_status==='REFUNDED'?'Refunded':'Partial'}</span>` : ''}
                   </div>
                 </td>
               </tr>
@@ -5470,6 +5480,232 @@ function renderPOSTransactions() {
       </div>
     </div>
   `;
+}
+
+// ============================================================
+// P6 — REFUND MODAL (Odoo-style workflow)
+// Opens for the selected original order:
+//   Session A → Order line list with per-line refund-qty picker
+//              → Payment composer (dynamic methods from settings)
+//              → Validate → refund receipt.
+// Backend independently validates every line + payment total. Frontend is
+// UX only. State lives in S.posRefundModal so it survives re-renders.
+// ============================================================
+function renderPOSRefundModal() {
+  const m = S.posRefundModal;
+  if (!m) return '';
+  if (m.loading) return `
+    <div class="crud-overlay"><div class="crud-modal" style="max-width:520px;text-align:center;padding:40px">
+      Loading refundable summary for order #${m.orderId}…
+    </div></div>`;
+  if (m.error) return `
+    <div class="crud-overlay"><div class="crud-modal" style="max-width:520px;padding:24px">
+      <div class="crud-error" style="margin-bottom:16px">${esc(m.error)}</div>
+      <button class="btn btn-outline" id="btn-refund-close">Close</button>
+    </div></div>`;
+
+  const data = m.data;
+  const order = data.order;
+  const lines = m.lines || [];
+  const total = lines.reduce((s,l) => s + (Number(l.refund_qty || 0) * Number(l.item.unit_price || 0) * (1 + Number(l.item.tax_rate || 0)/100) * (1 - Number(l.item.discount_percent || 0)/100)), 0);
+  // Use the more accurate ratio calculation the backend does — line total × ratio
+  const totalPrecise = lines.reduce((s, l) => {
+    const orig = Number(l.item.original_qty || 0);
+    if (orig <= 0) return s;
+    return s + Number(l.item.total || 0) * (Number(l.refund_qty || 0) / orig);
+  }, 0);
+  const refundTotal = Number(totalPrecise.toFixed(2));
+
+  const payments = m.payments || [];
+  const paid = payments.reduce((s, p) => s + Number(p.amount || 0), 0);
+  const remaining = Number((refundTotal - paid).toFixed(2));
+  const methods = posConfiguredMethods();
+  const money = n => `$${Number(n || 0).toFixed(2)}`;
+
+  const validate = (() => {
+    if (refundTotal <= 0) return { ok:false, reason:'Select at least one item and quantity to refund' };
+    for (const l of lines) {
+      const q = Number(l.refund_qty || 0);
+      if (q < 0) return { ok:false, reason:`${l.item.product_name}: quantity cannot be negative` };
+      if (q > Number(l.item.refundable_qty)) return { ok:false, reason:`${l.item.product_name}: over the refundable qty` };
+    }
+    if (payments.length === 0) return { ok:false, reason:'Add at least one refund payment method' };
+    if (Math.abs(remaining) > 0.001) return { ok:false, reason:`Refund payments must total ${money(refundTotal)}` };
+    return { ok:true };
+  })();
+
+  return `
+    <div class="crud-overlay">
+      <div class="crud-modal" style="max-width:760px">
+        <div class="crud-modal-header" style="background:#FEF2F2;border-bottom:1px solid #FCA5A5">
+          <h3><span aria-hidden="true">↩</span> Refund — ${esc(order.reference_number)}</h3>
+          <button class="crud-close-btn" id="btn-refund-close">×</button>
+        </div>
+        <div class="crud-modal-body">
+          <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px;font-size:12px;color:var(--text-muted)">
+            <span>Original cashier: <strong>${esc(order.cashier_name)}</strong></span>
+            <span>Customer: <strong>${esc(order.customer_name || 'Walk-in')}</strong></span>
+            <span>Original total: <strong>${money(order.total_amount)}</strong></span>
+            ${data.prior_refunds?.length ? `<span>Prior refunds: <strong>${data.prior_refunds.length}</strong></span>` : ''}
+          </div>
+
+          <!-- LINE PICKER -->
+          <div class="data-section" style="margin-bottom:14px">
+            <div class="section-header-bar"><h3 class="chart-title">Select items to refund</h3></div>
+            <div class="overflow-x-auto"><table class="data-table" style="min-width:520px">
+              <thead><tr><th>Product</th><th>Unit</th><th>Refundable</th><th>Refund qty</th><th>Line total</th></tr></thead>
+              <tbody>
+                ${lines.map((l, i) => {
+                  const perLine = Number(l.item.original_qty || 0) > 0
+                    ? Number(l.item.total || 0) * (Number(l.refund_qty || 0) / Number(l.item.original_qty))
+                    : 0;
+                  return `<tr>
+                    <td style="font-weight:700">${esc(l.item.product_name)}</td>
+                    <td style="font-family:var(--font-mono)">${money(l.item.unit_price)}</td>
+                    <td style="color:var(--text-muted)">${Number(l.item.refundable_qty)} of ${Number(l.item.original_qty)}</td>
+                    <td><input class="form-input pos-refund-qty" data-line-idx="${i}" type="number" min="0" step="1" max="${l.item.refundable_qty}" value="${l.refund_qty}" style="width:80px" ${Number(l.item.refundable_qty)<=0?'disabled':''}/></td>
+                    <td style="font-weight:800">${money(perLine)}</td>
+                  </tr>`;
+                }).join('')}
+              </tbody>
+            </table></div>
+            <div style="display:flex;justify-content:space-between;padding:12px 14px;background:var(--gray-50);border-radius:8px;margin-top:8px">
+              <span style="font-weight:800">Refund total</span>
+              <span style="font-weight:900;color:#B91C1C;font-size:16px">${money(refundTotal)}</span>
+            </div>
+          </div>
+
+          <!-- REFUND PAYMENT COMPOSER (mirror of the checkout composer) -->
+          <div class="data-section" style="margin-bottom:14px">
+            <div class="section-header-bar"><h3 class="chart-title">Refund method</h3></div>
+            <div style="display:flex;justify-content:space-between;gap:14px;padding:8px 0;font-size:12px;letter-spacing:1px;text-transform:uppercase;font-weight:800">
+              <span>Total<br><span style="font-size:16px;color:#B91C1C">${money(refundTotal)}</span></span>
+              <span>Allocated<br><span style="font-size:16px;color:${paid>=refundTotal?'#22C55E':'inherit'}">${money(paid)}</span></span>
+              <span>Remaining<br><span style="font-size:16px;color:${remaining>0?'#F59E0B':'#22C55E'}">${money(remaining)}</span></span>
+            </div>
+            ${payments.map((p, i) => `
+              <div style="display:flex;align-items:center;gap:8px;padding:6px;background:var(--gray-50);border-radius:6px;margin-bottom:6px">
+                <span style="font-weight:800;color:var(--purple-800);flex:0 0 100px">${esc(p.method)}</span>
+                <span style="color:var(--text-muted)">$</span>
+                <input class="form-input pos-refund-pay-amount" data-pay-idx="${i}" type="number" step="0.01" min="0" value="${Number(p.amount || 0).toFixed(2)}" style="width:100px"/>
+                <button class="btn btn-outline btn-sm pos-refund-pay-remove" data-pay-idx="${i}" style="margin-left:auto;color:#EF4444">Remove</button>
+              </div>
+            `).join('')}
+            <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+              ${methods.map(mm => `<button class="btn btn-outline btn-sm pos-refund-add-method" data-add-method="${esc(mm.name)}" ${refundTotal<=0||remaining<=0.001?'disabled':''}>+ ${esc(mm.name)}</button>`).join('')}
+            </div>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:8px">
+              Cash refund reduces this session's Expected Cash by exactly this amount. Deyn reversals reduce the customer's outstanding balance.
+              ${data.original_payments?.length ? `Original: ${data.original_payments.map(p => `${p.method_name} $${p.amount}`).join(' + ')}` : ''}
+            </div>
+          </div>
+
+          ${!validate.ok ? `<div style="color:#F59E0B;font-size:12px;margin-top:8px;text-align:center">${esc(validate.reason)}</div>` : ''}
+        </div>
+        <div class="crud-modal-footer">
+          <button class="btn btn-danger" id="btn-refund-submit" ${validate.ok?'':'disabled'}>Validate refund</button>
+          <button class="btn btn-outline" id="btn-refund-close">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function openRefundModal(orderId) {
+  S.posRefundModal = { orderId, loading:true, error:null };
+  render();
+  try {
+    const data = await posLoadRefundable(orderId);
+    S.posRefundModal = {
+      orderId,
+      loading: false,
+      error: null,
+      data,
+      lines: (data.items || []).map(item => ({
+        item,
+        // Default: refund the max refundable qty of the first line, 0 for the rest.
+        refund_qty: 0,
+      })),
+      payments: [],
+    };
+  } catch (e) {
+    S.posRefundModal = { orderId, loading:false, error: e.message };
+  }
+  render();
+}
+
+function wireRefundModal() {
+  document.getElementById('btn-refund-close')?.addEventListener('click', () => { S.posRefundModal = null; render(); });
+  document.querySelectorAll('.pos-refund-qty').forEach(inp => {
+    inp.addEventListener('input', () => {
+      const i = parseInt(inp.dataset.lineIdx);
+      const v = Math.max(0, Number(inp.value) || 0);
+      const max = Number(S.posRefundModal.lines[i].item.refundable_qty || 0);
+      S.posRefundModal.lines[i].refund_qty = Math.min(v, max);
+      render();
+    });
+  });
+  document.querySelectorAll('.pos-refund-add-method').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (btn.disabled) return;
+      const name = btn.dataset.addMethod;
+      const lines = S.posRefundModal.lines;
+      const totalPrecise = lines.reduce((s, l) => {
+        const o = Number(l.item.original_qty || 0);
+        return o > 0 ? s + Number(l.item.total || 0) * (Number(l.refund_qty || 0) / o) : s;
+      }, 0);
+      const refundTotal = Number(totalPrecise.toFixed(2));
+      const already = S.posRefundModal.payments.reduce((s,p) => s + Number(p.amount || 0), 0);
+      const remaining = Number((refundTotal - already).toFixed(2));
+      S.posRefundModal.payments.push({ method: name, amount: Math.max(0, remaining) });
+      render();
+    });
+  });
+  document.querySelectorAll('.pos-refund-pay-amount').forEach(inp => {
+    inp.addEventListener('input', () => {
+      const i = parseInt(inp.dataset.payIdx);
+      S.posRefundModal.payments[i].amount = Math.max(0, Number(inp.value) || 0);
+      render();
+    });
+  });
+  document.querySelectorAll('.pos-refund-pay-remove').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const i = parseInt(btn.dataset.payIdx);
+      S.posRefundModal.payments.splice(i, 1);
+      render();
+    });
+  });
+  const submit = document.getElementById('btn-refund-submit');
+  if (submit) submit.addEventListener('click', async () => {
+    if (submit.disabled) return;
+    submit.disabled = true; submit.textContent = 'Validating…';
+    try {
+      const items = S.posRefundModal.lines
+        .filter(l => Number(l.refund_qty) > 0)
+        .map(l => ({ order_item_id: Number(l.item.id), quantity: Number(l.refund_qty) }));
+      const payments = S.posRefundModal.payments.map(p => ({ method: p.method, amount: Number(p.amount) }));
+      const result = await posSubmitRefund(S.posRefundModal.orderId, { items, payments, reason: 'POS refund via Odoo-style workflow' });
+      const modalOrder = S.posRefundModal.data.order;
+      S.posRefundModal = null;
+      S.posLastReceipt = {
+        id: result.reference_number,
+        date: new Date(result.created_at || Date.now()).toLocaleString(),
+        items: [],
+        subtotal: 0,
+        tax: 0,
+        total: Number(result.total_amount || 0),
+        payment_lines: result.payment_lines || [],
+        method: result.payment_method || 'Refund',
+        amountPaid: 0, change: 0,
+        isRefund: true,
+        originalOrder: modalOrder,
+      };
+      S.posReceiptVisible = true;
+      render();
+    } catch (e) {
+      alert(e.message || 'Refund failed.');
+      submit.disabled = false; submit.textContent = 'Validate refund';
+    }
+  });
 }
 
 function renderStaffCredentialResult() {
@@ -6271,10 +6507,24 @@ function wirePOSEvents() {
     });
   });
   document.querySelectorAll('[data-delete-txn]').forEach(btn => {
+    // Retained for any legacy trigger — but the trash-style refund shortcut
+    // is now the explicit ↩ Refund button below. This falls through to the
+    // same confirmation for backwards compat.
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       S.confirmDeleteModal = { type:'transaction', id:btn.dataset.deleteTxn };
       render();
+    });
+  });
+  // P6 — Odoo-style refund workflow. Opens the line/qty picker + payment
+  // composer modal for the selected original order.
+  document.querySelectorAll('[data-refund-txn]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const refId = btn.dataset.refundTxn;
+      const backendId = POS_TRANSACTIONS.find(t => t.id === refId)?._backendId;
+      if (!backendId) { alert('Could not resolve order id.'); return; }
+      await openRefundModal(backendId);
     });
   });
 

@@ -709,9 +709,16 @@ class PosService
 
     private function transactionsData(int $companyId): array
     {
-        return $this->db->query(
-            "SELECT o.id,o.reference_number,o.order_date,o.total_amount,o.status,o.pos_state,o.refunded_order_id,o.amount_paid,o.amount_return,o.created_at,c.name customer_name,u.name cashier_name,
-                    COUNT(DISTINCT oi.id) items_count,COALESCE(GROUP_CONCAT(DISTINCT pp.method_name ORDER BY pp.id SEPARATOR ' + '),MAX(pm.name)) payment_method
+        // Refund status is a computed field per Rule #16 — derived from
+        // authoritative refund data so the UI can hide "Refund" on fully-
+        // refunded orders and badge partial ones.
+        $rows = $this->db->query(
+            "SELECT o.id,o.reference_number,o.order_date,o.total_amount,o.status,o.pos_state,o.refunded_order_id,o.amount_paid,o.amount_return,o.created_at,o.pos_session_id,c.name customer_name,u.name cashier_name,
+                    COUNT(DISTINCT oi.id) items_count,COALESCE(GROUP_CONCAT(DISTINCT pp.method_name ORDER BY pp.id SEPARATOR ' + '),MAX(pm.name)) payment_method,
+                    (SELECT COALESCE(SUM(oi2.quantity),0) FROM order_items oi2 WHERE oi2.order_id=o.id) original_qty_sum,
+                    (SELECT COALESCE(SUM(ABS(ri.quantity)),0) FROM order_items ri JOIN orders ro ON ro.id=ri.order_id
+                     WHERE ro.company_id=o.company_id AND ro.pos_state='done'
+                       AND ri.refunded_order_item_id IN (SELECT id FROM order_items WHERE order_id=o.id)) refunded_qty_sum
              FROM orders o LEFT JOIN customers c ON c.id=o.customer_id LEFT JOIN users u ON u.id=o.user_id
              LEFT JOIN order_items oi ON oi.order_id=o.id LEFT JOIN invoices i ON i.id=o.invoice_id
              LEFT JOIN payments p ON p.invoice_id=i.id AND p.status IN ('COMPLETED','REFUNDED') LEFT JOIN payment_methods pm ON pm.id=p.payment_method_id
@@ -719,6 +726,19 @@ class PosService
              WHERE o.company_id=:company GROUP BY o.id ORDER BY o.created_at DESC LIMIT 200",
             ['company'=>$companyId]
         )->fetchAll();
+        foreach ($rows as &$row) {
+            $row['refund_status'] = null;
+            if ((float)$row['total_amount'] > 0 && empty($row['refunded_order_id'])) {
+                $orig = (float)$row['original_qty_sum'];
+                $ref  = (float)$row['refunded_qty_sum'];
+                if ($orig > 0 && $ref > 0) {
+                    $row['refund_status'] = ($ref + 0.0001 >= $orig) ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
+                }
+            }
+            unset($row['original_qty_sum'], $row['refunded_qty_sum']);
+        }
+        unset($row);
+        return $rows;
     }
 
     public function voidTransaction(int $id, array $data = []): array
@@ -726,6 +746,97 @@ class PosService
         // Refund is BASIC in Odoo — the route middleware already enforces
         // pos.refund. No duplicate ADVANCED gate here.
         return $this->refundOrder($id,['reason'=>$data['reason']??'Full refund by POS employee']);
+    }
+
+    /**
+     * Return refundable-shape info for the Odoo-style refund workflow:
+     *   - original order header + customer + cashier + session
+     *   - each order_item with its original quantity + already-refunded qty
+     *     + refundable_qty (original − already)
+     *   - the original payment breakdown so the refund UI can pre-select
+     *     the same methods
+     *   - the computed refund_status of the original ('' / PARTIALLY_REFUNDED
+     *     / REFUNDED) so callers can hide "Refund" once fully refunded.
+     */
+    public function refundable(int $id): array
+    {
+        [$user, $companyId] = $this->context();
+        $order = $this->db->query(
+            "SELECT o.*, u.name AS cashier_name, c.name AS customer_name,
+                    ps.state AS original_session_state
+             FROM orders o
+             JOIN users u ON u.id = o.user_id
+             LEFT JOIN customers c ON c.id = o.customer_id
+             LEFT JOIN pos_sessions ps ON ps.id = o.pos_session_id
+             WHERE o.id = :id AND o.company_id = :company",
+            ['id'=>$id,'company'=>$companyId]
+        )->fetch();
+        if (!$order) throw new Exception('Order not found.', 404);
+        if (!empty($order['refunded_order_id'])) throw new Exception('This document is itself a refund, not a refundable sale.', 409);
+        if ((float)$order['total_amount'] < 0) throw new Exception('Refund documents cannot be refunded.', 409);
+        if ($order['status'] !== 'COMPLETED') throw new Exception('Only completed sales can be refunded.', 409);
+
+        $items = $this->db->query(
+            "SELECT oi.id, oi.product_id, p.name AS product_name, p.sku,
+                    oi.quantity AS original_qty, oi.unit_price, oi.discount_percent,
+                    oi.tax_rate, oi.tax_amount, oi.total
+             FROM order_items oi
+             JOIN products p ON p.id = oi.product_id
+             WHERE oi.order_id = :id
+             ORDER BY oi.id",
+            ['id'=>$id]
+        )->fetchAll();
+        foreach ($items as &$it) {
+            $refunded = (float)($this->db->query(
+                "SELECT COALESCE(SUM(ABS(ri.quantity)),0)
+                 FROM order_items ri
+                 JOIN orders ro ON ro.id = ri.order_id
+                 WHERE ri.refunded_order_item_id = :item
+                   AND ro.company_id = :company AND ro.pos_state='done'",
+                ['item'=>$it['id'],'company'=>$companyId]
+            )->fetchColumn() ?: 0);
+            $it['refunded_qty']   = round($refunded, 3);
+            $it['refundable_qty'] = round(max(0, (float)$it['original_qty'] - $refunded), 3);
+        }
+        unset($it);
+
+        $payments = $this->db->query(
+            "SELECT method_name, method_type,
+                    ROUND(SUM(amount),2) AS amount, COUNT(*) AS line_count
+             FROM pos_payments
+             WHERE order_id = :id AND company_id = :company
+               AND status='COMPLETED' AND is_change=0
+             GROUP BY method_name, method_type
+             ORDER BY amount DESC",
+            ['id'=>$id,'company'=>$companyId]
+        )->fetchAll();
+
+        $priorRefunds = $this->db->query(
+            "SELECT id, reference_number, total_amount, created_at
+             FROM orders
+             WHERE refunded_order_id = :id AND company_id = :company AND pos_state='done'
+             ORDER BY id",
+            ['id'=>$id,'company'=>$companyId]
+        )->fetchAll();
+
+        return [
+            'order'              => [
+                'id'               => (int)$order['id'],
+                'reference_number' => $order['reference_number'],
+                'customer_id'      => $order['customer_id'] ? (int)$order['customer_id'] : null,
+                'customer_name'    => $order['customer_name'],
+                'cashier_name'     => $order['cashier_name'],
+                'session_id'       => $order['pos_session_id'] ? (int)$order['pos_session_id'] : null,
+                'subtotal'         => (float)$order['subtotal'],
+                'tax_amount'       => (float)$order['tax_amount'],
+                'total_amount'     => (float)$order['total_amount'],
+                'created_at'       => $order['created_at'],
+            ],
+            'items'              => $items,
+            'original_payments'  => $payments,
+            'prior_refunds'      => $priorRefunds,
+            'refund_status'      => $this->computeRefundStatus($companyId, $id),
+        ];
     }
 
     public function refundOrder(int $id,array $data=[]): array
@@ -768,14 +879,79 @@ class PosService
                 $this->db->query("UPDATE products SET current_stock=:stock WHERE id=:id AND company_id=:company",['stock'=>$after,'id'=>$item['product_id'],'company'=>$companyId]);
                 $this->db->query("INSERT INTO stock_movements (product_id,warehouse_id,user_id,reference_type,reference_id,type,quantity,quantity_before,quantity_after,notes) VALUES (:product,:warehouse,:user,'POS_REFUND',:reference,'RETURN',:quantity,:before,:after,:notes)",['product'=>$item['product_id'],'warehouse'=>$order['warehouse_id'],'user'=>$user['id'],'reference'=>$refundId,'quantity'=>$line['quantity'],'before'=>$before,'after'=>$after,'notes'=>$data['reason']??'POS refund']);
             }
-            $originalPayment=$this->db->query("SELECT * FROM pos_payments WHERE order_id=:order AND company_id=:company AND status='COMPLETED' AND is_change=0 ORDER BY amount DESC,id LIMIT 1",['order'=>$id,'company'=>$companyId])->fetch();
-            $legacyDebt=!$originalPayment&&$order['invoice_id']&&(float)($this->db->query("SELECT balance FROM invoices WHERE id=:id",['id'=>$order['invoice_id']])->fetchColumn()?:0)>0;
-            $methodName=(string)($data['payment_method']??($originalPayment['method_name']??($legacyDebt?'Deyn':'Cash')));$payment=$this->paymentMethod($methodName);
-            $this->db->query("INSERT INTO pos_payments (company_id,session_id,order_id,user_id,payment_method_id,method_name,method_type,amount,reference_number,status) VALUES (:company,:session,:order,:user,:method,:name,:type,:amount,:reference,'COMPLETED')",
-                ['company'=>$companyId,'session'=>$session['id'],'order'=>$refundId,'user'=>$user['id'],'method'=>$payment['id'],'name'=>$payment['name'],'type'=>$payment['type'],'amount'=>$total,'reference'=>$reference]);
-            if(strtolower($payment['name'])==='deyn'&&$order['customer_id']){
-                // Ledger row for the refund reversal — signed negative so the
-                // customer's debt drops by the refunded amount.
+            // ---- Refund payment allocation (Rule #7 / #12) ---------------
+            // Accept a full split-refund via data['payments'] = [{method,amount},…].
+            // Backwards-compat: data['payment_method'] still works as single method.
+            // Total across refund payment lines must equal |refund total|.
+            $refundAbs = round(abs($total), 2);
+            $originalPayments = $this->db->query(
+                "SELECT method_name, method_type, ROUND(SUM(amount),2) amount
+                 FROM pos_payments
+                 WHERE order_id=:order AND company_id=:company AND status='COMPLETED' AND is_change=0
+                 GROUP BY method_name, method_type
+                 ORDER BY amount DESC",
+                ['order'=>$id,'company'=>$companyId]
+            )->fetchAll();
+            $legacyDebt = !$originalPayments && $order['invoice_id']
+                && (float)($this->db->query("SELECT balance FROM invoices WHERE id=:id",['id'=>$order['invoice_id']])->fetchColumn() ?: 0) > 0;
+
+            $refundPaymentLines = [];
+            if (!empty($data['payments']) && is_array($data['payments'])) {
+                // Client-provided split refund
+                $sum = 0.0;
+                foreach ($data['payments'] as $p) {
+                    $amt = round((float)($p['amount'] ?? 0), 2);
+                    if ($amt <= 0) throw new Exception('Refund payment amounts must be greater than zero.', 422);
+                    $name = (string)($p['method'] ?? $p['payment_method'] ?? '');
+                    if ($name === '') throw new Exception('Refund payment method is required.', 422);
+                    $pm = $this->paymentMethod($name);
+                    $this->assertPaymentEnabled($companyId, $pm['name']);
+                    $refundPaymentLines[] = ['method'=>$pm, 'amount'=>$amt, 'reference'=>$p['reference'] ?? null];
+                    $sum += $amt;
+                }
+                if (round($sum, 2) + 0.0001 < $refundAbs)  throw new Exception('Refund payment total is less than the refund amount.', 422);
+                if (round($sum, 2) > $refundAbs + 0.0001)  throw new Exception('Refund payment total exceeds the refund amount.', 422);
+            } else {
+                // Single-method (legacy) — default to the largest original
+                // method, falling back to Cash (or Deyn for legacy invoice debt).
+                $methodName = (string)($data['payment_method']
+                    ?? ($originalPayments[0]['method_name'] ?? ($legacyDebt ? 'Deyn' : 'Cash')));
+                $pm = $this->paymentMethod($methodName);
+                $this->assertPaymentEnabled($companyId, $pm['name']);
+                $refundPaymentLines[] = ['method'=>$pm, 'amount'=>$refundAbs, 'reference'=>null];
+            }
+
+            $deynRefundAmount = 0.0;
+            foreach ($refundPaymentLines as $line) {
+                $pm = $line['method'];
+                // pos_payments row (signed negative — this is money leaving
+                // the till). Cash refund reduces Expected Cash by exactly
+                // this amount (Rule #9 / #43).
+                $this->db->query(
+                    "INSERT INTO pos_payments
+                        (company_id, session_id, order_id, user_id, payment_method_id,
+                         method_name, method_type, amount, reference_number, status)
+                     VALUES
+                        (:company, :session, :order, :user, :method,
+                         :name, :type, :amount, :reference, 'COMPLETED')",
+                    [
+                        'company'  => $companyId,
+                        'session'  => $session['id'],
+                        'order'    => $refundId,
+                        'user'     => $user['id'],
+                        'method'   => $pm['id'],
+                        'name'     => $pm['name'],
+                        'type'     => $pm['type'],
+                        'amount'   => -$line['amount'],
+                        'reference'=> $line['reference'] ?? $reference,
+                    ]
+                );
+                if (strtolower($pm['name']) === 'deyn') $deynRefundAmount += $line['amount'];
+            }
+
+            // ---- Deyn / Customer-Account reversal (Rule #11) --------------
+            // Only the Deyn portion of the refund reduces the customer's debt.
+            if ($deynRefundAmount > 0 && $order['customer_id']) {
                 $this->db->query(
                     "INSERT INTO pos_credit_ledger
                         (company_id, branch_id, session_id, customer_id, cashier_id,
@@ -790,18 +966,71 @@ class PosService
                         'customer' => $order['customer_id'],
                         'cashier'  => $user['id'],
                         'order'    => $refundId,
-                        'amount'   => -abs($total),
+                        'amount'   => -abs($deynRefundAmount),
                         'reference'=> $reference,
                         'notes'    => 'Refund reversal of order '.$id,
                     ]
                 );
-                $this->db->query("UPDATE customers SET balance=GREATEST(0,balance+:total) WHERE id=:id AND company_id=:company",['total'=>$total,'id'=>$order['customer_id'],'company'=>$companyId]);
+                $this->db->query(
+                    "UPDATE customers SET balance = GREATEST(0, balance - :amt)
+                     WHERE id=:id AND company_id=:company",
+                    ['amt'=>$deynRefundAmount,'id'=>$order['customer_id'],'company'=>$companyId]
+                );
             }
-            if($order['invoice_id'])$this->createInvoice($companyId,$user,$refundId,$order['customer_id']?(int)$order['customer_id']:null,$refundLines,$subtotal,$tax,$total,false,true);
-            $this->log($user,$companyId,'ORDER_REFUND',$refundId,['original_order_id'=>$id,'reference'=>$reference,'total'=>$total]);$this->db->commit();
+
+            if ($order['invoice_id']) {
+                $this->createInvoice($companyId,$user,$refundId,$order['customer_id']?(int)$order['customer_id']:null,$refundLines,$subtotal,$tax,$total,false,true);
+            }
+            $this->log($user,$companyId,'ORDER_REFUND',$refundId,[
+                'original_order_id' => $id,
+                'reference'         => $reference,
+                'total'             => $total,
+                'payments'          => array_map(fn($l)=>['method'=>$l['method']['name'],'amount'=>$l['amount']], $refundPaymentLines),
+            ]);
+            $this->db->commit();
         } catch(\Throwable $e){if($this->db->getConnection()->inTransaction())$this->db->rollback();throw $e;}
         $this->syncStockAlerts($companyId);
-        return ['id'=>$refundId,'reference_number'=>$reference,'status'=>'COMPLETED','pos_state'=>'done','refunded_order_id'=>$id,'total_amount'=>$total,'payment_method'=>$payment['name'],'created_at'=>date('c')];
+        return [
+            'id'                => $refundId,
+            'reference_number'  => $reference,
+            'status'            => 'COMPLETED',
+            'pos_state'         => 'done',
+            'refunded_order_id' => $id,
+            'total_amount'      => $total,
+            'payment_method'    => implode(' + ', array_map(fn($l)=>$l['method']['name'], $refundPaymentLines)),
+            'payment_lines'     => array_map(fn($l)=>['method'=>$l['method']['name'],'type'=>$l['method']['type'],'amount'=>$l['amount']], $refundPaymentLines),
+            'created_at'        => date('c'),
+            'original_refund_status' => $this->computeRefundStatus($companyId, $id),
+        ];
+    }
+
+    /**
+     * Compute the ORIGINAL order's refund status from authoritative refund
+     * data. Rule #16 — status is a computed view over the linked refunds.
+     * Returns 'REFUNDED', 'PARTIALLY_REFUNDED', or null when nothing yet.
+     */
+    private function computeRefundStatus(int $companyId, int $originalOrderId): ?string
+    {
+        $row = $this->db->query(
+            "SELECT
+                COALESCE(SUM(oi.quantity),0)                            AS total_qty,
+                COALESCE((SELECT SUM(ABS(ri.quantity))
+                          FROM order_items ri
+                          JOIN orders ro ON ro.id = ri.order_id
+                          WHERE ro.company_id = :company
+                            AND ro.pos_state='done'
+                            AND ri.refunded_order_item_id IN
+                                (SELECT id FROM order_items WHERE order_id = :order)
+                        ),0)                                            AS refunded_qty
+             FROM order_items oi
+             WHERE oi.order_id = :order2",
+            ['company'=>$companyId,'order'=>$originalOrderId,'order2'=>$originalOrderId]
+        )->fetch();
+        $totalQty = (float)$row['total_qty'];
+        $refQty   = (float)$row['refunded_qty'];
+        if ($totalQty <= 0 || $refQty <= 0) return null;
+        if ($refQty + 0.0001 >= $totalQty) return 'REFUNDED';
+        return 'PARTIALLY_REFUNDED';
     }
 
     public function checkout(array $data): array

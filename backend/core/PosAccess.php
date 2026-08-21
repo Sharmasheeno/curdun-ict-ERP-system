@@ -41,25 +41,40 @@ final class PosAccess
     ];
 
     /**
-     * Capabilities allowed AT each level. A level inherits from lower levels.
+     * Capabilities each Odoo 19 level unlocks. Higher levels inherit lower.
+     *
+     * Sourced from Odoo 19 docs (Multi-employee management, Payment methods,
+     * Customer account, Reporting, Receipts). See CLAUDE.md/roadmap notes.
      * Keep names stable — routes, PosService, and the JS frontend all key on
      * them. Add new caps here, never inline elsewhere.
+     *
+     * DELIBERATELY MISSING from any level: pos.staff_admin, pos.customer_admin,
+     * pos.settings, pos.pos_admin. Those are ERP-account permissions and are
+     * gated by AccountPermissionMiddleware, not POS access level. An Advanced
+     * POS employee who has NO ERP account cannot open Staff / Settings / POS
+     * configuration — this matches Odoo (POS Advanced does not automatically
+     * grant backend access).
      */
     private const CAPS = [
         self::MINIMAL => [
-            // Rule #6 — ordinary selling only
             'pos.enter',
             'pos.sell',
             'pos.search_products',
-            'pos.select_customer',
-            'pos.order_note',
+            'pos.select_customer',        // Assign customer
+            'pos.order_note',              // Order notes
+            'pos.promo_code',              // Enter promotional codes
             'pos.payment_receive',
             'pos.order_validate',
-            'pos.employee_switch',
-            'pos.view_own_pos',
+            'pos.employee_switch',         // Lock / unlock switch
+            'pos.lock',                    // Lock/unlock POS register
+            'pos.reload',                  // Reload POS data
+            'pos.orders_view',             // Orders overview
+            'pos.orders_search',           // Search/filter orders
+            'pos.reprint_receipt',         // Reprint receipt
+            'pos.reprint_invoice',         // Reprint invoice
+            'pos.reports_view',            // Generate/download/print POS reports
         ],
         self::BASIC => [
-            // Rule #7 — standard Odoo operational rights
             'pos.register_open',
             'pos.opening_control',
             'pos.cash_in',
@@ -67,21 +82,23 @@ final class PosAccess
             'pos.refund',
             'pos.cancel_order',
             'pos.customer_create',
-            'pos.discount_apply',
-            'pos.price_change',
-            'pos.pricelist_select',
-            'pos.loyalty_operate',
+            'pos.discount_apply',           // Manual discount
+            'pos.price_change',             // Manual price change
+            'pos.pricelist_select',         // Select another pricelist
+            'pos.loyalty_operate',          // Loyalty rewards
+            'pos.settle_sales_order',       // Settle sales orders (Odoo 19)
+            'pos.fiscal_position_switch',   // Switch fiscal position (Odoo 19)
         ],
         self::ADVANCED => [
-            // Rule #8 — POS administration
+            // Odoo notes: Advanced adds Close Register unconditionally, and
+            // product-creation / backend access ONLY when the employee also
+            // has appropriate database-user rights. pos.product_admin here is
+            // the POS-side flag; back-office middleware also requires the
+            // corresponding ERP permission.
             'pos.register_close',
             'pos.closing_control',
             'pos.reconciliation',
             'pos.product_admin',
-            'pos.customer_admin',
-            'pos.staff_admin',
-            'pos.pos_admin',
-            'pos.settings',
         ],
     ];
 

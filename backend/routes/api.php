@@ -5,6 +5,7 @@ use App\Controllers\AuthController;
 use App\Controllers\PlatformController;
 use App\Controllers\PosController;
 use App\Middleware\AuthMiddleware;
+use App\Middleware\AccountPermissionMiddleware;
 use App\Middleware\PosCapabilityMiddleware;
 use App\Middleware\PosCashierRequiredMiddleware;
 
@@ -35,6 +36,10 @@ $router->group('/api/v1', function($router) {
     // requires ADVANCED, and 'pos.sell' passes for anyone with any POS level.
     // Superadmin is auto-bypassed by role→level mapping.
     $CAP = fn(string ...$caps) => new PosCapabilityMiddleware(...$caps);
+    // Back-office gate — ERP account permissions (never the active POS cashier).
+    // Odoo separates POS Advanced from backend/database access; use this on
+    // Staff/Settings/product-catalog admin so those don't leak on POS level alone.
+    $ACC = fn(string ...$perms) => new AccountPermissionMiddleware(...$perms);
 
     // Operational-endpoint gate — a live cashier must be PINned into the
     // terminal. A locked POS returns 401 even for an Admin account.
@@ -97,21 +102,26 @@ $router->group('/api/v1', function($router) {
     $router->post   ('/pos/shifts/close',                   [PosController::class, 'closeShift'],     [$NEEDS_CASHIER(), $CAP('pos.register_close','pos.closing_control')]);
 
     // --- BACK-OFFICE CONFIGURATION -------------------------------
-    // Bound to the ACCOUNT's access level (Odoo model), not the active
-    // cashier — an Admin browser session can edit products from any tab.
-    // See PosCapabilityMiddleware note in PosService about accountCan().
-    $router->post   ('/pos/products',                       [PosController::class, 'createProduct'],   [$CAP('pos.product_admin')]);
-    $router->put    ('/pos/products/{id}',                  [PosController::class, 'updateProduct'],   [$CAP('pos.product_admin')]);
-    $router->delete ('/pos/products/{id}',                  [PosController::class, 'deleteProduct'],   [$CAP('pos.product_admin')]);
+    // Odoo separates POS access from backend/ERP access. Product catalog admin
+    // requires POS Advanced (pos.product_admin) AND the ERP products.create
+    // permission — matching Odoo's rule that a POS-Advanced employee without
+    // a database user cannot create products.
+    // Customer create is a normal BASIC POS action (Odoo Basic Rights lets a
+    // cashier add a customer during selling); customer admin edit/delete is
+    // ERP-permission gated. Settings and Staff are ERP-permission-only.
+    $router->post   ('/pos/products',                       [PosController::class, 'createProduct'],   [$CAP('pos.product_admin'), $ACC('products.create')]);
+    $router->put    ('/pos/products/{id}',                  [PosController::class, 'updateProduct'],   [$CAP('pos.product_admin'), $ACC('products.update')]);
+    $router->delete ('/pos/products/{id}',                  [PosController::class, 'deleteProduct'],   [$CAP('pos.product_admin'), $ACC('products.delete')]);
     $router->post   ('/pos/customers',                      [PosController::class, 'createCustomer'], [$CAP('pos.customer_create')]);
-    $router->put    ('/pos/customers/{id}',                 [PosController::class, 'updateCustomer'], [$CAP('pos.customer_admin')]);
-    $router->delete ('/pos/customers/{id}',                 [PosController::class, 'deleteCustomer'], [$CAP('pos.customer_admin')]);
+    $router->put    ('/pos/customers/{id}',                 [PosController::class, 'updateCustomer'], [$ACC('customers.update')]);
+    $router->delete ('/pos/customers/{id}',                 [PosController::class, 'deleteCustomer'], [$ACC('customers.delete')]);
 
     // --- POS administration: staff, settings ---
-    $router->get    ('/pos/settings',           [PosController::class, 'settings'],     [$CAP('pos.settings')]);
-    $router->put    ('/pos/settings',           [PosController::class, 'updateSettings'],[$CAP('pos.settings')]);
-    $router->post   ('/pos/staff',              [PosController::class, 'createStaff'],  [$CAP('pos.staff_admin')]);
-    $router->put    ('/pos/staff/{id}',         [PosController::class, 'updateStaff'],  [$CAP('pos.staff_admin')]);
+    // ERP-account gated — Odoo Advanced POS alone must not unlock these.
+    $router->get    ('/pos/settings',           [PosController::class, 'settings'],     [$ACC('settings.manage')]);
+    $router->put    ('/pos/settings',           [PosController::class, 'updateSettings'],[$ACC('settings.manage')]);
+    $router->post   ('/pos/staff',              [PosController::class, 'createStaff'],  [$ACC('users.create')]);
+    $router->put    ('/pos/staff/{id}',         [PosController::class, 'updateStaff'],  [$ACC('users.update')]);
     $router->get('/pos/reports', [PosController::class, 'reports']);
     $router->get('/pos/stock-alerts', [PosController::class, 'stockAlerts']);
     $router->post('/pos/stock-alerts/read-all', [PosController::class, 'markAllStockAlertsRead']);

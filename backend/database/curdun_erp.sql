@@ -809,10 +809,13 @@ INSERT INTO permissions (module, name, display_name) VALUES
 INSERT INTO role_permissions (role_id, permission_id)
 SELECT 1, id FROM permissions;
 
--- 2. Admin (all except system internals)
+-- 2. Admin — tenant Admin gets everything except role definitions and
+-- superadmin-only audit log admin. Tenant Admin now includes settings.manage
+-- so they can configure their own POS (Odoo separates POS access from ERP
+-- account permission; back-office middleware relies on settings.manage).
 INSERT INTO role_permissions (role_id, permission_id)
 SELECT 2, id FROM permissions
-WHERE module NOT IN ('roles', 'settings', 'audit_logs');
+WHERE module NOT IN ('roles', 'audit_logs');
 
 -- 3. Manager
 INSERT INTO role_permissions (role_id, permission_id)

@@ -3108,23 +3108,30 @@ const POS_ROLE_TO_LEVEL = {
   'superadmin':     POS_LEVEL_ADVANCED,
 };
 
-// Capabilities each level unlocks (higher levels inherit lower ones).
-// Same names as backend Core\PosAccess::CAPS.
+// Capabilities each Odoo 19 level unlocks (higher levels inherit lower).
+// Kept in strict lockstep with backend Core\PosAccess::CAPS.
+// pos.staff_admin / pos.customer_admin / pos.settings are DELIBERATELY absent
+// — those are ERP-account permissions gated by AccountPermissionMiddleware.
+// Odoo separates POS access from backend access: an Advanced POS employee who
+// has no database user cannot enter Staff / Settings / Product admin.
 const POS_CAPABILITIES = {
   MINIMAL: [
     'pos.enter','pos.sell','pos.search_products','pos.select_customer',
-    'pos.order_note','pos.payment_receive','pos.order_validate',
-    'pos.employee_switch','pos.view_own_pos',
+    'pos.order_note','pos.promo_code','pos.payment_receive','pos.order_validate',
+    'pos.employee_switch','pos.lock','pos.reload',
+    'pos.orders_view','pos.orders_search',
+    'pos.reprint_receipt','pos.reprint_invoice','pos.reports_view',
   ],
   BASIC: [
     'pos.register_open','pos.opening_control','pos.cash_in','pos.cash_out',
-    'pos.refund','pos.cancel_order','pos.customer_create','pos.discount_apply',
-    'pos.price_change','pos.pricelist_select','pos.loyalty_operate',
+    'pos.refund','pos.cancel_order','pos.customer_create',
+    'pos.discount_apply','pos.price_change',
+    'pos.pricelist_select','pos.loyalty_operate',
+    'pos.settle_sales_order','pos.fiscal_position_switch',
   ],
   ADVANCED: [
     'pos.register_close','pos.closing_control','pos.reconciliation',
-    'pos.product_admin','pos.customer_admin','pos.staff_admin',
-    'pos.pos_admin','pos.settings',
+    'pos.product_admin',
   ],
 };
 
@@ -3146,6 +3153,11 @@ const POS_ROLES = {
 // Compatibility shim — old code paths use these action names; each now maps
 // to a canonical capability. Anything not in this map defaults to false
 // (least privilege) so unknown legacy checks don't accidentally allow.
+// Legacy action-name shims. Anything mapped to a null value here is an
+// ERP-account permission — the frontend cannot answer it from POS level
+// alone; the caller should check S.posAccountPermissions instead. posCan()
+// returns false for these so buttons stay hidden until back-office data
+// tells us the account carries the permission.
 const POS_LEGACY_ACTION_CAP = {
   sell:          'pos.sell',
   smallDiscount: 'pos.discount_apply',
@@ -3155,10 +3167,12 @@ const POS_LEGACY_ACTION_CAP = {
   cashInOut:     'pos.cash_in',
   openRegister:  'pos.register_open',
   closeRegister: 'pos.register_close',
-  viewMargin:    'pos.pos_admin',
   editProducts:  'pos.product_admin',
-  manageStaff:   'pos.staff_admin',
-  settings:      'pos.settings',
+  // These are ERP-permission-gated (see AccountPermissionMiddleware). The
+  // POS level does not answer them — hidden until the ERP account grants.
+  viewMargin:    null,
+  manageStaff:   null,
+  settings:      null,
 };
 
 /**
@@ -3186,7 +3200,22 @@ function posLevelForUser(user) {
  *   is now driven by pos_settings.extra_security (Rule #9); see P2.
  */
 function posCan(actionOrCapability, user) {
-  const cap = POS_LEGACY_ACTION_CAP[actionOrCapability] || actionOrCapability;
+  // Legacy action name → capability. If the legacy shim maps to null, the
+  // action is ERP-permission-gated and posCan cannot resolve it.
+  let cap = actionOrCapability;
+  if (Object.prototype.hasOwnProperty.call(POS_LEGACY_ACTION_CAP, actionOrCapability)) {
+    cap = POS_LEGACY_ACTION_CAP[actionOrCapability];
+    if (cap === null) {
+      // Fall back to the ERP account permission list from /auth/login.
+      const acct = S.activeSuperAdmin || S.activeCompanyAdmin || {};
+      const perms = Array.isArray(acct.permissions) ? acct.permissions : [];
+      const roles = Array.isArray(acct.roles) ? acct.roles : [];
+      if (roles.includes('superadmin')) return true;
+      const map = { viewMargin:'reports.view', manageStaff:'users.view', settings:'settings.manage' };
+      const need = map[actionOrCapability];
+      return need ? perms.includes(need) : false;
+    }
+  }
   const level = posLevelForUser(user);
   if (!level) return false;
   const rank = POS_LEVEL_RANK[level];

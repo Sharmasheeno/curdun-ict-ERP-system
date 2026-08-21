@@ -81,7 +81,10 @@ class PosService
         // Odoo-style access gate. PosAccess reads effectiveRoles(), so a
         // cashier PINned in wins over the underlying account.
         if (PosAccess::level() === null) throw new Exception('Retail POS access is not assigned.', 403);
-        if ($manager && !PosAccess::can('pos.pos_admin')) {
+        // "manager" flag = POS Advanced level. Routes that truly require an
+        // ERP permission (Staff, Settings, Products admin) are also gated by
+        // AccountPermissionMiddleware — see routes/api.php.
+        if ($manager && PosAccess::level() !== PosAccess::ADVANCED) {
             throw new Exception('This action requires Advanced POS rights.', 403);
         }
         if ($requireCapability !== null && !PosAccess::can($requireCapability)) {
@@ -108,9 +111,10 @@ class PosService
     public function bootstrap(): array
     {
         [$user,$companyId] = $this->context();
-        // Odoo BASIC+ sees the staff list and payments overview; MINIMAL
-        // only sees themselves. Keeps a Cashier from grazing the roster.
-        $canManageStaff = PosAccess::can('pos.staff_admin') || PosAccess::can('pos.pos_admin');
+        // Odoo separates POS access from ERP account permission. Full staff
+        // roster / sessions listing is offered only when the underlying ERP
+        // account can manage users — POS-Advanced alone is not enough.
+        $canManageStaff = Auth::hasPermission('users.view') || Auth::accountHasRole('superadmin');
         $config = $this->resolveConfig($companyId, isset($user['branch_id']) ? (int)$user['branch_id'] : null);
         $currentSession = $this->currentSessionForConfig($companyId,(int)$config['id']);
         return [
@@ -157,7 +161,10 @@ class PosService
 
     public function reports(array $filters = []): array
     {
-        [, $companyId]=$this->context(true);[$from,$to]=$this->reportRange($filters);
+        // Odoo 19: Minimal-Rights employees can generate/download/print POS
+        // reports. We do NOT hold reports back to Advanced. Route-level gate
+        // stays open too (no capability required); MINIMAL cashiers can view.
+        [, $companyId]=$this->context();[$from,$to]=$this->reportRange($filters);
         $range=['company'=>$companyId,'from'=>$from,'to'=>$to];
         $summary=$this->db->query(
             "SELECT COALESCE(SUM(CASE WHEN status='COMPLETED' AND total_amount>0 THEN total_amount ELSE 0 END),0) gross_sales,
@@ -863,7 +870,7 @@ class PosService
         $config=$this->resolveConfig($companyId,$cashier['branch_id']?(int)$cashier['branch_id']:null);
         $sessionId=(int)($data['session_id']??0);$session=$sessionId?$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company AND state IN ('OPENED','CLOSING_CONTROL')",['id'=>$sessionId,'company'=>$companyId])->fetch():$this->currentSessionForConfig($companyId,(int)$config['id']);if(!$session)throw new Exception('No open POS register session was found.',404);
         if((int)$session['config_id']!==(int)$config['id'])throw new Exception('The selected cashier is not assigned to this register.',403);
-        $summary=$this->sessionSummary((int)$session['id']);$expected=(float)$summary['expected_cash'];$variance=round($counted-$expected,2);
+        $summary=$this->sessionSummary((int)$session['id']);$expected=(float)$summary['expected_cash'];$variance=round($counted-$expected,2);$approved=!empty($data['approve_difference']);
         // Odoo default: no hardcoded maximum difference — the closer chooses
         // whether the count is accepted. If the tenant enables the Curdun
         // extra_security.variance_above threshold, require a manager approval

@@ -420,7 +420,18 @@ class PosService
     public function deleteCustomer(int $id): void
     {
         // ERP-account gated (customers.delete) — see AccountPermissionMiddleware.
-        [$user,$companyId]=$this->context();$this->customer($id,$companyId);
+        [$user,$companyId]=$this->context();
+        $customer = $this->customer($id,$companyId);
+        // P7 Rule (customer protection) — a customer with outstanding Customer
+        // Account debt must not be destructively deleted; that would silently
+        // erase money the company is owed and break the ledger invariant.
+        if ((float)$customer['balance'] > 0.001) {
+            throw new Exception('Cannot delete a customer with outstanding Customer Account debt of $'
+                . number_format((float)$customer['balance'], 2)
+                . '. Settle the balance or archive the customer instead.', 409);
+        }
+        // Soft-delete (archive) so historical orders and ledger entries keep
+        // pointing at this customer for financial traceability.
         $this->db->query("UPDATE customers SET deleted_at=NOW(),status='inactive' WHERE id=:id AND company_id=:company",['id'=>$id,'company'=>$companyId]);
         $this->log($user,$companyId,'CUSTOMER_DELETE',$id,[]);
     }
@@ -1228,11 +1239,29 @@ class PosService
     {
         [$user,$companyId]=$this->context();
         $customer=$this->customer($customerId,$companyId);
-        $amount=(float)($data['amount']??$customer['balance']);
-        if($amount<=0||$amount>(float)$customer['balance']) throw new Exception('Invalid collection amount.',422);
+        $amount = round((float)($data['amount'] ?? $customer['balance']), 2);
+        if ($amount <= 0) throw new Exception('Settlement amount must be greater than zero.', 422);
+        // P7 Rule (over-collection) — cannot collect more than the current debt.
+        if ($amount > round((float)$customer['balance'], 2) + 0.001) {
+            throw new Exception('Settlement amount exceeds the customer\'s outstanding balance of $'
+                . number_format((float)$customer['balance'], 2) . '.', 422);
+        }
         $method = (string)($data['payment_method'] ?? 'Cash');
+        // Validate the settlement method against configured payment methods.
+        // Rejects a method that has been disabled in Settings → Payments.
+        // Deyn cannot settle Deyn — customer can't pay their own debt with
+        // more Customer Account credit.
+        if (strtolower($method) === 'deyn') {
+            throw new Exception('Deyn cannot be used to settle a Customer Account balance.', 422);
+        }
+        $pm = $this->paymentMethod($method);
+        $this->assertPaymentEnabled($companyId, $pm['name']);
+        $sessionId = $this->currentOpenSessionId($companyId, $user);
 
-        // Atomically: ledger entry + balance update — must succeed together.
+        // Atomically: ledger entry + balance update + (cash → session cash IN) —
+        // must succeed together. Cash settlements physically arrive in the
+        // drawer so they contribute to Expected Cash via a pos_cash_movements
+        // row (Rule #11 / cash reconciliation).
         $this->db->beginTransaction();
         try {
             $this->db->query(
@@ -1245,12 +1274,12 @@ class PosService
                 [
                     'company'  => $companyId,
                     'branch'   => $user['branch_id'] ?? null,
-                    'session'  => $this->currentOpenSessionId($companyId, $user),
+                    'session'  => $sessionId,
                     'customer' => $customerId,
                     'cashier'  => $user['id'],
                     // Negative signed amount — payment REDUCES outstanding debt.
                     'amount'   => -abs($amount),
-                    'method'   => $method,
+                    'method'   => $pm['name'],
                     'reference'=> $data['reference'] ?? null,
                     'notes'    => $data['notes'] ?? null,
                 ]
@@ -1260,9 +1289,27 @@ class PosService
                  WHERE id = :id AND company_id = :company",
                 ['amount'=>$amount,'id'=>$customerId,'company'=>$companyId]
             );
-            $this->log($user, $companyId, 'DEBT_COLLECTION', $customerId, [
+            // Cash settlement → physical cash into the drawer.
+            if ($pm['type'] === 'cash' && $sessionId) {
+                $this->db->query(
+                    "INSERT INTO pos_cash_movements
+                        (company_id, session_id, user_id, movement_type, amount, reason)
+                     VALUES
+                        (:company, :session, :user, 'IN', :amount, :reason)",
+                    [
+                        'company' => $companyId,
+                        'session' => $sessionId,
+                        'user'    => $user['id'],
+                        'amount'  => $amount,
+                        'reason'  => 'Customer Account settlement — customer #'.$customerId,
+                    ]
+                );
+            }
+            $this->log($user, $companyId, 'CUSTOMER_ACCOUNT_PAYMENT', $customerId, [
                 'amount' => $amount,
-                'method' => $method,
+                'method' => $pm['name'],
+                'method_type' => $pm['type'],
+                'session_id' => $sessionId,
                 'ledger_id' => (int)$this->db->lastInsertId(),
             ]);
             $this->db->commit();
@@ -1271,6 +1318,66 @@ class PosService
             throw $e;
         }
         return $this->customer($customerId,$companyId);
+    }
+
+    /**
+     * P7 — Full Customer Account ledger for the given customer. Returns rows
+     * newest-first with method + employee + running balance so the frontend
+     * (and audit tools) can verify balance = SUM(ledger).
+     */
+    public function customerLedger(int $customerId): array
+    {
+        [$user, $companyId] = $this->context();
+        $customer = $this->customer($customerId, $companyId);
+        $rows = $this->db->query(
+            "SELECT l.id, l.type, l.amount, l.payment_method, l.reference, l.notes,
+                    l.created_at, l.session_id, l.order_id,
+                    u.name AS cashier_name,
+                    o.reference_number AS order_reference
+             FROM pos_credit_ledger l
+             LEFT JOIN users  u ON u.id = l.cashier_id
+             LEFT JOIN orders o ON o.id = l.order_id
+             WHERE l.company_id = :company AND l.customer_id = :customer
+             ORDER BY l.id DESC",
+            ['company'=>$companyId,'customer'=>$customerId]
+        )->fetchAll();
+
+        // Aggregate totals so the customer-account header shows purchases /
+        // payments / reversals cleanly.
+        $totals = ['purchases'=>0.0, 'payments'=>0.0, 'reversals'=>0.0];
+        foreach ($rows as $r) {
+            if     ($r['type'] === 'DEYN_SALE')             $totals['purchases'] += (float)$r['amount'];
+            elseif ($r['type'] === 'DEYN_PAYMENT')          $totals['payments']  += abs((float)$r['amount']);
+            elseif ($r['type'] === 'DEYN_REFUND_REVERSAL') $totals['reversals'] += abs((float)$r['amount']);
+        }
+        // Compute a running balance from oldest → newest and re-order desc.
+        $forward = array_reverse($rows);
+        $running = 0.0;
+        foreach ($forward as &$r) { $running += (float)$r['amount']; $r['running_balance'] = round($running, 2); }
+        unset($r);
+        $withBalance = array_reverse($forward);
+
+        // The critical invariant: SUM(ledger) MUST equal customer.balance.
+        $ledgerSum = round($running, 2);
+        $balance = round((float)$customer['balance'], 2);
+
+        return [
+            'customer' => [
+                'id'           => (int)$customer['id'],
+                'name'         => $customer['name'],
+                'balance'      => $balance,
+                'credit_limit' => round((float)$customer['credit_limit'], 2),
+                'available_credit' => max(0, round((float)$customer['credit_limit'] - $balance, 2)),
+            ],
+            'totals'       => [
+                'purchases' => round($totals['purchases'], 2),
+                'payments'  => round($totals['payments'], 2),
+                'reversals' => round($totals['reversals'], 2),
+            ],
+            'entries'      => $withBalance,
+            'invariant_ok' => abs($ledgerSum - $balance) < 0.01,
+            'ledger_sum'   => $ledgerSum,
+        ];
     }
 
     /**

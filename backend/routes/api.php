@@ -90,6 +90,9 @@ $router->group('/api/v1', function($router) {
     // Debt collection is a payment on the customer account; Odoo binds this
     // to BASIC (customer account operations).
     $router->post('/pos/customers/{id}/collect-debt',    [PosController::class, 'collectDebt'],    [$NEEDS_CASHIER(), $CAP('pos.payment_receive')]);
+    // Customer Account ledger — MINIMAL cashiers can view (they need it when
+    // helping a customer verify their balance); mutations remain gated.
+    $router->get ('/pos/customers/{id}/ledger',          [PosController::class, 'customerLedger']);
 
     // Odoo BASIC — open register, refunds, cash movements.
     $router->post   ('/pos/sessions/open',                  [PosController::class, 'openSession'],    [$NEEDS_CASHIER(), $CAP('pos.register_open')]);

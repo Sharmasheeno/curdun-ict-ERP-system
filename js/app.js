@@ -3082,62 +3082,119 @@ const SUPER_ADMINS = [];
 //  - Any active module (Retail POS): tempPassword works ONCE; forces
 //    module password creation on first login
 // ============================================================
-// POS ROLE-BASED ACCESS CONTROL
+// POS ACCESS-LEVEL MODEL — Odoo Retail POS (Rule #5/#6/#7/#8)
 // ============================================================
-const POS_ROLES = {
-  'Cashier':       ['dash', 'checkout', 'transactions'],
-  'Senior Cashier':['dash', 'checkout', 'transactions'],
-  'Store Manager': ['dash', 'checkout', 'transactions', 'sessions', 'payments', 'products', 'customers', 'reports', 'notifications', 'staff'],
-  'Admin':         ['dash', 'checkout', 'transactions', 'sessions', 'payments', 'products', 'customers', 'reports', 'notifications', 'staff', 'settings'],
+// Internal engine works on MINIMAL / BASIC / ADVANCED. Friendly
+// business-role names (Cashier, Senior Cashier, Store Manager,
+// Admin) are display labels only — they map to a level below.
+// The backend hydrates the same table via GET /api/v1/pos/access so
+// frontend and backend stay in lockstep (Rule #16).
+const POS_LEVEL_MINIMAL  = 'MINIMAL';
+const POS_LEVEL_BASIC    = 'BASIC';
+const POS_LEVEL_ADVANCED = 'ADVANCED';
+const POS_LEVEL_RANK = { MINIMAL:1, BASIC:2, ADVANCED:3 };
+
+// Friendly role → Odoo level. superadmin is always ADVANCED.
+const POS_ROLE_TO_LEVEL = {
+  'Cashier':        POS_LEVEL_MINIMAL,
+  'Senior Cashier': POS_LEVEL_BASIC,
+  'Store Manager':  POS_LEVEL_ADVANCED,
+  'Admin':          POS_LEVEL_ADVANCED,
+  // Backend role slugs (kept in sync with Core\PosAccess::ROLE_LEVEL)
+  'cashier':        POS_LEVEL_MINIMAL,
+  'senior_cashier': POS_LEVEL_BASIC,
+  'store_manager':  POS_LEVEL_ADVANCED,
+  'admin':          POS_LEVEL_ADVANCED,
+  'superadmin':     POS_LEVEL_ADVANCED,
 };
 
-// ============================================================
-// POS PERMISSIONS — action-level ACL enforced on top of role tabs.
-// True  → allowed silently.
-// 'pin' → allowed but requires a Manager+ PIN approval overlay.
-// False → hidden / disabled entirely.
-// Anyone above the level in the table inherits the same permission.
-// ============================================================
-const POS_PERMISSIONS = {
-  Cashier: {
-    sell: true, smallDiscount: true, largeDiscount: 'pin',
-    refund: 'pin', voidOrder: false,
-    cashInOut: 'pin', openRegister: false, closeRegister: false,
-    viewMargin: false, editProducts: false, manageStaff: false, settings: false,
-  },
-  'Senior Cashier': {
-    sell: true, smallDiscount: true, largeDiscount: 'pin',
-    refund: true, voidOrder: 'pin',
-    cashInOut: true, openRegister: true, closeRegister: true,
-    viewMargin: false, editProducts: false, manageStaff: false, settings: false,
-  },
-  'Store Manager': {
-    sell: true, smallDiscount: true, largeDiscount: true,
-    refund: true, voidOrder: true,
-    cashInOut: true, openRegister: true, closeRegister: true,
-    viewMargin: true, editProducts: true, manageStaff: true, settings: false,
-  },
-  Admin: {
-    sell: true, smallDiscount: true, largeDiscount: true,
-    refund: true, voidOrder: true,
-    cashInOut: true, openRegister: true, closeRegister: true,
-    viewMargin: true, editProducts: true, manageStaff: true, settings: true,
-  },
+// Capabilities each level unlocks (higher levels inherit lower ones).
+// Same names as backend Core\PosAccess::CAPS.
+const POS_CAPABILITIES = {
+  MINIMAL: [
+    'pos.enter','pos.sell','pos.search_products','pos.select_customer',
+    'pos.order_note','pos.payment_receive','pos.order_validate',
+    'pos.employee_switch','pos.view_own_pos',
+  ],
+  BASIC: [
+    'pos.register_open','pos.opening_control','pos.cash_in','pos.cash_out',
+    'pos.refund','pos.cancel_order','pos.customer_create','pos.discount_apply',
+    'pos.price_change','pos.pricelist_select','pos.loyalty_operate',
+  ],
+  ADVANCED: [
+    'pos.register_close','pos.closing_control','pos.reconciliation',
+    'pos.product_admin','pos.customer_admin','pos.staff_admin',
+    'pos.pos_admin','pos.settings',
+  ],
+};
+
+// Which POS sidebar tabs each level sees. Odoo doesn't have a Curdun-style
+// sidebar, but this maps to what the different levels manage in Odoo:
+// MINIMAL only sees selling; BASIC adds customers/refund history;
+// ADVANCED adds staff/settings/reports.
+const POS_ROLES = {
+  MINIMAL:  ['dash','checkout','transactions'],
+  BASIC:    ['dash','checkout','transactions','customers','notifications'],
+  ADVANCED: ['dash','checkout','transactions','sessions','payments','products','customers','reports','notifications','staff','settings'],
+  // Aliases for legacy code that still passes display names/role slugs.
+  'Cashier':       ['dash','checkout','transactions'],
+  'Senior Cashier':['dash','checkout','transactions','customers','notifications'],
+  'Store Manager': ['dash','checkout','transactions','sessions','payments','products','customers','reports','notifications','staff'],
+  'Admin':         ['dash','checkout','transactions','sessions','payments','products','customers','reports','notifications','staff','settings'],
+};
+
+// Compatibility shim — old code paths use these action names; each now maps
+// to a canonical capability. Anything not in this map defaults to false
+// (least privilege) so unknown legacy checks don't accidentally allow.
+const POS_LEGACY_ACTION_CAP = {
+  sell:          'pos.sell',
+  smallDiscount: 'pos.discount_apply',
+  largeDiscount: 'pos.discount_apply',
+  refund:        'pos.refund',
+  voidOrder:     'pos.refund',
+  cashInOut:     'pos.cash_in',
+  openRegister:  'pos.register_open',
+  closeRegister: 'pos.register_close',
+  viewMargin:    'pos.pos_admin',
+  editProducts:  'pos.product_admin',
+  manageStaff:   'pos.staff_admin',
+  settings:      'pos.settings',
 };
 
 /**
- * posCan(action, user?)
- *   → true    : allowed silently
- *   → 'pin'   : allowed only after a Manager PIN approval overlay
- *   → false   : not allowed at all
- * Falls back to the current cashier (S.posActiveUser). Unknown roles are
- * treated as Cashier (least privilege).
+ * Odoo access level for a user. Prefers the highest level any of their
+ * roles maps to. Unknown roles map to null → posCan returns false.
  */
-function posCan(action, user) {
+function posLevelForUser(user) {
   const u = user || S.posActiveUser;
-  const role = u?.role || 'Cashier';
-  const perms = POS_PERMISSIONS[role] || POS_PERMISSIONS.Cashier;
-  return perms[action] ?? false;
+  if (!u) return null;
+  const rawRoles = Array.isArray(u.roles) ? u.roles : (u.role ? [u.role] : []);
+  let best = null;
+  for (const r of rawRoles) {
+    const lvl = POS_ROLE_TO_LEVEL[r];
+    if (!lvl) continue;
+    if (!best || POS_LEVEL_RANK[lvl] > POS_LEVEL_RANK[best]) best = lvl;
+  }
+  return best;
+}
+
+/**
+ * posCan(actionOrCapability, user?)
+ *   Preferred usage passes a capability name (e.g. 'pos.refund'). Legacy
+ *   action names ('refund', 'openRegister', …) map via POS_LEGACY_ACTION_CAP.
+ *   Returns true / false. The old 'pin' return value is gone — approval
+ *   is now driven by pos_settings.extra_security (Rule #9); see P2.
+ */
+function posCan(actionOrCapability, user) {
+  const cap = POS_LEGACY_ACTION_CAP[actionOrCapability] || actionOrCapability;
+  const level = posLevelForUser(user);
+  if (!level) return false;
+  const rank = POS_LEVEL_RANK[level];
+  for (const [capLevel, caps] of Object.entries(POS_CAPABILITIES)) {
+    if (POS_LEVEL_RANK[capLevel] > rank) continue;
+    if (caps.includes(cap)) return true;
+  }
+  return false;
 }
 
 /**

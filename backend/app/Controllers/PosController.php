@@ -41,4 +41,5 @@ class PosController extends BaseController
     public function stockAlerts(Request $r): void { Response::success('Stock notifications retrieved.',$this->pos->stockAlerts()); }
     public function markStockAlertRead(Request $r,int $id): void { $this->pos->markStockAlertRead($id);Response::success('Stock notification marked as read.'); }
     public function markAllStockAlertsRead(Request $r): void { $this->pos->markAllStockAlertsRead();Response::success('All stock notifications marked as read.'); }
+    public function access(Request $r): void { Response::success('POS access snapshot.', \Core\PosAccess::snapshot()); }
 }

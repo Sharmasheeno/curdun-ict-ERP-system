@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS pos_manager_approvals (
     reason          TEXT         NULL,           -- audit note
     status          ENUM('PENDING','USED','EXPIRED','REVOKED') NOT NULL DEFAULT 'PENDING',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    expires_at      TIMESTAMP    NOT NULL,       -- typically NOW() + 5 min
+    expires_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP, -- typically NOW() + 5 min; service always sets explicitly
     used_at         TIMESTAMP    NULL,
     used_ip         VARCHAR(45)  NULL,
     UNIQUE KEY uq_pos_manager_approvals_token (token),

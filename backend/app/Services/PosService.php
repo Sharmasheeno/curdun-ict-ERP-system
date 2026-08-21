@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Repositories\AuditLogRepository;
 use Core\Auth;
 use Core\Database;
+use Core\PosAccess;
 use Exception;
 
 class PosService
@@ -15,7 +16,14 @@ class PosService
         private AuditLogRepository $audit
     ) {}
 
-    private function context(bool $manager = false): array
+    /**
+     * Resolve the acting party and enforce the required Odoo access level.
+     *
+     * The optional $requireCapability lets a service method assert a specific
+     * capability (e.g. 'pos.product_admin') without going through the router
+     * — used by helpers that are called from more than one route.
+     */
+    private function context(bool $manager = false, ?string $requireCapability = null): array
     {
         // Dual-identity: prefer the currently-active POS cashier when
         // authorizing/attributing POS actions. Fall back to the account
@@ -24,13 +32,14 @@ class PosService
         $cashier = Auth::posCashier() ?: $account;
         if (!$cashier) throw new Exception('Unauthenticated.', 401);
 
-        // Effective roles — cashier wins over the underlying account so an
-        // Admin browser session can NEVER let a Cashier hit admin endpoints.
-        $roles = Auth::effectiveRoles();
-        $allowed = ['superadmin','admin','store_manager','senior_cashier','cashier'];
-        if (!array_intersect($roles, $allowed)) throw new Exception('Retail POS access is not assigned.', 403);
-        if ($manager && !array_intersect($roles, ['superadmin','admin','store_manager'])) {
-            throw new Exception('Manager access is required.', 403);
+        // Odoo-style access gate. PosAccess reads effectiveRoles(), so a
+        // cashier PINned in wins over the underlying account.
+        if (PosAccess::level() === null) throw new Exception('Retail POS access is not assigned.', 403);
+        if ($manager && !PosAccess::can('pos.pos_admin')) {
+            throw new Exception('This action requires Advanced POS rights.', 403);
+        }
+        if ($requireCapability !== null && !PosAccess::can($requireCapability)) {
+            throw new Exception('This action requires a higher POS access level.', 403);
         }
 
         // Company always comes from the underlying account, never the
@@ -53,7 +62,9 @@ class PosService
     public function bootstrap(): array
     {
         [$user,$companyId] = $this->context();
-        $canManageStaff = (bool)array_intersect($user['roles'] ?? [], ['superadmin','admin','store_manager']);
+        // Odoo BASIC+ sees the staff list and payments overview; MINIMAL
+        // only sees themselves. Keeps a Cashier from grazing the roster.
+        $canManageStaff = PosAccess::can('pos.staff_admin') || PosAccess::can('pos.pos_admin');
         $config = $this->resolveConfig($companyId, isset($user['branch_id']) ? (int)$user['branch_id'] : null);
         $currentSession = $this->currentSessionForConfig($companyId,(int)$config['id']);
         return [
@@ -457,13 +468,15 @@ class PosService
 
     public function voidTransaction(int $id, array $data = []): array
     {
-        $this->context(true);
-        return $this->refundOrder($id,['reason'=>$data['reason']??'Full refund by POS manager']);
+        // Refund is BASIC in Odoo — the route middleware already enforces
+        // pos.refund. No duplicate ADVANCED gate here.
+        return $this->refundOrder($id,['reason'=>$data['reason']??'Full refund by POS employee']);
     }
 
     public function refundOrder(int $id,array $data=[]): array
     {
-        [$user,$companyId]=$this->context(true);
+        // BASIC-level operation — pos.refund is enforced by the route.
+        [$user,$companyId]=$this->context();
         $this->db->beginTransaction();
         try {
             $order=$this->db->query("SELECT * FROM orders WHERE id=:id AND company_id=:company FOR UPDATE",['id'=>$id,'company'=>$companyId])->fetch();
@@ -774,7 +787,7 @@ class PosService
         $config=$this->resolveConfig($companyId,$cashier['branch_id']?(int)$cashier['branch_id']:null);
         $sessionId=(int)($data['session_id']??0);$session=$sessionId?$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company AND state IN ('OPENED','CLOSING_CONTROL')",['id'=>$sessionId,'company'=>$companyId])->fetch():$this->currentSessionForConfig($companyId,(int)$config['id']);if(!$session)throw new Exception('No open POS register session was found.',404);
         if((int)$session['config_id']!==(int)$config['id'])throw new Exception('The selected cashier is not assigned to this register.',403);
-        $summary=$this->sessionSummary((int)$session['id']);$expected=(float)$summary['expected_cash'];$variance=round($counted-$expected,2);$isManager=(bool)array_intersect($user['roles']??[],['superadmin','admin','store_manager']);$approved=!empty($data['approve_difference']);
+        $summary=$this->sessionSummary((int)$session['id']);$expected=(float)$summary['expected_cash'];$variance=round($counted-$expected,2);$isManager=PosAccess::can('pos.closing_control');$approved=!empty($data['approve_difference']);
         if(abs($variance)>(float)$config['maximum_difference']&&!($isManager&&$approved))throw new Exception('The cash difference exceeds the allowed limit. A Store Manager must approve the closing.',409);
         $this->db->beginTransaction();try{
             $locked=$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company FOR UPDATE",['id'=>$session['id'],'company'=>$companyId])->fetch();if(!$locked||$locked['state']==='CLOSED')throw new Exception('This register session is already closed.',409);

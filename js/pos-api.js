@@ -116,23 +116,44 @@ async function posUpdateCustomer(id,form) { const row=await posApiFetch(`/pos/cu
 async function posDeleteCustomer(id) { await posApiFetch(`/pos/customers/${id}`,{method:'DELETE'});const i=POS_CUSTOMERS.findIndex(item=>item.id===Number(id));if(i>=0)POS_CUSTOMERS.splice(i,1); }
 async function posCreateStaff(form) { const role={Cashier:'cashier','Senior Cashier':'senior_cashier','Store Manager':'store_manager'}[form.role]||'cashier';const slug=form.name.toLowerCase().replace(/[^a-z0-9]+/g,'.').replace(/^\.|\.$/g,'');const email=form.email||`${slug}.${Date.now().toString().slice(-6)}@pos.curdun.so`;const pin=String(form.pin||'');const status=form.status==='break'?'inactive':(form.status||'active');const data=await posApiFetch('/pos/staff',{method:'POST',body:{name:form.name,email,phone:form.phone,role,branch_id:form.branchId||null,pin,status}});POS_STAFF.push({...mapStaff(data.user),hasPin:true});return {...data,pin}; }
 async function posUpdateStaff(id,form) { const role={Cashier:'cashier','Senior Cashier':'senior_cashier','Store Manager':'store_manager'}[form.role]||'cashier';const status=form.status==='break'?'inactive':(form.status||'active');const row=await posApiFetch(`/pos/staff/${id}`,{method:'PUT',body:{name:form.name,email:form.email,phone:form.phone,role,branch_id:form.branchId||null,pin:form.pin,status}});const i=POS_STAFF.findIndex(item=>item.id===Number(id));if(i>=0)POS_STAFF[i]=mapStaff(row);return row; }
-async function posCompleteCheckout(cart,customerId,method) {
-  const subtotal=cart.reduce((sum,item)=>sum+(item.isWholesale?item.wholesalePrice:item.price)*item.qty,0);
-  const total=Number((subtotal*(1+Number(S.storeSettings.taxRate||0)/100)).toFixed(2));
-  S.posPendingOrderId=S.posPendingOrderId||(globalThis.crypto?.randomUUID?.()||`${Date.now()}-0000-4000-8000-${Math.random().toString(16).slice(2).padEnd(12,'0').slice(0,12)}`);
-  // Point 12: for cash, send the tender explicitly so change lives on the cash line.
-  // (Split-payment-ready: this is one line — later, multiple lines with their own
-  // tender/amount pairs can be added without touching the backend contract.)
-  const isCash=method==='cash';
-  const tenderRaw=parseFloat(S.posCashTendered);
-  const tender=(isCash && !Number.isNaN(tenderRaw) && tenderRaw>0) ? Number(tenderRaw.toFixed(2)) : null;
-  const line={method,amount:total,reference:S.mobileTxId||null};
-  if (isCash && tender!==null) line.tendered=Math.max(tender,total);
-  const data=await posApiFetch('/pos/checkout',{method:'POST',body:{client_order_id:S.posPendingOrderId,customer_id:customerId||null,payments:[line],items:cart.map(item=>({product_id:item.id,quantity:item.qty,wholesale:Boolean(item.isWholesale),discount_percent:Number(item.discountPercent||0)})),mobile_phone:S.mobilePhone||null,payment_reference:S.mobileTxId||null}});
-  const mapped=mapTransaction({...data,id:data.id,total_amount:data.total_amount,items_count:cart.reduce((n,item)=>n+item.qty,0),customer_name:POS_CUSTOMERS.find(item=>item.id===customerId)?.name,cashier_name:S.posActiveUser?.name});
-  const existing=POS_TRANSACTIONS.findIndex(item=>item._backendId===mapped._backendId);
-  if(existing>=0)POS_TRANSACTIONS[existing]=mapped;else POS_TRANSACTIONS.unshift(mapped);
-  S.posPendingOrderId=null;
+// P3 Stage B: `payments` is now an array of Odoo-style payment lines built
+// by the checkout composer. Each entry: { method, amount, tendered?, reference? }.
+// Backwards-compat: if a caller still passes a single method string, wrap it
+// in a one-line array so we never break older code paths mid-session.
+async function posCompleteCheckout(cart, customerId, payments) {
+  const subtotal = cart.reduce((sum,item)=>sum+(item.isWholesale?item.wholesalePrice:item.price)*item.qty, 0);
+  const total = Number((subtotal * (1 + Number(S.storeSettings.taxRate||0)/100)).toFixed(2));
+  S.posPendingOrderId = S.posPendingOrderId || (globalThis.crypto?.randomUUID?.() || `${Date.now()}-0000-4000-8000-${Math.random().toString(16).slice(2).padEnd(12,'0').slice(0,12)}`);
+  let lines;
+  if (Array.isArray(payments)) {
+    // Trust the composer — one line per method, tendered only on cash lines.
+    lines = payments.map(p => {
+      const line = { method: p.method, amount: Number(p.amount) };
+      if (p.tendered !== undefined && p.tendered !== null) line.tendered = Number(p.tendered);
+      if (p.reference) line.reference = p.reference;
+      return line;
+    });
+  } else {
+    // Legacy single-method fallback.
+    const method = payments;
+    const isCash = String(method).toLowerCase() === 'cash';
+    const tenderRaw = parseFloat(S.posCashTendered);
+    const tender = (isCash && !Number.isNaN(tenderRaw) && tenderRaw>0) ? Number(tenderRaw.toFixed(2)) : null;
+    const line = { method, amount: total };
+    if (isCash && tender !== null) line.tendered = Math.max(tender, total);
+    if (S.mobileTxId) line.reference = S.mobileTxId;
+    lines = [line];
+  }
+  const data = await posApiFetch('/pos/checkout', { method:'POST', body:{
+    client_order_id: S.posPendingOrderId,
+    customer_id: customerId || null,
+    payments: lines,
+    items: cart.map(item => ({ product_id:item.id, quantity:item.qty, wholesale:Boolean(item.isWholesale), discount_percent:Number(item.discountPercent||0) })),
+  }});
+  const mapped = mapTransaction({ ...data, id:data.id, total_amount:data.total_amount, items_count:cart.reduce((n,item)=>n+item.qty,0), customer_name:POS_CUSTOMERS.find(item=>item.id===customerId)?.name, cashier_name:S.posActiveUser?.name });
+  const existing = POS_TRANSACTIONS.findIndex(item => item._backendId === mapped._backendId);
+  if (existing >= 0) POS_TRANSACTIONS[existing] = mapped; else POS_TRANSACTIONS.unshift(mapped);
+  S.posPendingOrderId = null;
   return data;
 }
 async function posVoidTransaction(orderId) { const row=await posApiFetch(`/pos/orders/${orderId}/refund`,{method:'POST',body:{reason:'Full refund by POS manager'}});await posBootstrap();return row; }

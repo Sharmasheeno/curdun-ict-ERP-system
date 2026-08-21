@@ -155,7 +155,13 @@ const S = {
   // POS — core
   posCart: [],
   posSearchTerm: '',
+  // Legacy single-method state kept only for the "add-line" click handler that
+  // consults it as a UI hint. Financial source of truth is posPaymentLines.
   posPaymentMethod: 'cash',
+  // Odoo-style split-payment lines. Each entry:
+  //   { method_name, method_type: 'cash'|'mobile'|'credit', amount, tendered?, reference? }
+  // The backend independently validates and re-derives change from tendered.
+  posPaymentLines: [],
   posReceiptVisible: false,
   posLastReceipt: null,
   posCustomerFilter: '',
@@ -3226,6 +3232,107 @@ function posCan(actionOrCapability, user) {
   return false;
 }
 
+// ============================================================
+// PAYMENT-LINE HELPERS (Odoo-style split payments — P3 Stage B)
+// ============================================================
+// Financial identity of a method is (name, type), not the display label.
+// Types drive UI + backend behaviour: cash carries tender/change; mobile
+// carries an optional reference; credit is Customer Account (Deyn) and
+// requires a customer at the ORDER level (not per line).
+
+function posMethodType(name) {
+  const key = String(name || '').toLowerCase();
+  if (key === 'cash') return 'cash';
+  if (key === 'deyn' || key === 'customer_account' || key === 'customer account') return 'credit';
+  return 'mobile';
+}
+
+// Configured methods for THIS POS, in enabled order. Comes from
+// pos_settings.payments (delivered by /pos/bootstrap and refreshed by
+// posSaveSettings). Never hardcode the six names — an Admin can turn any
+// of them off or add another method later.
+function posConfiguredMethods() {
+  const cfg = (S.storeSettings && S.storeSettings.payments) || {};
+  return Object.keys(cfg)
+    .filter(name => cfg[name])
+    .map(name => ({ name, type: posMethodType(name) }));
+}
+
+function posPaymentLinesPaid() {
+  return (S.posPaymentLines || []).reduce((sum, line) => sum + (Number(line.amount) || 0), 0);
+}
+
+function posPaymentLinesRemaining(total) {
+  const remaining = Number((total - posPaymentLinesPaid()).toFixed(2));
+  return remaining > 0 ? remaining : 0;
+}
+
+function posHasDeynLine() {
+  return (S.posPaymentLines || []).some(line => line.method_type === 'credit');
+}
+
+function posDeynLineAmount() {
+  return (S.posPaymentLines || [])
+    .filter(line => line.method_type === 'credit')
+    .reduce((sum, line) => sum + (Number(line.amount) || 0), 0);
+}
+
+// Add a line for the given method name. Defaults the amount to the current
+// remaining (Odoo behaviour). Cash lines get a tender that defaults to the
+// amount; the user can adjust for over-tender. Non-cash lines have no
+// tender/change concept.
+function posAddPaymentLine(name, orderTotal) {
+  const type = posMethodType(name);
+  const remaining = posPaymentLinesRemaining(orderTotal);
+  const amount = remaining > 0 ? remaining : orderTotal;
+  const line = { method_name: name, method_type: type, amount };
+  if (type === 'cash') line.tendered = amount;
+  S.posPaymentLines = [...(S.posPaymentLines || []), line];
+}
+
+function posRemovePaymentLine(idx) {
+  S.posPaymentLines = (S.posPaymentLines || []).filter((_, i) => i !== idx);
+}
+
+function posUpdatePaymentLine(idx, patch) {
+  S.posPaymentLines = (S.posPaymentLines || []).map((line, i) => {
+    if (i !== idx) return line;
+    const next = { ...line, ...patch };
+    // Cash: if amount changed and tendered wasn't explicitly set to more,
+    // keep tendered at least equal to amount (Odoo default: exact tender).
+    if (next.method_type === 'cash' && (patch.amount !== undefined) && (patch.tendered === undefined)) {
+      if ((Number(next.tendered) || 0) < Number(next.amount)) next.tendered = Number(next.amount);
+    }
+    return next;
+  });
+}
+
+// Full allocation check used by the Validate button. Never trust this on
+// the server — it's a UX gate only; the backend re-checks every line.
+function posPaymentLinesValid(orderTotal) {
+  const lines = S.posPaymentLines || [];
+  if (!lines.length) return { ok:false, reason:'Add at least one payment line' };
+  for (const line of lines) {
+    const amt = Number(line.amount) || 0;
+    if (amt <= 0) return { ok:false, reason:`${line.method_name}: amount must be > 0` };
+    if (line.method_type === 'cash') {
+      const tendered = Number(line.tendered) || 0;
+      if (tendered + 0.001 < amt) return { ok:false, reason:`${line.method_name}: tendered less than amount` };
+    }
+  }
+  const remaining = posPaymentLinesRemaining(orderTotal);
+  if (remaining > 0.001) return { ok:false, reason:`Remaining $${remaining.toFixed(2)} unallocated` };
+  if (posPaymentLinesPaid() > orderTotal + 0.001) return { ok:false, reason:'Total payment amounts exceed order total' };
+  if (posHasDeynLine() && !S.posDebtCustomerId) return { ok:false, reason:'Deyn requires a customer' };
+  return { ok:true };
+}
+
+function posResetPaymentLines() {
+  S.posPaymentLines = [];
+  S.posDebtCustomerId = null;
+  S.posCashTendered = '';
+}
+
 /**
  * requireManagerApproval(action, options, onApproved)
  *   Renders a Manager PIN modal. On PIN match (against a user with role
@@ -4527,15 +4634,7 @@ function renderPOSCheckout() {
   const subtotal = cart.reduce((s,item)=>{ const p = item.isWholesale ? item.wholesalePrice : item.price; return s + p * item.qty; }, 0);
   const taxRate = Number(S.storeSettings.taxRate || 0);
   const tax = subtotal * taxRate / 100;
-  const total = subtotal + tax;
-  const paymentEnabled = label => Object.entries(S.storeSettings.payments || {}).some(([name, enabled]) => name.toLowerCase() === label.toLowerCase() && enabled);
-  const isCash = S.posPaymentMethod === 'cash';
-  const isMobile = ['evc','edahab','zaad','sahal'].includes(S.posPaymentMethod);
-  const isDeyn = S.posPaymentMethod === 'deyn';
-  // Cash tendered / change logic
-  const tendered = parseFloat(S.posCashTendered) || 0;
-  const change = isCash && tendered > 0 ? Math.max(0, tendered - total) : 0;
-  const tenderedShort = isCash && tendered > 0 && tendered < total;
+  const total = Number((subtotal + tax).toFixed(2));
   const term = (S.posSearchTerm||'').toLowerCase();
   const filtered = term ? POS_PRODUCTS.filter(p=>p.name.toLowerCase().includes(term)||p.barcode.includes(term)||p.cat.toLowerCase().includes(term)) : POS_PRODUCTS;
   const catEmoji = {Groceries:'\ud83d\uded2',Beverages:'\ud83e\udd64',Household:'\ud83c\udfe0','Personal Care':'\ud83e\uddf4',Snacks:'\ud83c\udf6a',Bakery:'\ud83c\udf5e',Fresh:'\ud83e\udd6c'};
@@ -4543,8 +4642,20 @@ function renderPOSCheckout() {
 
   if (S.posReceiptVisible && S.posLastReceipt) return renderPOSReceipt();
 
-  const debtCustomer = isDeyn && S.posDebtCustomerId ? POS_CUSTOMERS.find(c=>c.id===S.posDebtCustomerId) : null;
-  const overLimit = debtCustomer && (debtCustomer.debtBalance + total) > debtCustomer.creditLimit;
+  // Payment composer state (Odoo split payments) \u2014 see P3 Stage B helpers.
+  const methods = posConfiguredMethods();
+  const lines = S.posPaymentLines || [];
+  const paid = posPaymentLinesPaid();
+  const remaining = posPaymentLinesRemaining(total);
+  const hasDeyn = posHasDeynLine();
+  const deynAmount = posDeynLineAmount();
+  const debtCustomer = (hasDeyn && S.posDebtCustomerId) ? POS_CUSTOMERS.find(c => c.id === S.posDebtCustomerId) : null;
+  const projectedBalance = debtCustomer ? Number((Number(debtCustomer.debtBalance||0) + deynAmount).toFixed(2)) : 0;
+  const overLimit = !!(debtCustomer && Number(debtCustomer.creditLimit||0) > 0 && projectedBalance > Number(debtCustomer.creditLimit||0));
+  const validation = posPaymentLinesValid(total);
+  const canValidate = cart.length > 0
+    && S.posSession?.state === 'OPENED'
+    && validation.ok;
 
   return `
     ${S.posSession?.state==='OPENED' ? `<div class="cashier-shift-banner" style="margin-bottom:12px"><span>🟢 Register #${S.posSession.id} open · ${esc(S.posSession.config_name||S.posConfig?.name||'Main Register')}</span><span class="shift-duration-badge">Expected $${Number(S.posSessionSummary?.expected_cash||S.posSession.opening_cash||0).toFixed(2)}</span></div>` : `<div class="cashier-shift-banner cashier-shift-idle" style="margin-bottom:12px;display:flex;align-items:center"><span style="flex:1">🔒 Register closed — open it before validating an order</span><button class="btn btn-primary btn-sm" id="btn-checkout-open-register">Open register</button></div>`}
@@ -4639,69 +4750,73 @@ function renderPOSCheckout() {
         </div>
 
         <div class="pos-payment-methods">
-          <div class="pos-pay-section-label">Payment method</div>
-          <div class="pos-pay-options">
-            <button class="pos-pay-btn${isCash?' active':''}" data-pay-method="cash" ${paymentEnabled('Cash')?'':'disabled'}>💵 Cash</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='evc'?' active':''} pos-pay-mobile" data-pay-method="evc" ${paymentEnabled('EVC Plus')?'':'disabled'}>📱 EVC Plus</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='edahab'?' active':''} pos-pay-mobile" data-pay-method="edahab" ${paymentEnabled('eDahab')?'':'disabled'}>💳 eDahab</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='zaad'?' active':''} pos-pay-mobile" data-pay-method="zaad" ${paymentEnabled('ZAAD')?'':'disabled'}>📲 Zaad</button>
-            <button class="pos-pay-btn${S.posPaymentMethod==='sahal'?' active':''}" data-pay-method="sahal" ${paymentEnabled('Sahal')?'':'disabled'}>💳 Sahal</button>
-            <button class="pos-pay-btn pos-pay-btn-stacked${isDeyn?' active':''} pos-pay-deyn" data-pay-method="deyn" ${paymentEnabled('Deyn')?'':'disabled'} title="Customer Credit — Pay Later">
-              <span class="pos-pay-btn-title">📒 Deyn</span>
-              <span class="pos-pay-btn-sub">Customer Credit · Pay Later</span>
-            </button>
+          <!-- Odoo-shaped split-payment composer (P3 Stage B). Total / Paid / Remaining
+               is authoritative UX; the backend re-validates every line. -->
+          <div class="pos-pay-tally" style="display:flex;justify-content:space-between;gap:14px;padding:8px 0;border-bottom:1px dashed rgba(255,255,255,0.15);color:#FFF;font-size:12px;letter-spacing:1px;text-transform:uppercase;font-weight:800">
+            <span>Total<br><span style="font-size:16px;color:#F5C411">$${total.toFixed(2)}</span></span>
+            <span>Paid<br><span style="font-size:16px;color:${paid>=total?'#22C55E':'#FFF'}">$${paid.toFixed(2)}</span></span>
+            <span>Remaining<br><span style="font-size:16px;color:${remaining>0?'#F5C411':'#22C55E'}">$${remaining.toFixed(2)}</span></span>
           </div>
 
-          ${isCash && cart.length > 0 ? `
-          <div class="pos-cash-tendered-box">
-            <div class="pos-cash-tendered-label">💵 Cash received from customer</div>
-            <div class="pos-cash-tendered-row">
-              <span class="pos-cash-currency">$</span>
-              <input class="pos-cash-tendered-input" id="pos-cash-tendered"
-                type="number" min="${total.toFixed(2)}" step="0.50" placeholder="${total.toFixed(2)}"
-                value="${S.posCashTendered||''}" />
-              <div class="pos-cash-quick-btns">
-                ${[Math.ceil(total), Math.ceil(total/5)*5, Math.ceil(total/10)*10].filter((v,i,a)=>a.indexOf(v)===i).map(v=>`<button class="pos-quick-cash" data-quick-cash="${v}">$${v}</button>`).join('')}
+          <div class="pos-pay-lines" style="display:flex;flex-direction:column;gap:8px;padding:8px 0">
+            ${lines.length === 0 ? `<div style="text-align:center;color:rgba(255,255,255,0.45);font-size:12px;padding:8px">No payment yet — tap a method below to add a line</div>` : lines.map((line, i) => `
+              <div class="pos-pay-line" data-line-idx="${i}" style="display:flex;align-items:center;gap:8px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:8px 10px">
+                <span style="font-weight:800;color:#F5C411;flex:0 0 90px;font-size:12px">${esc(line.method_name)}</span>
+                <span style="color:rgba(255,255,255,0.7);font-size:11px">$</span>
+                <input class="pos-pay-line-amount" data-line-idx="${i}" type="number" step="0.01" min="0" value="${Number(line.amount||0).toFixed(2)}"
+                  style="width:80px;background:rgba(0,0,0,0.35);color:#FFF;border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:4px 6px;font-family:var(--font-mono)"/>
+                ${line.method_type === 'cash' ? `
+                  <span style="color:rgba(255,255,255,0.5);font-size:11px;margin-left:6px">Tender $</span>
+                  <input class="pos-pay-line-tendered" data-line-idx="${i}" type="number" step="0.50" min="${Number(line.amount||0).toFixed(2)}" value="${Number(line.tendered||line.amount||0).toFixed(2)}"
+                    style="width:80px;background:rgba(0,0,0,0.35);color:#FFF;border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:4px 6px;font-family:var(--font-mono)"/>
+                  ${Number(line.tendered||0) > Number(line.amount||0) ? `<span style="color:#22C55E;font-size:11px;font-weight:800">Change $${(Number(line.tendered)-Number(line.amount)).toFixed(2)}</span>` : ''}
+                ` : line.method_type === 'mobile' ? `
+                  <input class="pos-pay-line-reference" data-line-idx="${i}" type="text" placeholder="Txn ref…" value="${esc(line.reference||'')}"
+                    style="width:120px;background:rgba(0,0,0,0.35);color:#FFF;border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:4px 6px;font-size:12px"/>
+                ` : line.method_type === 'credit' ? `
+                  <span style="color:rgba(255,255,255,0.5);font-size:11px;margin-left:6px">Customer Account (Deyn)</span>
+                ` : ''}
+                <button class="pos-pay-line-remove" data-line-idx="${i}" style="margin-left:auto;background:transparent;border:0;color:#EF4444;font-size:16px;cursor:pointer" title="Remove line">×</button>
               </div>
-            </div>
-            ${tendered > 0 && !tenderedShort ? `
-            <div class="pos-change-display">
-              <div class="pos-change-row"><span>Tendered</span><span class="pos-change-amount">$${tendered.toFixed(2)}</span></div>
-              <div class="pos-change-row pos-change-highlight"><span>🔁 Change</span><span class="pos-change-amount" style="color:#22c55e;font-size:20px">$${change.toFixed(2)}</span></div>
-            </div>` : ''}
-            ${tenderedShort ? `<div class="pos-cash-short">⚠ Short by $${(total-tendered).toFixed(2)}</div>` : ''}
-          </div>` : ''}
+            `).join('')}
+          </div>
 
-          ${isMobile && cart.length > 0 ? `
-          <div class="pos-mobile-info-box">
-            <div class="pos-mobile-info-icon">📱</div>
-            <div>
-              <div class="pos-mobile-info-title">Send exact amount via ${S.posPaymentMethod==='evc'?'EVC Plus':S.posPaymentMethod==='edahab'?'eDahab':S.posPaymentMethod==='zaad'?'Zaad':'Sahal'}</div>
-              <div class="pos-mobile-amount">$${total.toFixed(2)} USD</div>
-              <div class="pos-mobile-info-note">Customer sends the exact amount — no change needed.</div>
-            </div>
-          </div>` : ''}
+          <div class="pos-pay-add" style="display:flex;flex-wrap:wrap;gap:6px;padding:6px 0">
+            ${methods.length === 0 ? '<span style="color:rgba(255,255,255,0.5);font-size:12px">No payment methods enabled — open Settings → Payments</span>' : methods.map(m => `
+              <button class="pos-pay-add-btn" data-add-method="${esc(m.name)}" ${cart.length===0||remaining<=0.001?'disabled':''}
+                title="Add ${esc(m.name)} payment line"
+                style="background:${m.type==='credit'?'rgba(245,196,17,0.15)':'rgba(255,255,255,0.08)'};border:1px solid rgba(255,255,255,0.15);color:#FFF;padding:6px 10px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer">
+                + ${esc(m.name)}
+              </button>
+            `).join('')}
+          </div>
 
-          ${isDeyn ? `
-            <div class="pos-deyn-selector">
+          ${hasDeyn ? `
+            <div class="pos-deyn-selector" style="margin-top:10px">
               <div class="pos-deyn-banner">
-                <strong>Deyn — Customer Credit · Pay Later</strong>
-                <span>No cash or mobile-money is collected now. The sale is booked against the customer's account and must be settled later.</span>
+                <strong>Deyn — Customer Account</strong>
+                <span>Only the Deyn line amount ($${deynAmount.toFixed(2)}) will be booked against the customer's account.</span>
               </div>
               <label class="pos-pay-section-label">Customer (Buugga Deynta)</label>
               <select id="pos-deyn-customer" class="pos-deyn-select">
                 <option value="">— Select customer —</option>
-                ${POS_CUSTOMERS.map(c=>{ const used=c.debtBalance+total; const over=used>c.creditLimit; return `<option value="${c.id}" ${S.posDebtCustomerId===c.id?'selected':''}>${esc(c.name)} — Debt: $${c.debtBalance.toFixed(2)} / Limit: $${c.creditLimit} ${over?'⚠':'✓'}</option>`; }).join('')}
+                ${POS_CUSTOMERS.map(c => `<option value="${c.id}" ${S.posDebtCustomerId===c.id?'selected':''}>${esc(c.name)} — Balance: $${Number(c.debtBalance||0).toFixed(2)} / Limit: $${Number(c.creditLimit||0).toFixed(2)}</option>`).join('')}
               </select>
-              ${overLimit ? `<div class="pos-deyn-warning">⚠ Credit limit exceeded! Limit: $${debtCustomer.creditLimit}, total would be: $${(debtCustomer.debtBalance+total).toFixed(2)}.</div>` : ''}
-              ${debtCustomer && !overLimit ? `<div class="pos-deyn-ok">✓ ${debtCustomer.name} · New debt: $${(debtCustomer.debtBalance+total).toFixed(2)} / $${debtCustomer.creditLimit} limit</div>` : ''}
+              ${debtCustomer ? `
+                <div class="${overLimit?'pos-deyn-warning':'pos-deyn-ok'}" style="margin-top:6px">
+                  ${overLimit ? '⚠' : '✓'} ${esc(debtCustomer.name)} · Balance after this sale: $${projectedBalance.toFixed(2)} / limit $${Number(debtCustomer.creditLimit||0).toFixed(2)}
+                  ${overLimit ? ' — Odoo mode allows continuation; a credit warning will be recorded' : ''}
+                </div>
+              ` : ''}
             </div>
           ` : ''}
+
+          ${!validation.ok && lines.length > 0 ? `<div style="color:#F59E0B;font-size:11px;padding:4px 0;text-align:center">${esc(validation.reason)}</div>` : ''}
         </div>
 
         <div class="pos-cart-actions">
-          <button class="pos-charge-btn" id="btn-pos-charge" ${cart.length===0||overLimit||(isDeyn&&!S.posDebtCustomerId)||S.posSession?.state!=='OPENED'||(isCash&&tenderedShort)?'disabled':''}>
-            ${isCash && tendered > 0 ? `Collect $${total.toFixed(2)} · Change $${change.toFixed(2)}` : isMobile ? `Send $${total.toFixed(2)} →` : isDeyn ? `Record Deyn $${total.toFixed(2)}` : `Charge $${total.toFixed(2)}`}
+          <button class="pos-charge-btn" id="btn-pos-charge" ${canValidate?'':'disabled'}>
+            ${canValidate ? `Validate $${total.toFixed(2)}` : `Validate`}
           </button>
           <button class="pos-clear-btn" id="btn-pos-clear" ${cart.length===0?'disabled':''}>Clear</button>
         </div>
@@ -4770,9 +4885,26 @@ function renderPOSReceipt() {
             <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text-muted)"><span>Subtotal</span><span>$${r.subtotal.toFixed(2)}</span></div>
             <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text-muted)"><span>Tax (${Number(S.storeSettings.taxRate || 0)}%)</span><span>$${r.tax.toFixed(2)}</span></div>
             <div style="display:flex;justify-content:space-between;font-size:16px;font-weight:900;margin-top:8px;color:var(--purple-800)"><span>Total</span><span>$${r.total.toFixed(2)}</span></div>
-            <div style="display:flex;justify-content:space-between;font-size:12px;margin-top:8px;color:var(--text-muted)"><span>Paid via</span><span style="font-weight:700;color:var(--text-primary)">${esc(r.method)}</span></div>
-            ${r.amountPaid > r.total ? `<div style="display:flex;justify-content:space-between;font-size:12px;margin-top:4px;color:var(--text-muted)"><span>Cash tendered</span><span>$${r.amountPaid.toFixed(2)}</span></div>` : ''}
-            ${r.change > 0 ? `<div style="display:flex;justify-content:space-between;font-size:13px;margin-top:4px;font-weight:800"><span>Change</span><span>$${r.change.toFixed(2)}</span></div>` : ''}
+            ${Array.isArray(r.payment_lines) && r.payment_lines.length > 0 ? `
+              <div style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)">
+                <div style="font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:800;color:var(--text-muted);margin-bottom:6px">Payment</div>
+                ${r.payment_lines.map(line => `
+                  <div style="display:flex;justify-content:space-between;font-size:13px;padding:2px 0">
+                    <span>${esc(line.method)}</span>
+                    <span style="font-weight:700">$${Number(line.amount||0).toFixed(2)}</span>
+                  </div>
+                  ${line.tendered !== undefined && Number(line.tendered) > Number(line.amount) ? `
+                    <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);padding:0 8px">
+                      <span>Cash received</span><span>$${Number(line.tendered).toFixed(2)}</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:800;padding:0 8px">
+                      <span>Change</span><span>$${(Number(line.tendered)-Number(line.amount)).toFixed(2)}</span>
+                    </div>
+                  ` : ''}
+                  ${line.reference ? `<div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);padding:0 8px"><span>Ref</span><span style="font-family:var(--font-mono)">${esc(line.reference)}</span></div>` : ''}
+                `).join('')}
+              </div>
+            ` : `<div style="display:flex;justify-content:space-between;font-size:12px;margin-top:8px;color:var(--text-muted)"><span>Paid via</span><span style="font-weight:700;color:var(--text-primary)">${esc(r.method)}</span></div>`}
           </div>
           <div style="text-align:center;font-size:11px;color:var(--text-muted);padding-top:12px;border-top:1px dashed var(--border)">${esc(S.storeSettings.receiptFooter)}</div>
         </div>
@@ -6048,28 +6180,65 @@ function wirePOSEvents() {
     document.querySelectorAll('[data-pos-cat]').forEach(btn => {
       btn.addEventListener('click', () => { S.posSearchTerm = btn.dataset.posCat==='All'?'':btn.dataset.posCat; render(); });
     });
-    document.querySelectorAll('[data-pay-method]').forEach(btn => {
-      btn.addEventListener('click', () => { S.posPaymentMethod=btn.dataset.payMethod; S.posDebtCustomerId=null; S.posCashTendered=''; render(); });
+    // ---- Odoo-style split-payment composer wiring (P3 Stage B) ----
+    // Compute total for helpers that need it.
+    const _payTotal = (() => {
+      const _sub = S.posCart.reduce((s,item)=>{ const p = item.isWholesale?item.wholesalePrice:item.price; return s + p*item.qty; }, 0);
+      const _tax = _sub * Number(S.storeSettings.taxRate||0) / 100;
+      return Number((_sub + _tax).toFixed(2));
+    })();
+    // Add-line buttons — push a new line for the given method with amount
+    // defaulted to the remaining unallocated.
+    document.querySelectorAll('[data-add-method]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (btn.disabled) return;
+        posAddPaymentLine(btn.dataset.addMethod, _payTotal);
+        render();
+      });
     });
+    // Per-line amount editing (any type).
+    document.querySelectorAll('.pos-pay-line-amount').forEach(inp => {
+      inp.addEventListener('input', () => {
+        const idx = parseInt(inp.dataset.lineIdx);
+        const v = parseFloat(inp.value);
+        posUpdatePaymentLine(idx, { amount: Number.isFinite(v) ? Math.max(0, v) : 0 });
+        render();
+      });
+    });
+    // Cash line — tendered input.
+    document.querySelectorAll('.pos-pay-line-tendered').forEach(inp => {
+      inp.addEventListener('input', () => {
+        const idx = parseInt(inp.dataset.lineIdx);
+        const v = parseFloat(inp.value);
+        posUpdatePaymentLine(idx, { tendered: Number.isFinite(v) ? Math.max(0, v) : 0 });
+        render();
+      });
+    });
+    // Mobile line — reference (transaction id).
+    document.querySelectorAll('.pos-pay-line-reference').forEach(inp => {
+      inp.addEventListener('input', () => {
+        const idx = parseInt(inp.dataset.lineIdx);
+        posUpdatePaymentLine(idx, { reference: inp.value });
+      });
+    });
+    // Remove line.
+    document.querySelectorAll('.pos-pay-line-remove').forEach(btn => {
+      btn.addEventListener('click', () => {
+        posRemovePaymentLine(parseInt(btn.dataset.lineIdx));
+        render();
+      });
+    });
+    // Deyn customer selector (order-level — one customer per order regardless
+    // of how many Deyn lines exist).
     const deynSel = document.getElementById('pos-deyn-customer');
     if (deynSel) deynSel.addEventListener('change', () => { S.posDebtCustomerId=parseInt(deynSel.value)||null; render(); });
-
-    // ---- Cash tendered / change ----
-    const tenderedInput = document.getElementById('pos-cash-tendered');
-    if (tenderedInput) {
-      tenderedInput.addEventListener('input', () => { S.posCashTendered = tenderedInput.value; render(); });
-      tenderedInput.addEventListener('focus', () => tenderedInput.select());
-    }
-    document.querySelectorAll('[data-quick-cash]').forEach(btn => {
-      btn.addEventListener('click', () => { S.posCashTendered = btn.dataset.quickCash; render(); });
-    });
 
     // ---- Hold / Resume / Discard ----
     document.getElementById('btn-hold-order')?.addEventListener('click', () => {
       if (!S.posCart.length) return;
       if (!S.posHeldOrders) S.posHeldOrders = [];
-      S.posHeldOrders.push({ id: Date.now(), cashier: S.posActiveUser?.name||'?', items: [...S.posCart], customer: S.posDebtCustomerId, ts: Date.now() });
-      S.posCart = []; S.posDebtCustomerId = null; S.posCashTendered = ''; S.posReceiptVisible = false; S.posShowHeld = false;
+      S.posHeldOrders.push({ id: Date.now(), cashier: S.posActiveUser?.name||'?', items: [...S.posCart], customer: S.posDebtCustomerId, payment_lines: [...(S.posPaymentLines||[])], ts: Date.now() });
+      S.posCart = []; posResetPaymentLines(); S.posReceiptVisible = false; S.posShowHeld = false;
       render();
     });
     document.getElementById('btn-show-held')?.addEventListener('click', () => { S.posShowHeld = !S.posShowHeld; render(); });
@@ -6079,7 +6248,10 @@ function wirePOSEvents() {
         const held = (S.posHeldOrders||[])[idx];
         if (!held) return;
         if (S.posCart.length > 0 && !confirm('Replace current cart with held order?')) return;
-        S.posCart = [...held.items]; S.posDebtCustomerId = held.customer; S.posCashTendered = '';
+        S.posCart = [...held.items];
+        S.posDebtCustomerId = held.customer || null;
+        S.posPaymentLines = Array.isArray(held.payment_lines) ? [...held.payment_lines] : [];
+        S.posCashTendered = '';
         S.posHeldOrders.splice(idx, 1); S.posShowHeld = false; render();
       });
     });
@@ -6090,16 +6262,17 @@ function wirePOSEvents() {
     const chargeBtn = document.getElementById('btn-pos-charge');
     if (chargeBtn) {
       chargeBtn.addEventListener('click', async () => {
-        if (S.posCart.length===0) return;
-        if (['evc','edahab','zaad'].includes(S.posPaymentMethod)) {
-          S.posMobileMoneyModal=true; S.mobilePhone=''; S.mobileTxId=''; S.mobileError='';
-          render(); return;
-        }
-        await finalizeCharge();
+        if (chargeBtn.disabled) return;
+        // Guard against double-click while the request is in flight —
+        // idempotency UUID also protects the backend, but this is a UX belt.
+        chargeBtn.disabled = true;
+        chargeBtn.textContent = 'Validating…';
+        try { await finalizeCharge(); }
+        finally { /* render() re-renders the button anyway */ }
       });
     }
     const clearBtn = document.getElementById('btn-pos-clear');
-    if (clearBtn) clearBtn.addEventListener('click', () => { S.posCart=[]; S.posCashTendered=''; render(); });
+    if (clearBtn) clearBtn.addEventListener('click', () => { S.posCart=[]; posResetPaymentLines(); render(); });
   }
 
   if (S.posMobileMoneyModal) {
@@ -6124,7 +6297,7 @@ function wirePOSEvents() {
 
   if (S.posReceiptVisible) {
     const newBtn = document.getElementById('btn-receipt-new');
-    if (newBtn) newBtn.addEventListener('click', () => { S.posReceiptVisible=false; S.posCart=[]; render(); });
+    if (newBtn) newBtn.addEventListener('click', () => { S.posReceiptVisible=false; S.posCart=[]; posResetPaymentLines(); render(); });
     const printBtn = document.getElementById('btn-receipt-print');
     if (printBtn) printBtn.addEventListener('click', () => { window.print(); });
   }
@@ -6202,24 +6375,30 @@ async function finalizeCharge() {
     alert('Checkout needs a connection so stock and the receipt can be saved safely.');
     return;
   }
-  if (S.posPaymentMethod === 'deyn' && !S.posDebtCustomerId) {
-    alert('Select a customer before recording a credit sale.');
-    return;
-  }
   if (!S.posSession || S.posSession.state !== 'OPENED') {
-    // Don't slip in a JS prompt mid-checkout — Odoo pattern is: block, force
-    // the operator through Opening Control, then let them retry the sale.
+    // Odoo pattern: block, force operator through Opening Control, then retry.
     openRegisterModal('open');
     alert('The register is closed. Open it (with the correct opening cash) before validating this sale.');
-    return;
+    render(); return;
   }
   const cart = S.posCart.map(item => ({ ...item }));
   const subtotal = S.posCart.reduce((s,item)=>{ const p=item.isWholesale?item.wholesalePrice:item.price; return s+p*item.qty; }, 0);
   const tax = subtotal * (Number(S.storeSettings.taxRate || 0) / 100);
-  const total = subtotal + tax;
-  const methodLabels = {cash:'Cash',evc:'EVC Plus',edahab:'eDahab',zaad:'Zaad',sahal:'Sahal',deyn:'Deyn (Credit)'};
+  const total = Number((subtotal + tax).toFixed(2));
+  // Front-side validation gate (backend re-validates every line).
+  const check = posPaymentLinesValid(total);
+  if (!check.ok) { alert(check.reason); render(); return; }
+  const lines = (S.posPaymentLines || []).map(l => ({
+    method: l.method_name,
+    amount: Number(l.amount),
+    tendered: l.method_type === 'cash' ? Number(l.tendered || l.amount) : undefined,
+    reference: l.reference || undefined,
+  }));
   try {
-    const result = await posCompleteCheckout(cart, S.posDebtCustomerId, S.posPaymentMethod);
+    const result = await posCompleteCheckout(cart, S.posDebtCustomerId, lines);
+    // Snapshot the payment lines exactly as sent, so the receipt reflects
+    // what the backend accepted (Rule #49). The stored order-response
+    // payment_method field can carry a joined summary like "Cash + EVC".
     S.posLastReceipt = {
       id: result.reference_number,
       date: new Date(result.created_at || Date.now()).toLocaleString(),
@@ -6227,18 +6406,25 @@ async function finalizeCharge() {
       subtotal: Number(result.subtotal ?? subtotal),
       tax: Number(result.tax_amount ?? tax),
       total: Number(result.total_amount ?? total),
-      method: methodLabels[S.posPaymentMethod] || result.payment_method || 'Cash',
-      amountPaid: Number(result.amount_paid ?? total) + Number(result.amount_return ?? 0),
-      change: Number(result.amount_return ?? 0),
-      mobilePhone:S.mobilePhone||null,
-      mobileTxId:S.mobileTxId||null,
+      payment_lines: lines,
+      method: result.payment_method || lines.map(l => l.method).join(' + '),
+      amountPaid: lines.reduce((s,l) => s + (l.tendered || l.amount), 0),
+      change: lines.filter(l => l.tendered !== undefined).reduce((s,l) => s + Math.max(0, (l.tendered - l.amount)), 0),
+      credit_warning: result.credit_warning || null,
+      customer_id: S.posDebtCustomerId || null,
     };
-    S.posReceiptVisible=true;
-    S.posCart=[];
-    S.posMobileMoneyModal=false;
+    S.posReceiptVisible = true;
+    S.posCart = [];
+    posResetPaymentLines();
+    S.posMobileMoneyModal = false;
     await posBootstrap();
+    if (S.posLastReceipt.credit_warning) {
+      // Odoo-mode warn: surface after the sale succeeded (Rule #28).
+      const w = S.posLastReceipt.credit_warning;
+      setTimeout(() => alert(`Credit warning: this customer's balance is now $${Number(w.projected_balance).toFixed(2)}, which is $${Number(w.overage).toFixed(2)} over their $${Number(w.credit_limit).toFixed(2)} limit.`), 50);
+    }
   } catch (error) {
-    S.posMobileMoneyModal=false;
+    S.posMobileMoneyModal = false;
     alert(error.message);
     render();
   }

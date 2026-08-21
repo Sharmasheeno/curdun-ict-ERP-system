@@ -13,8 +13,54 @@ class PosService
     public function __construct(
         private Database $db,
         private PlatformService $platform,
-        private AuditLogRepository $audit
+        private AuditLogRepository $audit,
+        private AuthService $auth
     ) {}
+
+    /**
+     * Optional Curdun "Extra POS Security" (Rule #9). Odoo's default is that
+     * Basic/Advanced employees perform refunds, cash out, closing variance,
+     * discount overrides, and void-paid without a manager approval overlay.
+     * A tenant that wants stricter behaviour enables toggles in
+     * pos_settings.extra_security; only then do we require an
+     * X-Manager-Approval token (issued by /auth/manager-approval and
+     * consumed once here).
+     *
+     *   $action  — must match the action name the approval was issued for.
+     *   $context — ['target_id'=>..., 'amount'=>...] optional constraints.
+     *   $settingKey — the extra_security key (e.g. 'refund') OR a threshold
+     *                 pair ['discount_above_pct'=>10.0] meaning: require
+     *                 approval if $context['discount_pct'] > threshold.
+     */
+    private function enforceExtraSecurity(int $companyId, string $action, array $context, string|array $settingKey): void
+    {
+        $settings = $this->settingsData($companyId);
+        $extra = (array)($settings['extra_security'] ?? []);
+
+        // Boolean gate (always-on) or threshold gate (on when a numeric
+        // constraint is exceeded).
+        $required = false;
+        if (is_string($settingKey)) {
+            $required = !empty($extra[$settingKey]);
+        } else {
+            foreach ($settingKey as $key => $threshold) {
+                if (!array_key_exists($key, $extra)) continue;
+                $configured = $extra[$key];
+                if ($configured === null || $configured === '' || $configured === false) continue;
+                $actual = (float)($context['_threshold_value'] ?? 0);
+                if ($actual > (float)$configured) { $required = true; break; }
+            }
+        }
+        if (!$required) return;
+
+        $headerToken = $_SERVER['HTTP_X_MANAGER_APPROVAL'] ?? null;
+        $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+        $constraints = ['action' => $action];
+        if (isset($context['target_id'])) $constraints['target_id'] = (int)$context['target_id'];
+        if (isset($context['amount']))    $constraints['amount']    = (float)$context['amount'];
+        // consumeApproval throws with a clear 403 on any mismatch/expiry/reuse.
+        $this->auth->consumeApproval($headerToken, $constraints, $ip);
+    }
 
     /**
      * Resolve the acting party and enforce the required Odoo access level.
@@ -445,6 +491,12 @@ class PosService
     {
         [$user,$companyId]=$this->context();$type=strtoupper((string)($data['type']??''));$amount=round((float)($data['amount']??0),2);$reason=trim((string)($data['reason']??''));
         if(!in_array($type,['IN','OUT'],true)||$amount<=0||$reason==='')throw new Exception('Cash movement type, amount, and reason are required.',422);
+        // Optional Curdun Extra Security (Rule #9): cash OUT can require an
+        // approval token when the tenant enables the extra_security.cash_out
+        // toggle. Cash IN never does — Odoo treats it as a routine deposit.
+        if ($type === 'OUT') {
+            $this->enforceExtraSecurity($companyId,'cash-out',['target_id'=>$sessionId,'amount'=>$amount],'cash_out');
+        }
         $session=$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company AND state='OPENED'",['id'=>$sessionId,'company'=>$companyId])->fetch();
         if(!$session)throw new Exception('The POS register is not open.',409);
         $this->db->query("INSERT INTO pos_cash_movements (company_id,session_id,user_id,movement_type,amount,reason) VALUES (:company,:session,:user,:type,:amount,:reason)",['company'=>$companyId,'session'=>$sessionId,'user'=>$user['id'],'type'=>$type,'amount'=>$amount,'reason'=>$reason]);
@@ -477,6 +529,8 @@ class PosService
     {
         // BASIC-level operation — pos.refund is enforced by the route.
         [$user,$companyId]=$this->context();
+        // Optional Curdun Extra Security (Rule #9). Odoo default = off.
+        $this->enforceExtraSecurity($companyId,'refund',['target_id'=>$id],'refund');
         $this->db->beginTransaction();
         try {
             $order=$this->db->query("SELECT * FROM orders WHERE id=:id AND company_id=:company FOR UPDATE",['id'=>$id,'company'=>$companyId])->fetch();
@@ -610,9 +664,29 @@ class PosService
             if(round($applied,2)+0.0001<$total)throw new Exception('The order is not fully paid.',422);
             if(round($applied,2)>$total+0.0001)throw new Exception('Payment amounts exceed the order total. Use the tendered field for cash overpayment, not the amount.',422);
             $tendered=$applied+$change; // for legacy fields in orders row
-            if($hasDebt){
-                $limit=(float)($customer['credit_limit']??0);$balance=(float)($customer['balance']??0);
-                if($limit<=0||$balance+$debtAmount>$limit)throw new Exception('This sale exceeds the customer credit limit.',422);
+            // Rule #28 — Odoo's Customer Account credit limit is warn-only by
+            // default. The response carries a `credit_warning` field so the
+            // POS can surface it. A tenant that wants Odoo blocking behaviour
+            // enables extra_security.credit_over_limit_strict — then we hard
+            // reject at 422 as before.
+            $creditWarning = null;
+            if ($hasDebt) {
+                $limit   = (float)($customer['credit_limit'] ?? 0);
+                $balance = (float)($customer['balance'] ?? 0);
+                $projected = $balance + $debtAmount;
+                if ($limit > 0 && $projected > $limit) {
+                    $strict = !empty($this->settingsData($companyId)['extra_security']['credit_over_limit_strict']);
+                    if ($strict) {
+                        throw new Exception('This sale exceeds the customer credit limit.', 422);
+                    }
+                    $creditWarning = [
+                        'customer_id'      => $customerId,
+                        'credit_limit'     => $limit,
+                        'previous_balance' => $balance,
+                        'projected_balance'=> $projected,
+                        'overage'          => round($projected - $limit, 2),
+                    ];
+                }
             }
             $sequence=$this->nextSequence((int)$config['id']);$reference=$this->posReference($config,$sequence);$toInvoice=!empty($data['to_invoice'])||$hasDebt;
             $this->db->query("INSERT INTO orders (company_id,customer_id,user_id,warehouse_id,pos_session_id,uuid,sequence_number,reference_number,status,pos_state,order_date,subtotal,tax_amount,discount_amount,total_amount,amount_paid,amount_return,to_invoice,notes) VALUES (:company,:customer,:user,:warehouse,:session,:uuid,:sequence,:reference,'COMPLETED','done',CURDATE(),:subtotal,:tax,:discount,:total,:paid,:returned,:invoice,:notes)",
@@ -663,7 +737,9 @@ class PosService
             $this->log($user,$companyId,'CHECKOUT',$orderId,['reference'=>$reference,'uuid'=>$clientUuid,'session_id'=>$session['id'],'total'=>$total,'payments'=>array_map(fn($p)=>['method'=>$p['method']['name'],'amount'=>$p['amount']],$payments),'change'=>$change]);$this->db->commit();
         }catch(\Throwable $e){if($this->db->getConnection()->inTransaction())$this->db->rollback();throw $e;}
         $this->syncStockAlerts($companyId);
-        return $this->checkoutResponse($orderId,$companyId,false);
+        $response = $this->checkoutResponse($orderId,$companyId,false);
+        if (!empty($creditWarning)) $response['credit_warning'] = $creditWarning;
+        return $response;
     }
 
     private function paymentMethod(string $raw): array
@@ -787,8 +863,17 @@ class PosService
         $config=$this->resolveConfig($companyId,$cashier['branch_id']?(int)$cashier['branch_id']:null);
         $sessionId=(int)($data['session_id']??0);$session=$sessionId?$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company AND state IN ('OPENED','CLOSING_CONTROL')",['id'=>$sessionId,'company'=>$companyId])->fetch():$this->currentSessionForConfig($companyId,(int)$config['id']);if(!$session)throw new Exception('No open POS register session was found.',404);
         if((int)$session['config_id']!==(int)$config['id'])throw new Exception('The selected cashier is not assigned to this register.',403);
-        $summary=$this->sessionSummary((int)$session['id']);$expected=(float)$summary['expected_cash'];$variance=round($counted-$expected,2);$isManager=PosAccess::can('pos.closing_control');$approved=!empty($data['approve_difference']);
-        if(abs($variance)>(float)$config['maximum_difference']&&!($isManager&&$approved))throw new Exception('The cash difference exceeds the allowed limit. A Store Manager must approve the closing.',409);
+        $summary=$this->sessionSummary((int)$session['id']);$expected=(float)$summary['expected_cash'];$variance=round($counted-$expected,2);
+        // Odoo default: no hardcoded maximum difference — the closer chooses
+        // whether the count is accepted. If the tenant enables the Curdun
+        // extra_security.variance_above threshold, require a manager approval
+        // token when |variance| exceeds that amount. Rule #45.
+        $this->enforceExtraSecurity(
+            $companyId,
+            'close-variance',
+            ['target_id'=>(int)$session['id'],'amount'=>abs($variance),'_threshold_value'=>abs($variance)],
+            ['variance_above'=>(float)($this->settingsData($companyId)['extra_security']['variance_above']??0)]
+        );
         $this->db->beginTransaction();try{
             $locked=$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company FOR UPDATE",['id'=>$session['id'],'company'=>$companyId])->fetch();if(!$locked||$locked['state']==='CLOSED')throw new Exception('This register session is already closed.',409);
             $this->db->query("UPDATE pos_sessions SET state='CLOSED',expected_cash=:expected,counted_cash=:counted,difference_amount=:variance,closing_note=:notes,closed_by=:closed_by,closed_at=NOW() WHERE id=:id",['expected'=>$expected,'counted'=>$counted,'variance'=>$variance,'notes'=>$data['notes']??null,'closed_by'=>$user['id'],'id'=>$session['id']]);
@@ -800,7 +885,18 @@ class PosService
 
     private function settingsData(int $companyId): array
     {
-        $defaults=['store_name'=>Auth::user()['company_name']??'Retail Store','tax_rate'=>5,'receipt_header'=>Auth::user()['company_name']??'Retail Store','receipt_footer'=>'Thank you for shopping with us!','receipt_barcode'=>true,'default_branch_id'=>Auth::user()['branch_id']??null,'cash_control'=>true,'opening_control'=>true,'maximum_difference'=>20,'payments'=>['Cash'=>true,'EVC Plus'=>true,'eDahab'=>true,'ZAAD'=>true,'Sahal'=>true,'Deyn'=>true]];
+        // Odoo defaults for Extra Security (Rule #9): every toggle OFF. Enable
+        // per company to require an X-Manager-Approval header for these ops.
+        $extraSecurityDefaults = [
+            'refund'                     => false,
+            'cash_out'                   => false,
+            'void_paid'                  => false,
+            'price_override'             => false,
+            'discount_above_pct'         => null, // null OR numeric %; approval kicks in when the line discount exceeds
+            'variance_above'             => null, // null OR numeric $; approval kicks in on close when |variance| exceeds
+            'credit_over_limit_strict'   => false, // Rule #28 — Odoo mode warns; enable to hard-block
+        ];
+        $defaults=['store_name'=>Auth::user()['company_name']??'Retail Store','tax_rate'=>5,'receipt_header'=>Auth::user()['company_name']??'Retail Store','receipt_footer'=>'Thank you for shopping with us!','receipt_barcode'=>true,'default_branch_id'=>Auth::user()['branch_id']??null,'cash_control'=>true,'opening_control'=>true,'maximum_difference'=>20,'payments'=>['Cash'=>true,'EVC Plus'=>true,'eDahab'=>true,'ZAAD'=>true,'Sahal'=>true,'Deyn'=>true],'extra_security'=>$extraSecurityDefaults];
         $rows=$this->db->query("SELECT `key`,value,type FROM settings WHERE company_id=:company AND `key` LIKE 'pos.%'",['company'=>$companyId])->fetchAll();
         foreach($rows as $row){$key=substr($row['key'],4);$value=$row['value'];if($row['type']==='json')$value=json_decode($value,true);elseif($row['type']==='integer')$value=(int)$value;elseif($row['type']==='boolean')$value=(bool)$value;$defaults[$key]=$value;}
         return $defaults;
@@ -808,7 +904,7 @@ class PosService
     public function settings(): array { [, $companyId]=$this->context();return $this->settingsData($companyId); }
     public function updateSettings(array $data): array
     {
-        [$user,$companyId]=$this->context(true);$allowed=['store_name','tax_rate','receipt_header','receipt_footer','receipt_barcode','default_branch_id','cash_control','opening_control','maximum_difference','payments'];
+        [$user,$companyId]=$this->context(true);$allowed=['store_name','tax_rate','receipt_header','receipt_footer','receipt_barcode','default_branch_id','cash_control','opening_control','maximum_difference','payments','extra_security'];
         foreach($allowed as $key){if(!array_key_exists($key,$data))continue;$value=$data[$key];$type='string';if(is_array($value)){$value=json_encode($value);$type='json';}elseif(is_bool($value)){$value=$value?'1':'0';$type='boolean';}elseif(is_int($value)){$type='integer';}
             $this->db->query("INSERT INTO settings (company_id,`key`,value,type) VALUES (:company,:key,:value,:type) ON DUPLICATE KEY UPDATE value=VALUES(value),type=VALUES(type)",['company'=>$companyId,'key'=>'pos.'.$key,'value'=>(string)$value,'type'=>$type]);}
         $config=$this->resolveConfig($companyId,isset($data['default_branch_id'])?(int)$data['default_branch_id']:(isset($user['branch_id'])?(int)$user['branch_id']:null));

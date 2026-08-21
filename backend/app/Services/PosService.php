@@ -938,7 +938,7 @@ class PosService
                     $name = (string)($p['method'] ?? $p['payment_method'] ?? '');
                     if ($name === '') throw new Exception('Refund payment method is required.', 422);
                     $pm = $this->paymentMethod($name);
-                    $this->assertPaymentEnabled($companyId, $pm['name']);
+                    $this->assertPaymentEnabled($companyId, $pm['name'], (int)$config['id']);
                     $refundPaymentLines[] = ['method'=>$pm, 'amount'=>$amt, 'reference'=>$p['reference'] ?? null];
                     $sum += $amt;
                 }
@@ -950,7 +950,7 @@ class PosService
                 $methodName = (string)($data['payment_method']
                     ?? ($originalPayments[0]['method_name'] ?? ($legacyDebt ? 'Deyn' : 'Cash')));
                 $pm = $this->paymentMethod($methodName);
-                $this->assertPaymentEnabled($companyId, $pm['name']);
+                $this->assertPaymentEnabled($companyId, $pm['name'], (int)$config['id']);
                 $refundPaymentLines[] = ['method'=>$pm, 'amount'=>$refundAbs, 'reference'=>null];
             }
 
@@ -1103,7 +1103,8 @@ class PosService
             $payments=[];$applied=0.0;$change=0.0;$debtAmount=0.0;$hasCash=false;$hasDebt=false;
             foreach($paymentLines as $paymentLine){
                 $payment=$this->paymentMethod((string)($paymentLine['method']??$paymentLine['payment_method']??'Cash'));
-                $this->assertPaymentEnabled($companyId,$payment['name']);
+                // P8.1 — every payment line must be assigned to THIS POS config.
+                $this->assertPaymentEnabled($companyId,$payment['name'],(int)$config['id']);
                 $amount=round((float)($paymentLine['amount']??0),2);
                 if($amount<=0)throw new Exception('Payment amounts must be greater than zero.',422);
                 $isCash=($payment['type']==='cash');
@@ -1268,11 +1269,42 @@ class PosService
         ];
     }
 
-    private function assertPaymentEnabled(int $companyId,string $name): void
+    /**
+     * P8.1 — Gate a payment method against the ACTIVE POS configuration.
+     * The pos_config_payment_methods join is the authoritative source.
+     * If $configId is null (unusual — settlement path from an old caller),
+     * we fall back to the company-level enable dict for backwards compat.
+     * A method that is not assigned to the POS is rejected before any
+     * financial write, and the operator sees a clear message.
+     */
+    private function assertPaymentEnabled(int $companyId, string $name, ?int $configId = null): void
     {
-        $configured=$this->settingsData($companyId)['payments']??[];
-        foreach($configured as $configuredName=>$enabled)if(strtolower((string)$configuredName)===strtolower($name)){if(!$enabled)throw new Exception("{$name} is disabled in POS settings.",422);return;}
-        throw new Exception("{$name} is not configured for this POS.",422);
+        if ($configId !== null) {
+            $row = $this->db->query(
+                "SELECT pcpm.enabled, pm.name
+                 FROM pos_config_payment_methods pcpm
+                 JOIN payment_methods pm ON pm.id = pcpm.payment_method_id
+                 WHERE pcpm.pos_config_id = :config AND LOWER(pm.name) = LOWER(:name)
+                 LIMIT 1",
+                ['config' => $configId, 'name' => $name]
+            )->fetch();
+            if (!$row) {
+                throw new Exception("{$name} is not assigned to this POS. An administrator can add it in Settings → Payments.", 422);
+            }
+            if (!(int)$row['enabled']) {
+                throw new Exception("{$name} is disabled on this POS.", 422);
+            }
+            return;
+        }
+        // Legacy fallback — company-wide enable map (pre-P8.1 callers).
+        $configured = $this->settingsData($companyId)['payments'] ?? [];
+        foreach ($configured as $configuredName => $enabled) {
+            if (strtolower((string)$configuredName) === strtolower($name)) {
+                if (!$enabled) throw new Exception("{$name} is disabled in POS settings.", 422);
+                return;
+            }
+        }
+        throw new Exception("{$name} is not configured for this POS.", 422);
     }
 
     private function nextSequence(int $configId): int
@@ -1329,7 +1361,10 @@ class PosService
         if ($pm['type'] === 'credit') {
             throw new Exception('A Customer-Account method cannot be used to settle a Customer Account balance.', 422);
         }
-        $this->assertPaymentEnabled($companyId, $pm['name']);
+        // P8.1 — settlement method must be assigned to the cashier's active
+        // POS. Resolve the config for the acting user, then gate.
+        $settleConfig = $this->resolveConfig($companyId, isset($user['branch_id']) ? (int)$user['branch_id'] : null);
+        $this->assertPaymentEnabled($companyId, $pm['name'], (int)$settleConfig['id']);
         $sessionId = $this->currentOpenSessionId($companyId, $user);
 
         // Atomically: ledger entry + balance update + (cash → session cash IN) —
@@ -1512,16 +1547,34 @@ class PosService
             'variance_above'             => null, // null OR numeric $; approval kicks in on close when |variance| exceeds
             'credit_over_limit_strict'   => false, // Rule #28 — Odoo mode warns; enable to hard-block
         ];
-        // P8 — payments defaults are derived from the payment_methods table
-        // so a rename ("Deyn" → "Customer Account") is picked up here too.
+        // P8 / P8.1 — payments come from the pos_config_payment_methods join
+        // for the ACTING user's active POS config. A method that is not
+        // assigned to the config shows enabled=false in the response, and
+        // checkout/refund/settlement will reject it server-side. Historical
+        // pos_payments rows are unaffected by any change here (Rule #10).
+        $branchId = Auth::user()['branch_id'] ?? null;
+        try {
+            $activeConfig = $this->resolveConfig($companyId, $branchId ? (int)$branchId : null);
+            $activeConfigId = (int)$activeConfig['id'];
+        } catch (\Throwable $_) { $activeConfigId = null; }
+
         $methodRows = $this->db->query(
-            "SELECT id, name, type, integration_type, identify_customer, `sequence`, status
-             FROM payment_methods WHERE status='active' ORDER BY `sequence`, id"
+            "SELECT pm.id, pm.name, pm.type, pm.integration_type, pm.identify_customer,
+                    COALESCE(pcpm.`sequence`, pm.`sequence`) AS `sequence`,
+                    COALESCE(pcpm.enabled, 0) AS assigned_enabled,
+                    (pcpm.pos_config_id IS NOT NULL) AS is_assigned
+             FROM payment_methods pm
+             LEFT JOIN pos_config_payment_methods pcpm
+                    ON pcpm.payment_method_id = pm.id AND pcpm.pos_config_id = :config
+             WHERE pm.status='active'
+             ORDER BY COALESCE(pcpm.`sequence`, pm.`sequence`), pm.id",
+            ['config' => $activeConfigId ?? 0]
         )->fetchAll();
         $paymentsDefault = [];
         $paymentMethodsMeta = [];
         foreach ($methodRows as $m) {
-            $paymentsDefault[$m['name']] = true;
+            $enabled = (int)$m['assigned_enabled'] === 1;
+            $paymentsDefault[$m['name']] = $enabled;
             $paymentMethodsMeta[] = [
                 'id'                => (int)$m['id'],
                 'name'              => $m['name'],
@@ -1529,11 +1582,20 @@ class PosService
                 'integration_type'  => $m['integration_type'],
                 'identify_customer' => (int)$m['identify_customer'],
                 'sequence'          => (int)$m['sequence'],
+                'enabled'           => $enabled,
+                'assigned'          => (int)$m['is_assigned'] === 1,
             ];
         }
-        $defaults=['store_name'=>Auth::user()['company_name']??'Retail Store','tax_rate'=>5,'receipt_header'=>Auth::user()['company_name']??'Retail Store','receipt_footer'=>'Thank you for shopping with us!','receipt_barcode'=>true,'default_branch_id'=>Auth::user()['branch_id']??null,'cash_control'=>true,'opening_control'=>true,'maximum_difference'=>20,'payments'=>$paymentsDefault,'payment_methods'=>$paymentMethodsMeta,'extra_security'=>$extraSecurityDefaults];
+        $defaults=['store_name'=>Auth::user()['company_name']??'Retail Store','tax_rate'=>5,'receipt_header'=>Auth::user()['company_name']??'Retail Store','receipt_footer'=>'Thank you for shopping with us!','receipt_barcode'=>true,'default_branch_id'=>Auth::user()['branch_id']??null,'cash_control'=>true,'opening_control'=>true,'maximum_difference'=>20,'payments'=>$paymentsDefault,'payment_methods'=>$paymentMethodsMeta,'pos_config_id'=>$activeConfigId,'extra_security'=>$extraSecurityDefaults];
         $rows=$this->db->query("SELECT `key`,value,type FROM settings WHERE company_id=:company AND `key` LIKE 'pos.%'",['company'=>$companyId])->fetchAll();
-        foreach($rows as $row){$key=substr($row['key'],4);$value=$row['value'];if($row['type']==='json')$value=json_decode($value,true);elseif($row['type']==='integer')$value=(int)$value;elseif($row['type']==='boolean')$value=(bool)$value;$defaults[$key]=$value;}
+        foreach($rows as $row){
+            $key=substr($row['key'],4);
+            // 'payments' is now sourced from pos_config_payment_methods per
+            // P8.1; ignore any stale settings-row copy so the UI reflects the
+            // authoritative per-POS assignment.
+            if ($key === 'payments' || $key === 'payment_methods') continue;
+            $value=$row['value'];if($row['type']==='json')$value=json_decode($value,true);elseif($row['type']==='integer')$value=(int)$value;elseif($row['type']==='boolean')$value=(bool)$value;$defaults[$key]=$value;
+        }
         return $defaults;
     }
     public function settings(): array { [, $companyId]=$this->context();return $this->settingsData($companyId); }
@@ -1545,9 +1607,38 @@ class PosService
         // authorised admin browser account gets 403 for a purely back-office
         // action the account is allowed to perform.
         [$user,$companyId]=$this->context();$allowed=['store_name','tax_rate','receipt_header','receipt_footer','receipt_barcode','default_branch_id','cash_control','opening_control','maximum_difference','payments','extra_security'];
-        foreach($allowed as $key){if(!array_key_exists($key,$data))continue;$value=$data[$key];$type='string';if(is_array($value)){$value=json_encode($value);$type='json';}elseif(is_bool($value)){$value=$value?'1':'0';$type='boolean';}elseif(is_int($value)){$type='integer';}
-            $this->db->query("INSERT INTO settings (company_id,`key`,value,type) VALUES (:company,:key,:value,:type) ON DUPLICATE KEY UPDATE value=VALUES(value),type=VALUES(type)",['company'=>$companyId,'key'=>'pos.'.$key,'value'=>(string)$value,'type'=>$type]);}
+        foreach($allowed as $key){
+            if(!array_key_exists($key,$data))continue;
+            // P8.1 — payments is a per-POS assignment, not a generic setting.
+            // Skip the generic settings write; the per-config update below
+            // handles it authoritatively.
+            if ($key === 'payments') continue;
+            $value=$data[$key];$type='string';if(is_array($value)){$value=json_encode($value);$type='json';}elseif(is_bool($value)){$value=$value?'1':'0';$type='boolean';}elseif(is_int($value)){$type='integer';}
+            $this->db->query("INSERT INTO settings (company_id,`key`,value,type) VALUES (:company,:key,:value,:type) ON DUPLICATE KEY UPDATE value=VALUES(value),type=VALUES(type)",['company'=>$companyId,'key'=>'pos.'.$key,'value'=>(string)$value,'type'=>$type]);
+        }
         $config=$this->resolveConfig($companyId,isset($data['default_branch_id'])?(int)$data['default_branch_id']:(isset($user['branch_id'])?(int)$user['branch_id']:null));
+        // P8.1 — apply payment-method enable/disable to THIS POS config.
+        if (isset($data['payments']) && is_array($data['payments'])) {
+            foreach ($data['payments'] as $methodName => $enabled) {
+                $pmRow = $this->db->query(
+                    "SELECT id FROM payment_methods WHERE LOWER(name)=LOWER(:name) LIMIT 1",
+                    ['name' => (string)$methodName]
+                )->fetch();
+                if (!$pmRow) continue;
+                $this->db->query(
+                    "INSERT INTO pos_config_payment_methods
+                        (pos_config_id, payment_method_id, `sequence`, enabled)
+                     VALUES (:config, :pm, 100, :en)
+                     ON DUPLICATE KEY UPDATE enabled = VALUES(enabled)",
+                    ['config' => $config['id'], 'pm' => $pmRow['id'], 'en' => ($enabled ? 1 : 0)]
+                );
+            }
+            // Delete any stale generic pos.payments row so it stops shadowing.
+            $this->db->query(
+                "DELETE FROM settings WHERE company_id=:company AND `key`='pos.payments'",
+                ['company' => $companyId]
+            );
+        }
         $this->db->query("UPDATE pos_configs SET cash_control=:cash,opening_control=:opening,maximum_difference=:difference WHERE id=:id AND company_id=:company",['cash'=>array_key_exists('cash_control',$data)?(!empty($data['cash_control'])?1:0):($config['cash_control']??1),'opening'=>array_key_exists('opening_control',$data)?(!empty($data['opening_control'])?1:0):($config['opening_control']??1),'difference'=>max(0,(float)($data['maximum_difference']??$config['maximum_difference']??20)),'id'=>$config['id'],'company'=>$companyId]);
         $this->log($user,$companyId,'SETTINGS_UPDATE',null,$data);return $this->settingsData($companyId);
     }

@@ -139,12 +139,19 @@ class PosService
     public function products(): array { [, $companyId]=$this->context(); return $this->productsData($companyId); }
     public function customers(): array { [, $companyId]=$this->context(); return $this->customersData($companyId); }
     public function transactions(): array { [, $companyId]=$this->context(); return $this->transactionsData($companyId); }
-    public function sessions(): array { [, $companyId]=$this->context(true);return $this->sessionsData($companyId); }
-    public function payments(): array { [, $companyId]=$this->context(true);return $this->paymentsData($companyId); }
-    public function staff(): array { [, $companyId]=$this->context(true); return $this->platform->users(['company_id'=>$companyId]); }
+    // Odoo 19: MINIMAL cashiers get orders overview and POS reports. Sessions
+    // and payment-lines listings are read-only support views for those; kept
+    // at the plain-context level. Back-office admin gates (staff / settings /
+    // catalog admin) are the ones that stay ERP-permission-gated.
+    public function sessions(): array { [, $companyId]=$this->context();return $this->sessionsData($companyId); }
+    public function payments(): array { [, $companyId]=$this->context();return $this->paymentsData($companyId); }
+    public function staff(): array { [, $companyId]=$this->context(); return $this->platform->users(['company_id'=>$companyId]); }
     public function createStaff(array $data): array
     {
-        $this->context(true);
+        // ERP-account gated (users.create) — see AccountPermissionMiddleware.
+        // No duplicate POS Advanced check here so a BASIC cashier PINned in
+        // over an authorised admin account can still act.
+        $this->context();
         if (!preg_match('/^\d{4}$/', (string)($data['pin'] ?? ''))) {
             throw new Exception('A unique 4-digit POS PIN is required.', 422);
         }
@@ -152,7 +159,7 @@ class PosService
     }
     public function updateStaff(int $id,array $data): array
     {
-        $this->context(true);
+        $this->context();
         if (array_key_exists('pin',$data) && $data['pin'] !== '' && !preg_match('/^\d{4}$/',(string)$data['pin'])) {
             throw new Exception('POS PIN must contain exactly 4 digits.',422);
         }
@@ -288,7 +295,11 @@ class PosService
 
     private function paymentsData(int $companyId): array
     {
-        return $this->db->query("SELECT pp.id,pp.session_id,pp.order_id,o.reference_number order_reference,pp.method_name,pp.method_type,pp.amount,pp.is_change,pp.reference_number,pp.status,pp.created_at,u.name cashier_name
+        // tendered_amount + change_amount exposed so the payments ledger,
+        // split-payment receipt, and reconciliation views can render the
+        // cash-tender detail. Non-cash lines carry null for both — those
+        // methods have no tender concept (Rule #34).
+        return $this->db->query("SELECT pp.id,pp.session_id,pp.order_id,o.reference_number order_reference,pp.method_name,pp.method_type,pp.amount,pp.tendered_amount,pp.change_amount,pp.is_change,pp.reference_number,pp.status,pp.created_at,u.name cashier_name
              FROM pos_payments pp JOIN orders o ON o.id=pp.order_id JOIN users u ON u.id=pp.user_id
              WHERE pp.company_id=:company ORDER BY pp.id DESC LIMIT 500",['company'=>$companyId])->fetchAll();
     }
@@ -408,7 +419,8 @@ class PosService
 
     public function deleteCustomer(int $id): void
     {
-        [$user,$companyId]=$this->context(true);$this->customer($id,$companyId);
+        // ERP-account gated (customers.delete) — see AccountPermissionMiddleware.
+        [$user,$companyId]=$this->context();$this->customer($id,$companyId);
         $this->db->query("UPDATE customers SET deleted_at=NOW(),status='inactive' WHERE id=:id AND company_id=:company",['id'=>$id,'company'=>$companyId]);
         $this->log($user,$companyId,'CUSTOMER_DELETE',$id,[]);
     }
@@ -911,7 +923,12 @@ class PosService
     public function settings(): array { [, $companyId]=$this->context();return $this->settingsData($companyId); }
     public function updateSettings(array $data): array
     {
-        [$user,$companyId]=$this->context(true);$allowed=['store_name','tax_rate','receipt_header','receipt_footer','receipt_barcode','default_branch_id','cash_control','opening_control','maximum_difference','payments','extra_security'];
+        // Settings is ERP-account gated — AccountPermissionMiddleware
+        // (settings.manage) is the sole enforcement point. Do NOT also require
+        // POS Advanced here, otherwise a BASIC cashier PINned in over an
+        // authorised admin browser account gets 403 for a purely back-office
+        // action the account is allowed to perform.
+        [$user,$companyId]=$this->context();$allowed=['store_name','tax_rate','receipt_header','receipt_footer','receipt_barcode','default_branch_id','cash_control','opening_control','maximum_difference','payments','extra_security'];
         foreach($allowed as $key){if(!array_key_exists($key,$data))continue;$value=$data[$key];$type='string';if(is_array($value)){$value=json_encode($value);$type='json';}elseif(is_bool($value)){$value=$value?'1':'0';$type='boolean';}elseif(is_int($value)){$type='integer';}
             $this->db->query("INSERT INTO settings (company_id,`key`,value,type) VALUES (:company,:key,:value,:type) ON DUPLICATE KEY UPDATE value=VALUES(value),type=VALUES(type)",['company'=>$companyId,'key'=>'pos.'.$key,'value'=>(string)$value,'type'=>$type]);}
         $config=$this->resolveConfig($companyId,isset($data['default_branch_id'])?(int)$data['default_branch_id']:(isset($user['branch_id'])?(int)$user['branch_id']:null));

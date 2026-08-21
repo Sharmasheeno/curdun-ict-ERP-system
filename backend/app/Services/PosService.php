@@ -979,7 +979,8 @@ class PosService
                         'reference'=> $line['reference'] ?? $reference,
                     ]
                 );
-                if (strtolower($pm['name']) === 'deyn') $deynRefundAmount += $line['amount'];
+                // P8 — Refund reversal amount aggregation keys on TYPE not name.
+                if ($pm['type'] === 'credit') $deynRefundAmount += $line['amount'];
             }
 
             // ---- Deyn / Customer-Account reversal (Rule #11) --------------
@@ -1121,7 +1122,10 @@ class PosService
                 }
                 $applied+=$amount;$change+=($lineChange??0);
                 $hasCash=$hasCash||$isCash;
-                $isDebt=strtolower($payment['name'])==='deyn';$hasDebt=$hasDebt||$isDebt;
+                // P8 — Financial identity is method TYPE, not display name.
+                // A tenant renaming Deyn to "Customer Account" must not break checkout.
+                $isDebt = ($payment['type'] === 'credit') || !empty($payment['identify_customer']);
+                $hasDebt = $hasDebt || $isDebt;
                 if($isDebt)$debtAmount+=$amount;
                 $payments[]=['method'=>$payment,'amount'=>$amount,'tendered'=>$lineTendered,'line_change'=>$lineChange,'reference'=>$paymentLine['reference']??$data['payment_reference']??null];
             }
@@ -1207,13 +1211,61 @@ class PosService
         return $response;
     }
 
+    /**
+     * Resolve a payment method by its display name to its canonical record.
+     *
+     * Returns { id, name, type, integration_type, identify_customer, sequence }.
+     * Financial code MUST key on `type` / `identify_customer` / `integration_type`
+     * — never the display name. That way an admin can rename "Deyn" to
+     * "Customer Account" (or the Somali equivalent) without breaking checkout,
+     * refund, settlement, or reporting.
+     *
+     * A small alias map remains only for CASE folding of the six seeded
+     * Curdun labels; new custom methods are stored verbatim.
+     */
     private function paymentMethod(string $raw): array
     {
-        $key=strtolower(trim($raw));$names=['cash'=>'Cash','evc'=>'EVC Plus','evc plus'=>'EVC Plus','zaad'=>'ZAAD','sahal'=>'Sahal','edahab'=>'eDahab','deyn'=>'Deyn'];$name=$names[$key]??trim($raw);if($name==='')$name='Cash';
-        $row=$this->db->query("SELECT id,name,type FROM payment_methods WHERE LOWER(name)=LOWER(:name) AND status='active' LIMIT 1",['name'=>$name])->fetch();
-        $type=$key==='deyn'?'credit':($row['type']??($key==='cash'?'cash':'mobile'));
-        if(!$row){$legacyType=in_array($type,['cash','bank','mobile','other'],true)?$type:'other';$this->db->query("INSERT INTO payment_methods (name,type,status) VALUES (:name,:type,'active')",['name'=>$name,'type'=>$legacyType]);$row=['id'=>(int)$this->db->lastInsertId(),'name'=>$name,'type'=>$legacyType];}
-        return ['id'=>(int)$row['id'],'name'=>$row['name'],'type'=>$type];
+        $key = strtolower(trim($raw));
+        $aliases = ['evc' => 'EVC Plus', 'evc plus' => 'EVC Plus'];
+        $name = $aliases[$key] ?? trim($raw);
+        if ($name === '') $name = 'Cash';
+
+        $row = $this->db->query(
+            "SELECT id, name, type, integration_type, identify_customer, `sequence`, status
+             FROM payment_methods
+             WHERE LOWER(name) = LOWER(:name)
+             LIMIT 1",
+            ['name' => $name]
+        )->fetch();
+
+        if (!$row) {
+            // Auto-create for a first-time reference. Type defaults to 'other'
+            // — an admin should edit it in Settings → Payments to pick the
+            // correct financial type before using it for real transactions.
+            $this->db->query(
+                "INSERT INTO payment_methods (name, type, integration_type, identify_customer, status)
+                 VALUES (:name, 'other', 'MANUAL', 0, 'active')",
+                ['name' => $name]
+            );
+            $row = [
+                'id' => (int)$this->db->lastInsertId(),
+                'name' => $name,
+                'type' => 'other',
+                'integration_type' => 'MANUAL',
+                'identify_customer' => 0,
+                'sequence' => 100,
+                'status' => 'active',
+            ];
+        }
+
+        return [
+            'id'                => (int)$row['id'],
+            'name'              => $row['name'],
+            'type'              => $row['type'],
+            'integration_type'  => $row['integration_type'] ?? 'MANUAL',
+            'identify_customer' => (int)($row['identify_customer'] ?? 0),
+            'sequence'          => (int)($row['sequence'] ?? 100),
+        ];
     }
 
     private function assertPaymentEnabled(int $companyId,string $name): void
@@ -1270,13 +1322,13 @@ class PosService
         }
         $method = (string)($data['payment_method'] ?? 'Cash');
         // Validate the settlement method against configured payment methods.
-        // Rejects a method that has been disabled in Settings → Payments.
-        // Deyn cannot settle Deyn — customer can't pay their own debt with
-        // more Customer Account credit.
-        if (strtolower($method) === 'deyn') {
-            throw new Exception('Deyn cannot be used to settle a Customer Account balance.', 422);
-        }
+        // A method with type='credit' (Customer Account) cannot be used to
+        // settle a Customer Account balance — you can't pay debt with more
+        // debt (Rule #11). P8: keyed on TYPE not name.
         $pm = $this->paymentMethod($method);
+        if ($pm['type'] === 'credit') {
+            throw new Exception('A Customer-Account method cannot be used to settle a Customer Account balance.', 422);
+        }
         $this->assertPaymentEnabled($companyId, $pm['name']);
         $sessionId = $this->currentOpenSessionId($companyId, $user);
 
@@ -1460,7 +1512,26 @@ class PosService
             'variance_above'             => null, // null OR numeric $; approval kicks in on close when |variance| exceeds
             'credit_over_limit_strict'   => false, // Rule #28 — Odoo mode warns; enable to hard-block
         ];
-        $defaults=['store_name'=>Auth::user()['company_name']??'Retail Store','tax_rate'=>5,'receipt_header'=>Auth::user()['company_name']??'Retail Store','receipt_footer'=>'Thank you for shopping with us!','receipt_barcode'=>true,'default_branch_id'=>Auth::user()['branch_id']??null,'cash_control'=>true,'opening_control'=>true,'maximum_difference'=>20,'payments'=>['Cash'=>true,'EVC Plus'=>true,'eDahab'=>true,'ZAAD'=>true,'Sahal'=>true,'Deyn'=>true],'extra_security'=>$extraSecurityDefaults];
+        // P8 — payments defaults are derived from the payment_methods table
+        // so a rename ("Deyn" → "Customer Account") is picked up here too.
+        $methodRows = $this->db->query(
+            "SELECT id, name, type, integration_type, identify_customer, `sequence`, status
+             FROM payment_methods WHERE status='active' ORDER BY `sequence`, id"
+        )->fetchAll();
+        $paymentsDefault = [];
+        $paymentMethodsMeta = [];
+        foreach ($methodRows as $m) {
+            $paymentsDefault[$m['name']] = true;
+            $paymentMethodsMeta[] = [
+                'id'                => (int)$m['id'],
+                'name'              => $m['name'],
+                'type'              => $m['type'],
+                'integration_type'  => $m['integration_type'],
+                'identify_customer' => (int)$m['identify_customer'],
+                'sequence'          => (int)$m['sequence'],
+            ];
+        }
+        $defaults=['store_name'=>Auth::user()['company_name']??'Retail Store','tax_rate'=>5,'receipt_header'=>Auth::user()['company_name']??'Retail Store','receipt_footer'=>'Thank you for shopping with us!','receipt_barcode'=>true,'default_branch_id'=>Auth::user()['branch_id']??null,'cash_control'=>true,'opening_control'=>true,'maximum_difference'=>20,'payments'=>$paymentsDefault,'payment_methods'=>$paymentMethodsMeta,'extra_security'=>$extraSecurityDefaults];
         $rows=$this->db->query("SELECT `key`,value,type FROM settings WHERE company_id=:company AND `key` LIKE 'pos.%'",['company'=>$companyId])->fetchAll();
         foreach($rows as $row){$key=substr($row['key'],4);$value=$row['value'];if($row['type']==='json')$value=json_decode($value,true);elseif($row['type']==='integer')$value=(int)$value;elseif($row['type']==='boolean')$value=(bool)$value;$defaults[$key]=$value;}
         return $defaults;

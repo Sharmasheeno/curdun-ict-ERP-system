@@ -1658,7 +1658,15 @@
 .pos-backoffice-content {
   flex: 1;
   overflow-y: auto;
+  /* Same gutter + rhythm as .tab-content (Super Admin console) so KPI cards,
+     tables, and section headers sit inside consistent padding. Rule #21/#65. */
+  padding: 24px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
 }
+@media (max-width: 1100px) { .pos-backoffice-content { padding: 20px 22px; gap: 16px; } }
+@media (max-width: 720px)  { .pos-backoffice-content { padding: 14px;      gap: 14px; } }
 
 /* ---- Top Navigation Bar ---- */
 .pos-topnav {

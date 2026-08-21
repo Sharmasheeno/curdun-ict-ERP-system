@@ -4396,8 +4396,8 @@ function exportSessionReportCSV(sum) {
   (sum.employees || []).forEach(e => line(e.employee_name, e.orders, e.gross_sales, e.refund_amount, e.net_sales));
   line('');
   line('== CASH MOVEMENTS ==');
-  line('Time', 'Type', 'Amount', 'Reason', 'Employee');
-  (sum.cash_movements?.items || []).forEach(m => line(m.created_at, m.movement_type, m.amount, m.reason, m.employee_name));
+  line('Time', 'Direction', 'Category', 'Amount', 'Reason', 'Employee');
+  (sum.cash_movements?.items || []).forEach(m => line(m.created_at, m.movement_type, m.subtype || 'MANUAL', m.amount, m.reason, m.employee_name));
   line('');
   line('== ORDERS ==');
   line('Reference', 'Date', 'Customer', 'Employee', 'Items', 'Total', 'Payment', 'Status');
@@ -4502,9 +4502,12 @@ function renderPOSReportSession() {
         <h3 class="chart-title" style="margin-bottom:12px">Cash Reconciliation</h3>
         <div class="txn-detail-grid">
           <div class="txn-detail-row"><span>Opening Cash</span><strong>${money(cr.opening_cash)}</strong></div>
-          <div class="txn-detail-row"><span>+ Cash Payments</span><strong>${money(cr.cash_payments)}</strong></div>
-          <div class="txn-detail-row"><span>+ Cash In</span><strong>${money(cr.cash_in)}</strong></div>
-          <div class="txn-detail-row"><span>− Cash Out</span><strong>${money(cr.cash_out)}</strong></div>
+          <div class="txn-detail-row"><span>+ Cash Payments (sales)</span><strong>${money(cr.cash_payments)}</strong></div>
+          ${cr.cash_in_customer_settle > 0 ? `<div class="txn-detail-row"><span>+ Cash Customer Settlements</span><strong>${money(cr.cash_in_customer_settle)}</strong></div>` : ''}
+          ${cr.cash_in_manual > 0 ? `<div class="txn-detail-row"><span>+ Manual Cash In</span><strong>${money(cr.cash_in_manual)}</strong></div>` : ''}
+          ${cr.cash_out_manual > 0 ? `<div class="txn-detail-row"><span>− Manual Cash Out</span><strong>${money(cr.cash_out_manual)}</strong></div>` : ''}
+          ${cr.cash_out_other > 0 ? `<div class="txn-detail-row"><span>− Other Cash Out</span><strong>${money(cr.cash_out_other)}</strong></div>` : ''}
+          ${(cr.cash_in_customer_settle == null && cr.cash_in_manual == null) ? `<div class="txn-detail-row"><span>+ Cash In</span><strong>${money(cr.cash_in)}</strong></div><div class="txn-detail-row"><span>− Cash Out</span><strong>${money(cr.cash_out)}</strong></div>` : ''}
           <div class="txn-detail-row" style="border-top:1px solid var(--border);padding-top:8px;margin-top:6px"><span style="font-weight:900">= Expected Cash</span><strong style="color:var(--purple-800);font-size:16px">${money(cr.expected_cash)}</strong></div>
           ${!isOpen ? `
             <div class="txn-detail-row"><span>Counted Cash</span><strong>${cr.counted_cash === null ? '—' : money(cr.counted_cash)}</strong></div>
@@ -4534,9 +4537,9 @@ function renderPOSReportSession() {
         ${(data.cash_movements?.items || []).length === 0
           ? `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:13px">No cash in/out on this session.</div>`
           : `<div class="overflow-x-auto"><table class="data-table" style="min-width:600px">
-              <thead><tr><th>Time</th><th>Type</th><th>Amount</th><th>Reason</th><th>Employee</th></tr></thead>
+              <thead><tr><th>Time</th><th>Direction</th><th>Category</th><th>Amount</th><th>Reason</th><th>Employee</th></tr></thead>
               <tbody>
-                ${data.cash_movements.items.map(m => `<tr><td>${esc(m.created_at)}</td><td><span class="pill ${m.movement_type==='IN'?'pill-green':'pill-red'}">${m.movement_type}</span></td><td style="font-weight:800">${money(m.amount)}</td><td>${esc(m.reason)}</td><td>${esc(m.employee_name)}</td></tr>`).join('')}
+                ${data.cash_movements.items.map(m => `<tr><td>${esc(m.created_at)}</td><td><span class="pill ${m.movement_type==='IN'?'pill-green':'pill-red'}">${m.movement_type}</span></td><td><span class="pill ${m.subtype==='SETTLEMENT'?'pill-gold':'pill-amber'}" style="font-size:10px">${esc(m.subtype||'MANUAL')}</span></td><td style="font-weight:800">${money(m.amount)}</td><td>${esc(m.reason)}</td><td>${esc(m.employee_name)}</td></tr>`).join('')}
               </tbody>
             </table></div>`}
       </div>

@@ -567,21 +567,34 @@ class PosService
         $cashPayments = 0.0;
         foreach ($methods as $m) if ($m['method_type'] === 'cash') $cashPayments += (float)$m['amount'];
 
-        // ---- Cash movements — aggregate + individual records for the list
+        // ---- Cash movements — break down by (direction, subtype). Reports
+        //      need to distinguish MANUAL cash in from SETTLEMENT cash in so
+        //      the operator can read where the drawer money actually came from.
+        //      Expected Cash still sums every IN and OUT regardless.
         $movementsAgg = $this->db->query(
-            "SELECT movement_type, ROUND(SUM(amount),2) amount
+            "SELECT movement_type, subtype, ROUND(SUM(amount),2) amount
              FROM pos_cash_movements
              WHERE company_id=:company AND session_id=:session
-             GROUP BY movement_type",
+             GROUP BY movement_type, subtype",
             $params
         )->fetchAll();
         $cashIn = 0.0; $cashOut = 0.0;
+        $cashInManual = 0.0; $cashInSettlement = 0.0;
+        $cashOutManual = 0.0; $cashOutOther = 0.0;
         foreach ($movementsAgg as $mv) {
-            if ($mv['movement_type'] === 'IN')  $cashIn  = (float)$mv['amount'];
-            else                                 $cashOut = (float)$mv['amount'];
+            $amt = (float)$mv['amount'];
+            if ($mv['movement_type'] === 'IN') {
+                $cashIn += $amt;
+                if ($mv['subtype'] === 'SETTLEMENT') $cashInSettlement += $amt;
+                else                                  $cashInManual     += $amt;
+            } else {
+                $cashOut += $amt;
+                if ($mv['subtype'] === 'MANUAL') $cashOutManual += $amt;
+                else                              $cashOutOther  += $amt;
+            }
         }
         $movementList = $this->db->query(
-            "SELECT cm.id, cm.movement_type, cm.amount, cm.reason, cm.created_at, u.name AS employee_name
+            "SELECT cm.id, cm.movement_type, cm.subtype, cm.amount, cm.reason, cm.created_at, u.name AS employee_name
              FROM pos_cash_movements cm
              JOIN users u ON u.id = cm.user_id
              WHERE cm.company_id=:company AND cm.session_id=:session
@@ -678,15 +691,24 @@ class PosService
             ],
             'payment_methods'  => $methods,
             'cash_reconciliation' => [
-                'opening_cash'   => round((float)$session['opening_cash'], 2),
-                'cash_payments'  => round($cashPayments, 2),
-                'cash_in'        => $cashIn,
-                'cash_out'       => $cashOut,
-                'expected_cash'  => $expected,
-                'counted_cash'   => $session['counted_cash'] === null ? null : round((float)$session['counted_cash'], 2),
-                'difference'     => $session['difference_amount'] === null ? null : round((float)$session['difference_amount'], 2),
+                'opening_cash'             => round((float)$session['opening_cash'], 2),
+                'cash_payments'            => round($cashPayments, 2),
+                'cash_in'                  => $cashIn,
+                'cash_in_manual'           => round($cashInManual, 2),
+                'cash_in_customer_settle'  => round($cashInSettlement, 2),
+                'cash_out'                 => $cashOut,
+                'cash_out_manual'          => round($cashOutManual, 2),
+                'cash_out_other'           => round($cashOutOther, 2),
+                'expected_cash'            => $expected,
+                'counted_cash'             => $session['counted_cash'] === null ? null : round((float)$session['counted_cash'], 2),
+                'difference'               => $session['difference_amount'] === null ? null : round((float)$session['difference_amount'], 2),
             ],
-            'cash_movements'   => ['in' => $cashIn, 'out' => $cashOut, 'items' => $movementList],
+            'cash_movements'   => [
+                'in' => $cashIn, 'out' => $cashOut,
+                'in_manual' => round($cashInManual, 2), 'in_customer_settle' => round($cashInSettlement, 2),
+                'out_manual' => round($cashOutManual, 2), 'out_other' => round($cashOutOther, 2),
+                'items' => $movementList,
+            ],
             'employees'        => $employees,
             'orders_list'      => $orders,
             'customer_account' => [
@@ -713,7 +735,7 @@ class PosService
         }
         $session=$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company AND state='OPENED'",['id'=>$sessionId,'company'=>$companyId])->fetch();
         if(!$session)throw new Exception('The POS register is not open.',409);
-        $this->db->query("INSERT INTO pos_cash_movements (company_id,session_id,user_id,movement_type,amount,reason) VALUES (:company,:session,:user,:type,:amount,:reason)",['company'=>$companyId,'session'=>$sessionId,'user'=>$user['id'],'type'=>$type,'amount'=>$amount,'reason'=>$reason]);
+        $this->db->query("INSERT INTO pos_cash_movements (company_id,session_id,user_id,movement_type,subtype,amount,reason) VALUES (:company,:session,:user,:type,'MANUAL',:amount,:reason)",['company'=>$companyId,'session'=>$sessionId,'user'=>$user['id'],'type'=>$type,'amount'=>$amount,'reason'=>$reason]);
         $id=(int)$this->db->lastInsertId();$this->log($user,$companyId,'CASH_'.$type,$id,['session_id'=>$sessionId,'amount'=>$amount,'reason'=>$reason]);
         return ['id'=>$id,'session_id'=>$sessionId,'type'=>$type,'amount'=>$amount,'reason'=>$reason,'created_at'=>date('c')];
     }
@@ -1289,13 +1311,16 @@ class PosService
                  WHERE id = :id AND company_id = :company",
                 ['amount'=>$amount,'id'=>$customerId,'company'=>$companyId]
             );
-            // Cash settlement → physical cash into the drawer.
+            // Cash settlement → physical cash into the drawer. Recorded with
+            // subtype='SETTLEMENT' so reports can distinguish it from a
+            // manual Cash In. Expected Cash still counts it because it is an
+            // IN movement — this is only about classification for reporting.
             if ($pm['type'] === 'cash' && $sessionId) {
                 $this->db->query(
                     "INSERT INTO pos_cash_movements
-                        (company_id, session_id, user_id, movement_type, amount, reason)
+                        (company_id, session_id, user_id, movement_type, subtype, amount, reason)
                      VALUES
-                        (:company, :session, :user, 'IN', :amount, :reason)",
+                        (:company, :session, :user, 'IN', 'SETTLEMENT', :amount, :reason)",
                     [
                         'company' => $companyId,
                         'session' => $sessionId,

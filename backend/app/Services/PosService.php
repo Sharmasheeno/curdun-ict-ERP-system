@@ -480,7 +480,13 @@ class PosService
         try {
             $this->db->query("SELECT id FROM pos_configs WHERE id=:id AND company_id=:company FOR UPDATE",['id'=>$config['id'],'company'=>$companyId]);
             $existing=$this->currentSessionForConfig($companyId,(int)$config['id'],true);
-            if($existing){$this->db->commit();return $existing;}
+            // Rule #5 — an already-open session must reject a fresh open with 409.
+            // Client can still discover the existing session via GET /pos/session/current
+            // and route the operator to "Continue Selling" (Rule #4).
+            if($existing){
+                $this->db->commit();
+                throw new Exception('A register session is already open for this POS. Continue selling on session #'.$existing['id'].' or close it first.', 409);
+            }
             $uuid=$this->uuid();
             $this->db->query("INSERT INTO pos_sessions (uuid,company_id,config_id,branch_id,opened_by,state,opening_cash,opening_note,opened_at) VALUES (:uuid,:company,:config,:branch,:user,'OPENED',:cash,:note,NOW())",
                 ['uuid'=>$uuid,'company'=>$companyId,'config'=>$config['id'],'branch'=>$config['branch_id'],'user'=>$user['id'],'cash'=>$opening,'note'=>$data['note']??null]);

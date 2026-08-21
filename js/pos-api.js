@@ -108,6 +108,40 @@ async function posBootstrap() {
   finally { S._posLoading.bootstrap = false; if (typeof render === 'function') render(); }
 }
 
+/**
+ * Rule #16 / #23 — one authoritative session-state refresh. All screens read
+ * S.posSession / S.posSessions / S.posSessionSummary; every mutation that
+ * changes those must route through here (Open / Close / Checkout / Refund /
+ * Cash In / Cash Out / PIN Login / Lock). Never mutate those three keys from
+ * a partial response — always call this and let the backend be the source
+ * of truth.
+ */
+async function refreshPOSSessionState() {
+  try {
+    const [current, list] = await Promise.all([
+      posApiFetch('/pos/session/current'),
+      posApiFetch('/pos/sessions'),
+    ]);
+    if (current) {
+      if (current.config) S.posConfig = current.config;
+      S.posSession = current.session || null;
+    }
+    S.posSessions = Array.isArray(list) ? list : [];
+    if (S.posSession && S.posSession.id) {
+      try {
+        S.posSessionSummary = await posApiFetch(`/pos/sessions/${S.posSession.id}/summary`);
+      } catch (_) { S.posSessionSummary = null; }
+    } else {
+      S.posSessionSummary = null;
+    }
+    S.posShiftActive = Boolean(S.posSession && S.posSession.state === 'OPENED');
+    S.posShiftStart  = S.posSession?.opened_at ? new Date(S.posSession.opened_at) : null;
+  } finally {
+    if (typeof render === 'function') render();
+  }
+  return S.posSession;
+}
+
 async function posCreateProduct(form) { const row=await posApiFetch('/pos/products',{method:'POST',body:{name:form.name,category_name:form.cat,selling_price:form.price,wholesale_price:form.wholesalePrice,current_stock:form.stock,minimum_stock:form.minimumStock,barcode:form.barcode}});POS_PRODUCTS.push(mapProduct(row));await posLoadStockAlerts(false);return row; }
 async function posUpdateProduct(id,form) { const row=await posApiFetch(`/pos/products/${id}`,{method:'PUT',body:{name:form.name,category_name:form.cat,selling_price:form.price,wholesale_price:form.wholesalePrice,current_stock:form.stock,minimum_stock:form.minimumStock,barcode:form.barcode}});const i=POS_PRODUCTS.findIndex(item=>item.id===Number(id));if(i>=0)POS_PRODUCTS[i]=mapProduct(row);await posLoadStockAlerts(false);return row; }
 async function posDeleteProduct(id) { await posApiFetch(`/pos/products/${id}`,{method:'DELETE'});const i=POS_PRODUCTS.findIndex(item=>item.id===Number(id));if(i>=0)POS_PRODUCTS.splice(i,1);await posLoadStockAlerts(false); }
@@ -156,11 +190,35 @@ async function posCompleteCheckout(cart, customerId, payments) {
   S.posPendingOrderId = null;
   return data;
 }
-async function posVoidTransaction(orderId) { const row=await posApiFetch(`/pos/orders/${orderId}/refund`,{method:'POST',body:{reason:'Full refund by POS manager'}});await posBootstrap();return row; }
+async function posVoidTransaction(orderId) {
+  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body:{ reason:'Full refund from POS' }});
+  await refreshPOSSessionState();
+  await posBootstrap();
+  return row;
+}
 async function posCollectDebt(id,amount) { const row=await posApiFetch(`/pos/customers/${id}/collect-debt`,{method:'POST',body:{amount,payment_method:'Cash'}});const i=POS_CUSTOMERS.findIndex(item=>item.id===Number(id));if(i>=0)POS_CUSTOMERS[i]=mapCustomer(row);return row; }
-async function posOpenSession(openingCash=0) { const session=await posApiFetch('/pos/sessions/open',{method:'POST',body:{opening_cash:openingCash}});S.posSession=session;S.posSessionSummary={session,expected_cash:Number(session.opening_cash||openingCash),orders:0,net_sales:0,payment_methods:[],cash_movements:{in:0,out:0}};S.posShiftActive=true;S.posShiftStart=new Date(session.opened_at||Date.now());return session; }
-async function posRecordCashMovement(type,amount,reason) { if(!S.posSession?.id)throw new Error('Open the register first.');const row=await posApiFetch(`/pos/sessions/${S.posSession.id}/cash-movements`,{method:'POST',body:{type,amount,reason}});await posBootstrap();return row; }
-async function posCloseShift(cashierId,countedCash,approveDifference=false) { const result=await posApiFetch('/pos/shifts/close',{method:'POST',body:{cashier_id:cashierId,counted_cash:countedCash,approve_difference:approveDifference}});if(Number(result.session_id)===Number(S.posSession?.id)){S.posSession=null;S.posSessionSummary=null;S.posShiftActive=false;S.posShiftStart=null;}return result; }
+async function posOpenSession(openingCash=0, note=null) {
+  // Fire-and-refresh: post the open, then let refreshPOSSessionState() be
+  // the source of truth for every downstream screen (Rule #16). Never
+  // mutate S.posSession from the open response directly — the summary,
+  // sessions list, and config all need to update atomically.
+  const body = { opening_cash: openingCash };
+  if (note !== null && note !== '') body.note = note;
+  await posApiFetch('/pos/sessions/open', { method:'POST', body });
+  await refreshPOSSessionState();
+  return S.posSession;
+}
+async function posRecordCashMovement(type,amount,reason) {
+  if (!S.posSession?.id) throw new Error('Open the register first.');
+  const row = await posApiFetch(`/pos/sessions/${S.posSession.id}/cash-movements`, { method:'POST', body:{ type, amount, reason }});
+  await refreshPOSSessionState();
+  return row;
+}
+async function posCloseShift(cashierId, countedCash, approveDifference=false) {
+  const result = await posApiFetch('/pos/shifts/close', { method:'POST', body:{ cashier_id:cashierId, counted_cash:countedCash, approve_difference:approveDifference }});
+  await refreshPOSSessionState();
+  return result;
+}
 async function posSaveSettings(settings) { return posApiFetch('/pos/settings',{method:'PUT',body:{store_name:settings.storeName,tax_rate:settings.taxRate,receipt_header:settings.receiptHeader,receipt_footer:settings.receiptFooter,receipt_barcode:settings.showBarcodeOnReceipt,cash_control:settings.cashControl,opening_control:settings.openingControl,maximum_difference:settings.maximumDifference,payments:settings.payments,default_branch_id:settings.defaultBranchId||null}}); }
 
 async function posLoadReports(from = S.posReportFrom, to = S.posReportTo) {
@@ -197,7 +255,15 @@ async function posMarkAllStockAlertsRead() {
   return posLoadStockAlerts();
 }
 
-async function posPinLogin(pin,userId,branchId) { const result=await posApiFetch('/auth/pin-login',{method:'POST',body:{pin,user_id:userId,branch_id:branchId||null}});const user=result.user||result;S.posActiveUser={...mapStaff(user),role:posRoleName(user)};S.currentCompany=user.company_name||S.currentCompany;S.posTab='dash';await posBootstrap(); }
+async function posPinLogin(pin, userId, branchId) {
+  const result = await posApiFetch('/auth/pin-login', { method:'POST', body:{ pin, user_id:userId, branch_id:branchId || null }});
+  const user = result.user || result;
+  S.posActiveUser = { ...mapStaff(user), role: posRoleName(user) };
+  S.currentCompany = user.company_name || S.currentCompany;
+  S.posTab = 'dash';
+  await posBootstrap();
+  await refreshPOSSessionState();
+}
 
 // Manager PIN approval — verifies a Store Manager or Admin PIN WITHOUT
 // hijacking the current cashier's session. Returns { approved_by, action, reason }.
@@ -209,5 +275,19 @@ async function posVerifyManagerPin(pin, action, reason, branchId) {
 }
 async function posEmailLogin(email,password) { const result=await posApiFetch('/auth/login',{method:'POST',body:{email,password}});return result.user||result; }
 async function posLogout() { try{await posApiFetch('/auth/logout',{method:'POST'});}catch(_){}S.posActiveUser=null;S.activeCompanyAdmin=null;S.activeSuperAdmin=null;S.view='login';render(); }
-async function posLockRegister() { try{await posApiFetch('/auth/logout',{method:'POST'});}catch(_){}S.posActiveUser=null;S.activeCompanyAdmin=null;S.activeSuperAdmin=null;S.posLoginMode='staff';S.posLoginPin='';S._loginSelectedId=null;S.view='pos';render(); }
+async function posLockRegister() {
+  // Rule #15 — POS Lock ≠ Close Register. Drop the POS employee only;
+  // keep the ERP account session and let the register session stay OPEN.
+  // The backend /auth/pos-lock endpoint removes session['pos_cashier']
+  // without touching session['user']. We do NOT hit /auth/logout because
+  // that would sign the account out too.
+  try { await posApiFetch('/auth/pos-lock', { method:'POST' }); } catch (_) {}
+  S.posActiveUser = null;
+  S.posLoginMode = 'staff';
+  S.posLoginPin = '';
+  S._loginSelectedId = null;
+  // Register state persists — same session, ready for another PIN login.
+  await refreshPOSSessionState();
+  render();
+}
 async function posCheckSession() { if(new URLSearchParams(location.search).has('reset'))return;try{const user=await posApiFetch('/auth/me');if(user&&user.id&&typeof handleAuthenticatedUser==='function')await handleAuthenticatedUser(user,true);}catch(_){} }

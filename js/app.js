@@ -4344,40 +4344,73 @@ function renderPOSReportSales() {
 }
 
 function renderPOSReportSession() {
-  const sessions = S.posSessions || [];
-  return `
-    <div class="pharm-topbar">
-      <div class="pharm-tab-label">Session Report</div>
-    </div>
-    <div class="pharm-content">
-      ${sessions.length === 0 ? `
-        <div style="text-align:center;padding:80px 20px;color:var(--text-muted)">
-          <div style="font-size:48px;margin-bottom:12px">📋</div>
-          <div style="font-size:18px;font-weight:700">No sessions recorded yet</div>
-          <div style="margin-top:8px;font-size:14px">Open the register from the <strong>"Open Register →"</strong> button above to start selling.</div>
-        </div>
-      ` : `
-        <div class="pos-table-wrap">
-          <table class="pos-table">
-            <thead><tr><th>Session #</th><th>Cashier</th><th>Opened</th><th>Closed</th><th>Opening Cash</th><th>Expected</th><th>Difference</th><th>Status</th></tr></thead>
+  // Split current OPEN session from CLOSED history (Rule #11 / #17).
+  const all = S.posSessions || [];
+  const current = S.posSession && S.posSession.state === 'OPENED' ? S.posSession : null;
+  const summary = S.posSessionSummary || {};
+  const closed = all.filter(s => s.state === 'CLOSED');
+
+  const currentBlock = current ? `
+    <div class="card" style="padding:20px;margin-bottom:16px;border:2px solid #22C55E">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <span class="pill pill-green" style="font-weight:900">Session #${current.id} — OPEN</span>
+        <span style="font-size:12px;color:var(--text-muted)">Running totals</span>
+      </div>
+      <h3 class="chart-title">${esc(current.config_name || S.posConfig?.name || 'Main Register')}</h3>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px">Opened by <strong>${esc(current.opened_by_name || '—')}</strong> at ${esc(current.opened_at || '—')}</div>
+      <div class="txn-detail-grid">
+        <div class="txn-detail-row"><span>Opening Cash</span><strong>$${Number(current.opening_cash || 0).toFixed(2)}</strong></div>
+        <div class="txn-detail-row"><span>Orders</span><strong>${Number(summary.orders || 0)}</strong></div>
+        <div class="txn-detail-row"><span>Net Sales</span><strong>$${Number(summary.net_sales || 0).toFixed(2)}</strong></div>
+        <div class="txn-detail-row"><span>Cash In</span><strong>$${Number(summary.cash_movements?.in || 0).toFixed(2)}</strong></div>
+        <div class="txn-detail-row"><span>Cash Out</span><strong>$${Number(summary.cash_movements?.out || 0).toFixed(2)}</strong></div>
+        <div class="txn-detail-row"><span>Expected Cash</span><strong>$${Number(summary.expected_cash || 0).toFixed(2)}</strong></div>
+      </div>
+      ${Array.isArray(summary.payment_methods) && summary.payment_methods.length ? `
+        <div style="margin-top:14px">
+          <div style="font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted);font-weight:800;margin-bottom:6px">Payment methods</div>
+          <table class="data-table" style="min-width:400px"><thead><tr><th>Method</th><th>Type</th><th>Transactions</th><th>Amount</th></tr></thead>
             <tbody>
-              ${sessions.map(s => {
-                const diff = Number(s.closing_cash||0) - Number(s.expected_cash||0);
-                return `<tr>
-                  <td>#${s.id}</td>
-                  <td>${esc(s.opened_by_name||'—')}</td>
-                  <td>${s.start_time?new Date(s.start_time).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—'}</td>
-                  <td>${s.end_time?new Date(s.end_time).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'Open'}</td>
-                  <td>$${Number(s.opening_cash||0).toFixed(2)}</td>
-                  <td>$${Number(s.expected_cash||0).toFixed(2)}</td>
-                  <td style="color:${diff>=0?'#22C55E':'#e53e3e'};font-weight:700">${diff>=0?'+':''}$${diff.toFixed(2)}</td>
-                  <td><span class="pill ${s.state==='OPENED'?'pill-green':'pill-red'}">${s.state||'CLOSED'}</span></td>
-                </tr>`;
-              }).join('')}
+              ${summary.payment_methods.map(m => `<tr><td>${esc(m.method_name)}</td><td><span class="pill ${m.method_type==='cash'?'pill-green':m.method_type==='credit'?'pill-gold':'pill-amber'}">${esc(m.method_type)}</span></td><td>${Number(m.transactions || 0)}</td><td style="font-weight:700">$${Number(m.amount || 0).toFixed(2)}</td></tr>`).join('')}
             </tbody>
           </table>
         </div>
-      `}
+      ` : ''}
+    </div>` : '';
+
+  const closedBlock = closed.length === 0
+    ? (current
+        ? `<div style="text-align:center;padding:40px 20px;color:var(--text-muted);font-size:13px">No closed register sessions yet.</div>`
+        : `<div style="text-align:center;padding:60px 20px;color:var(--text-muted)"><div style="font-size:48px;margin-bottom:12px">📋</div><div style="font-size:16px;font-weight:700">No register sessions have been recorded yet.</div><div style="margin-top:8px;font-size:13px">Open the register from the Sessions screen to start.</div></div>`)
+    : `<div class="pos-table-wrap"><table class="pos-table">
+        <thead><tr><th>Session #</th><th>Register</th><th>Opened by</th><th>Closed by</th><th>Opened</th><th>Closed</th><th>Opening</th><th>Expected</th><th>Counted</th><th>Difference</th></tr></thead>
+        <tbody>
+          ${closed.map(s => {
+            const diff = Number(s.difference_amount || 0);
+            return `<tr>
+              <td style="font-family:var(--font-mono);font-weight:800">#${s.id}</td>
+              <td>${esc(s.config_name || '—')}</td>
+              <td>${esc(s.opened_by_name || '—')}</td>
+              <td>${esc(s.closed_by_name || '—')}</td>
+              <td>${esc(s.opened_at || '—')}</td>
+              <td>${esc(s.closed_at || '—')}</td>
+              <td>$${Number(s.opening_cash || 0).toFixed(2)}</td>
+              <td>$${Number(s.expected_cash || 0).toFixed(2)}</td>
+              <td>${s.counted_cash == null ? '—' : `$${Number(s.counted_cash).toFixed(2)}`}</td>
+              <td style="color:${diff >= 0 ? '#22C55E' : '#B91C1C'};font-weight:800">${diff >= 0 ? '+' : ''}$${diff.toFixed(2)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table></div>`;
+
+  return `
+    <div class="pharm-topbar"><div class="pharm-tab-label">Session Report</div></div>
+    <div class="pharm-content">
+      ${currentBlock}
+      <div class="data-section">
+        <div class="section-header-bar"><h3 class="chart-title">Closed Sessions</h3><span class="ml-auto" style="font-size:11px;color:var(--text-muted)">${closed.length} closed</span></div>
+        ${closedBlock}
+      </div>
     </div>`;
 }
 
@@ -5412,29 +5445,87 @@ function renderPOSStaff() {
 }
 
 function renderPOSSessions() {
-  const rows = S.posSessions || [];
-  const current = S.posSession;
+  // Rule #9 / #16 — the CURRENT open session is a first-class card at the top;
+  // history is a separate table below. The two never share a row.
+  const all = S.posSessions || [];
+  const current = S.posSession && S.posSession.state === 'OPENED' ? S.posSession : null;
+  const closed = all.filter(row => row.state === 'CLOSED');
   const summary = S.posSessionSummary || {};
-  return `
-    <div class="kpi-grid">
-      <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Register state</div><div class="kpi-value" style="font-size:22px">${current?.state==='OPENED'?'OPEN':'CLOSED'}</div><div class="kpi-trend" style="color:#EFEAFB">${current?`Session #${current.id}`:'No active session'}</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Opening cash</div><div class="kpi-value">$${Number(current?.opening_cash||0).toFixed(2)}</div><div class="kpi-trend">Recorded at opening</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Expected cash</div><div class="kpi-value">$${Number(summary.expected_cash||0).toFixed(2)}</div><div class="kpi-trend">Opening + cash payments + in − out</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Session net sales</div><div class="kpi-value">$${Number(summary.net_sales||0).toFixed(2)}</div><div class="kpi-trend">${Number(summary.orders||0)} validated orders</div></div>
-    </div>
+  const cashInOut = summary.cash_movements || { in:0, out:0 };
+  const activeEmployee = S.posActiveUser ? S.posActiveUser.name : 'POS Locked';
+  const canCloseRegister  = posCan('closeRegister');
+  const canCashInOut      = posCan('cashInOut');
+  const canOpenRegister   = posCan('openRegister');
+
+  const currentCard = current ? `
+    <div class="card" style="padding:20px;margin-bottom:16px;border:2px solid #22C55E;background:linear-gradient(180deg,#F0FDF4 0%,#FFF 100%)">
+      <div style="display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap">
+        <div style="flex:1;min-width:260px">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+            <span class="pill pill-green" style="font-weight:900">CURRENT REGISTER SESSION</span>
+            <span style="font-family:var(--font-mono);font-weight:900;font-size:16px;color:var(--purple-800)">#${current.id}</span>
+            <span class="pill pill-green">OPEN</span>
+          </div>
+          <h3 class="chart-title" style="margin-top:4px">${esc(current.config_name || S.posConfig?.name || 'Main Register')}</h3>
+          <div style="font-size:12px;color:var(--text-muted);margin-top:2px">Opened by <strong>${esc(current.opened_by_name || '—')}</strong> · Current employee <strong>${esc(activeEmployee)}</strong></div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-outline btn-sm" id="btn-continue-selling">Continue Selling</button>
+          ${canCashInOut ? `<button class="btn btn-outline btn-sm" id="btn-cash-in">Cash In</button><button class="btn btn-outline btn-sm" id="btn-cash-out">Cash Out</button>` : ''}
+          ${canCloseRegister ? `<button class="btn btn-primary btn-sm" id="btn-session-close">Close Register</button>` : ''}
+        </div>
+      </div>
+      <div class="txn-detail-grid" style="margin-top:16px">
+        <div class="txn-detail-row"><span>Opened at</span><strong>${esc(current.opened_at || '—')}</strong></div>
+        <div class="txn-detail-row"><span>Opening cash</span><strong>$${Number(current.opening_cash || 0).toFixed(2)}</strong></div>
+        <div class="txn-detail-row"><span>Expected cash</span><strong>$${Number(summary.expected_cash || current.opening_cash || 0).toFixed(2)}</strong></div>
+        <div class="txn-detail-row"><span>Net sales</span><strong>$${Number(summary.net_sales || 0).toFixed(2)}</strong></div>
+        <div class="txn-detail-row"><span>Orders</span><strong>${Number(summary.orders || 0)}</strong></div>
+        <div class="txn-detail-row"><span>Cash in / out</span><strong>$${Number(cashInOut.in || 0).toFixed(2)} / $${Number(cashInOut.out || 0).toFixed(2)}</strong></div>
+      </div>
+    </div>` : `
     <div class="card" style="padding:20px;margin-bottom:16px">
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <div style="flex:1;min-width:240px"><h3 class="chart-title">Register Control</h3><div style="font-size:11px;color:var(--text-muted);margin-top:4px">Open the register, record cash movements, and reconcile it before closing.</div></div>
-        ${current?.state==='OPENED' ? `<button class="btn btn-outline btn-sm" id="btn-cash-in">Cash In</button><button class="btn btn-outline btn-sm" id="btn-cash-out">Cash Out</button><button class="btn btn-primary btn-sm" id="btn-session-close">Close & reconcile</button>` : `<button class="btn btn-primary btn-sm" id="btn-session-open">Open register</button>`}
+        <div style="flex:1;min-width:240px">
+          <span class="pill pill-amber" style="font-weight:900">REGISTER CLOSED</span>
+          <h3 class="chart-title" style="margin-top:8px">${esc(S.posConfig?.name || 'Main Register')}</h3>
+          <div style="font-size:12px;color:var(--text-muted);margin-top:2px">Open the register with an Opening Control entry before selling.</div>
+        </div>
+        ${canOpenRegister ? `<button class="btn btn-primary btn-sm" id="btn-session-open">Open Register</button>` : `<div style="font-size:11px;color:var(--text-muted)">A Senior Cashier or higher must open the register.</div>`}
       </div>
-      ${current?.state==='OPENED' ? `<div class="txn-detail-grid" style="margin-top:16px"><div class="txn-detail-row"><span>Configuration</span><strong>${esc(current.config_name||S.posConfig?.name||'Main Register')}</strong></div><div class="txn-detail-row"><span>Opened by</span><strong>${esc(current.opened_by_name||'—')}</strong></div><div class="txn-detail-row"><span>Opened at</span><strong>${esc(current.opened_at||'—')}</strong></div><div class="txn-detail-row"><span>Cash in / out</span><strong>$${Number(summary.cash_movements?.in||0).toFixed(2)} / $${Number(summary.cash_movements?.out||0).toFixed(2)}</strong></div></div>` : ''}
-    </div>
+    </div>`;
+
+  const closedTable = closed.length === 0
+    ? `<div style="padding:28px;text-align:center;color:var(--text-muted);font-size:13px">${current ? 'No closed register sessions yet.' : 'No register sessions have been recorded yet.'}</div>`
+    : `<div class="overflow-x-auto"><table class="data-table" style="min-width:1100px">
+        <thead><tr><th>Session</th><th>Register</th><th>Opened by</th><th>Closed by</th><th>Opened</th><th>Closed</th><th>Orders</th><th>Net sales</th><th>Expected</th><th>Counted</th><th>Difference</th></tr></thead>
+        <tbody>
+          ${closed.map(row => `
+            <tr>
+              <td style="font-family:var(--font-mono);font-weight:800">#${row.id}</td>
+              <td>${esc(row.config_name)}</td>
+              <td>${esc(row.opened_by_name)}</td>
+              <td>${esc(row.closed_by_name || '—')}</td>
+              <td>${esc(row.opened_at || '—')}</td>
+              <td>${esc(row.closed_at || '—')}</td>
+              <td>${Number(row.orders || 0)}</td>
+              <td>$${Number(row.net_sales || 0).toFixed(2)}</td>
+              <td>$${Number(row.expected_cash || 0).toFixed(2)}</td>
+              <td>${row.counted_cash == null ? '—' : `$${Number(row.counted_cash).toFixed(2)}`}</td>
+              <td style="font-weight:800;color:${Number(row.difference_amount || 0) < 0 ? '#B91C1C' : 'var(--text-primary)'}">${row.difference_amount == null ? '—' : `$${Number(row.difference_amount).toFixed(2)}`}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table></div>`;
+
+  return `
+    ${currentCard}
     <div class="data-section">
-      <div class="section-header-bar"><h3 class="chart-title">Register Sessions</h3><span class="ml-auto" style="font-size:11px;color:var(--text-muted)">${rows.length} session${rows.length===1?'':'s'}</span></div>
-      <div class="overflow-x-auto"><table class="data-table" style="min-width:1000px"><thead><tr><th>Session</th><th>Register</th><th>Opened by</th><th>Opened</th><th>Closed</th><th>Orders</th><th>Net sales</th><th>Expected cash</th><th>Counted</th><th>Difference</th><th>Status</th></tr></thead><tbody>
-        ${rows.map(row=>`<tr><td style="font-family:var(--font-mono);font-weight:800">#${row.id}</td><td>${esc(row.config_name)}</td><td>${esc(row.opened_by_name)}</td><td>${esc(row.opened_at||'—')}</td><td>${esc(row.closed_at||'—')}</td><td>${Number(row.orders||0)}</td><td>$${Number(row.net_sales||0).toFixed(2)}</td><td>$${Number(row.state==='CLOSED'?row.expected_cash:row.calculated_cash||0).toFixed(2)}</td><td>${row.counted_cash==null?'—':`$${Number(row.counted_cash).toFixed(2)}`}</td><td>${row.difference_amount==null?'—':`$${Number(row.difference_amount).toFixed(2)}`}</td><td><span class="pill ${row.state==='OPENED'?'pill-green':row.state==='CLOSED'?'pill-gold':'pill-amber'}">${esc(row.state)}</span></td></tr>`).join('')}
-        ${rows.length?'':'<tr><td colspan="11" style="text-align:center;padding:28px;color:var(--text-muted)">No register sessions yet.</td></tr>'}
-      </tbody></table></div>
+      <div class="section-header-bar">
+        <h3 class="chart-title">Closed Register Sessions</h3>
+        <span class="ml-auto" style="font-size:11px;color:var(--text-muted)">${closed.length} closed session${closed.length===1?'':'s'}</span>
+      </div>
+      ${closedTable}
     </div>`;
 }
 
@@ -5817,6 +5908,14 @@ function wirePOSEvents() {
   // Opening Control (Odoo-style modal, replaces prompt()).
   document.getElementById('btn-checkout-open-register')?.addEventListener('click', () => openRegisterModal('open'));
   document.getElementById('btn-session-open')?.addEventListener('click',           () => openRegisterModal('open'));
+  // Rule #21 — Continue Selling takes an operator with an already-open session
+  // straight back to the checkout screen. No duplicate register creation.
+  document.getElementById('btn-continue-selling')?.addEventListener('click', () => {
+    S.posBackofficeTab = 'checkout';
+    S.posView = 'session';
+    S.posTab  = 'checkout';
+    render();
+  });
   document.getElementById('btn-dashboard-register')?.addEventListener('click', () => {
     if (S.posSession?.state === 'OPENED') { S.posTab = 'staff'; render(); return; }
     openRegisterModal('open');

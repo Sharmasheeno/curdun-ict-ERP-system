@@ -231,6 +231,8 @@ function posApplyBootstrap(data) {
   S.posBranches = data.branches || [];
   S.posStockAlerts = data.stock_alerts || [];
   S.posConfig = data.pos_config || null;
+  S.posStoreType = data.pos_config?.store_type || data.settings?.store_type || 'retail';
+  S.posStoreCapabilities = { ...(data.pos_config?.capabilities || data.settings?.store_capabilities || {}) };
   S.posSession = data.current_session || null;
   S.posSessionSummary = data.current_session_summary || null;
   S.posSessions = data.sessions || [];
@@ -406,6 +408,12 @@ async function posCloseShift(cashierId, countedCash, approveDifference=false, ap
   return result;
 }
 async function posSaveSettings(settings) { return posApiFetch('/pos/settings',{method:'PUT',body:{store_name:settings.storeName,tax_rate:settings.taxRate,receipt_header:settings.receiptHeader,receipt_footer:settings.receiptFooter,receipt_barcode:settings.showBarcodeOnReceipt,cash_control:settings.cashControl,opening_control:settings.openingControl,maximum_difference:settings.maximumDifference,payments:settings.payments,extra_security:settings.extraSecurity,default_branch_id:settings.defaultBranchId||null}}); }
+async function posSetStoreType(storeType, capabilityOverrides={}) {
+  const result=await posApiFetch('/pos/settings',{method:'PUT',body:{store_type:storeType,capability_overrides:capabilityOverrides}});
+  await posBootstrap();
+  return result;
+}
+function posHasStoreCapability(capability) { return S.posStoreCapabilities?.[capability] === true; }
 
 async function posLoadReports(from = S.posReportFrom, to = S.posReportTo) {
   S.posReportLoading = true;

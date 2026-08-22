@@ -506,6 +506,42 @@ class PosService
             $this->db->query("INSERT INTO pos_configs (company_id,branch_id,name) VALUES (:company,:branch,:name)",['company'=>$companyId,'branch'=>$branchId ?: null,'name'=>$branchName.' Register']);
             $config=$this->db->query("SELECT pc.*,b.name branch_name FROM pos_configs pc LEFT JOIN branches b ON b.id=pc.branch_id WHERE pc.id=:id",['id'=>(int)$this->db->lastInsertId()])->fetch();
         }
+        return $this->decorateStoreConfig($config);
+    }
+
+    private function normalizeStoreType(mixed $value): string
+    {
+        $type=strtolower(trim((string)$value));
+        $aliases=['bakery'=>'bakery_food','clothes'=>'fashion','furniture'=>'furniture_home'];
+        $type=$aliases[$type]??$type;
+        $allowed=['retail','bakery_food','fashion','furniture_home','restaurant','electronics'];
+        if(!in_array($type,$allowed,true))throw new Exception('Unsupported POS store type.',422);
+        return $type;
+    }
+
+    private function storeCapabilityDefaults(string $type): array
+    {
+        $base=['inventory'=>true,'customer_account'=>true,'loyalty'=>true,'pricelists'=>true,'refunds'=>true,'cash_control'=>true,'variants'=>false,'batches'=>false,'expiry_tracking'=>false,'serial_numbers'=>false,'warranties'=>false,'tables'=>false,'kitchen_orders'=>false,'order_notes'=>false,'dine_in'=>false,'takeaway'=>false,'delivery'=>false];
+        return array_replace($base,match($type){
+            'fashion'=>['variants'=>true],
+            'electronics'=>['serial_numbers'=>true,'warranties'=>true],
+            'bakery_food'=>['batches'=>true,'expiry_tracking'=>true],
+            'furniture_home'=>['variants'=>true,'delivery'=>true],
+            'restaurant'=>['tables'=>true,'kitchen_orders'=>true,'order_notes'=>true,'dine_in'=>true,'takeaway'=>true,'delivery'=>true,'expiry_tracking'=>true],
+            default=>[],
+        });
+    }
+
+    private function decorateStoreConfig(array $config): array
+    {
+        $type=$this->normalizeStoreType($config['store_type']??$config['profile_type']??'retail');
+        $overrides=json_decode((string)($config['capability_overrides']??''),true);
+        if(!is_array($overrides))$overrides=[];
+        $defaults=$this->storeCapabilityDefaults($type);
+        $safe=[];foreach($overrides as $key=>$value)if(array_key_exists($key,$defaults))$safe[$key]=(bool)$value;
+        $config['store_type']=$type;
+        $config['capability_overrides']=$safe;
+        $config['capabilities']=array_replace($defaults,$safe);
         return $config;
     }
 
@@ -2526,7 +2562,7 @@ class PosService
         // assigned to the config shows enabled=false in the response, and
         // checkout/refund/settlement will reject it server-side. Historical
         // pos_payments rows are unaffected by any change here (Rule #10).
-        $branchId = Auth::user()['branch_id'] ?? null;
+        $branchId = Auth::user()['branch_id'] ?? null;$activeConfig=[];
         try {
             $activeConfig = $this->resolveConfig($companyId, $branchId ? (int)$branchId : null);
             $activeConfigId = (int)$activeConfig['id'];
@@ -2560,7 +2596,7 @@ class PosService
                 'assigned'          => (int)$m['is_assigned'] === 1,
             ];
         }
-        $defaults=['store_name'=>Auth::user()['company_name']??'Retail Store','tax_rate'=>5,'receipt_header'=>Auth::user()['company_name']??'Retail Store','receipt_footer'=>'Thank you for shopping with us!','receipt_barcode'=>true,'default_branch_id'=>Auth::user()['branch_id']??null,'cash_control'=>true,'opening_control'=>true,'maximum_difference'=>20,'payments'=>$paymentsDefault,'payment_methods'=>$paymentMethodsMeta,'pos_config_id'=>$activeConfigId,'extra_security'=>$extraSecurityDefaults];
+        $defaults=['store_name'=>Auth::user()['company_name']??'Retail Store','tax_rate'=>5,'receipt_header'=>Auth::user()['company_name']??'Retail Store','receipt_footer'=>'Thank you for shopping with us!','receipt_barcode'=>true,'default_branch_id'=>Auth::user()['branch_id']??null,'cash_control'=>true,'opening_control'=>true,'maximum_difference'=>20,'payments'=>$paymentsDefault,'payment_methods'=>$paymentMethodsMeta,'pos_config_id'=>$activeConfigId,'store_type'=>$activeConfig['store_type']??'retail','store_capabilities'=>$activeConfig['capabilities']??$this->storeCapabilityDefaults('retail'),'capability_overrides'=>$activeConfig['capability_overrides']??[],'extra_security'=>$extraSecurityDefaults];
         $rows=$this->db->query("SELECT `key`,value,type FROM settings WHERE company_id=:company AND `key` LIKE 'pos.%'",['company'=>$companyId])->fetchAll();
         foreach($rows as $row){
             $key=substr($row['key'],4);
@@ -2670,17 +2706,26 @@ class PosService
         // POS Advanced here, otherwise a BASIC cashier PINned in over an
         // authorised admin browser account gets 403 for a purely back-office
         // action the account is allowed to perform.
-        [$user,$companyId]=$this->context();$beforeSettings=$this->settingsData($companyId);$allowed=['store_name','tax_rate','receipt_header','receipt_footer','receipt_barcode','default_branch_id','cash_control','opening_control','maximum_difference','payments','extra_security'];
+        [$user,$companyId]=$this->context();$beforeSettings=$this->settingsData($companyId);$allowed=['store_name','tax_rate','receipt_header','receipt_footer','receipt_barcode','default_branch_id','cash_control','opening_control','maximum_difference','payments','extra_security','store_type','capability_overrides'];
         foreach($allowed as $key){
             if(!array_key_exists($key,$data))continue;
             // P8.1 — payments is a per-POS assignment, not a generic setting.
             // Skip the generic settings write; the per-config update below
             // handles it authoritatively.
-            if ($key === 'payments') continue;
+            if (in_array($key,['payments','store_type','capability_overrides'],true)) continue;
             $value=$data[$key];$type='string';if(is_array($value)){$value=json_encode($value);$type='json';}elseif(is_bool($value)){$value=$value?'1':'0';$type='boolean';}elseif(is_int($value)){$type='integer';}
             $this->db->query("INSERT INTO settings (company_id,`key`,value,type) VALUES (:company,:key,:value,:type) ON DUPLICATE KEY UPDATE value=VALUES(value),type=VALUES(type)",['company'=>$companyId,'key'=>'pos.'.$key,'value'=>(string)$value,'type'=>$type]);
         }
         $config=$this->resolveConfig($companyId,isset($data['default_branch_id'])?(int)$data['default_branch_id']:(isset($user['branch_id'])?(int)$user['branch_id']:null));
+        if(array_key_exists('store_type',$data)||array_key_exists('capability_overrides',$data)){
+            $nextType=array_key_exists('store_type',$data)?$this->normalizeStoreType($data['store_type']):$config['store_type'];
+            $open=(int)$this->db->query("SELECT COUNT(*) FROM pos_sessions WHERE company_id=:company AND config_id=:config AND state IN ('OPENING_CONTROL','OPENED','CLOSING_CONTROL')",['company'=>$companyId,'config'=>$config['id']])->fetchColumn();
+            if($open&&$nextType!==$config['store_type'])throw new Exception('Close the register before changing its store type.',409);
+            $overrides=$data['capability_overrides']??$config['capability_overrides'];if(!is_array($overrides))throw new Exception('Capability overrides must be an object.',422);
+            $defaults=$this->storeCapabilityDefaults($nextType);$safe=[];foreach($overrides as $key=>$value){if(!array_key_exists($key,$defaults))throw new Exception('Unknown store capability: '.$key,422);$safe[$key]=(bool)$value;}
+            $this->db->query("UPDATE pos_configs SET store_type=:type,capability_overrides=:overrides WHERE id=:id AND company_id=:company",['type'=>$nextType,'overrides'=>json_encode($safe),'id'=>$config['id'],'company'=>$companyId]);
+            $config=$this->resolveConfig($companyId,(int)($config['branch_id']??0));
+        }
         // P8.1 — apply payment-method enable/disable to THIS POS config.
         if (isset($data['payments']) && is_array($data['payments'])) {
             foreach ($data['payments'] as $methodName => $enabled) {

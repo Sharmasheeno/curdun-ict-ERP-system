@@ -87,7 +87,8 @@ const S = {
 
   // Odoo-style POS architecture state
   posView: 'selector',      // 'selector' | 'backoffice' | 'session'
-  posStoreType: null,       // null | 'retail' | 'bakery' | 'clothes' | 'furniture' | 'restaurant' | 'electronics'
+  posStoreType: null,       // canonical: retail | bakery_food | fashion | furniture_home | restaurant | electronics
+  posStoreCapabilities: {},
   posBackofficeTab: 'dashboard', // dashboard | orders | sessions | payments | customers | products | categories | combos | reports-orders | reports-sales | reports-session | reports-stock | config-settings | config-payments | config-staff | config-currencies
   posNavDropdown: null,     // null | 'orders' | 'products' | 'reporting' | 'configuration'
 
@@ -3959,9 +3960,9 @@ function renderPOSStoreSelector() {
 
   const storeTypes = [
     { key:'retail',      icon:'🛒', name:'Retail',           desc:'Any shop · general merchandise' },
-    { key:'bakery',      icon:'🍞', name:'Bakery & Food',    desc:'Food, over the counter' },
-    { key:'clothes',     icon:'👕', name:'Clothes & Fashion',desc:'Multi sizes, colors, SKUs' },
-    { key:'furniture',   icon:'🪑', name:'Furniture & Home', desc:'Stock, discounts, configurator' },
+    { key:'bakery_food', icon:'🍞', name:'Bakery & Food',    desc:'Food, batches and expiry tracking' },
+    { key:'fashion',     icon:'👕', name:'Clothes & Fashion',desc:'Sizes, colors and variant stock' },
+    { key:'furniture_home',icon:'🪑', name:'Furniture & Home', desc:'Variants, stock and delivery' },
     { key:'restaurant',  icon:'🍽️', name:'Restaurant',       desc:'Tables, menus, kitchen display' },
     { key:'electronics', icon:'📱', name:'Electronics',      desc:'Tech, serial numbers, warranty' },
   ];
@@ -4001,11 +4002,17 @@ function renderPOSStoreSelector() {
 
   div.querySelector('#btn-pos-sel-back').addEventListener('click', () => { S.view = 'workspace'; render(); });
   div.querySelectorAll('[data-store-type]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      S.posStoreType = btn.dataset.storeType;
-      S.posView = 'backoffice';
-      S.posBackofficeTab = 'dashboard';
-      render();
+    btn.addEventListener('click', async () => {
+      const type=btn.dataset.storeType;btn.disabled=true;
+      try {
+        const settings=await posSetStoreType(type);
+        S.posStoreType=settings.store_type;
+        S.posStoreCapabilities={...(settings.store_capabilities||{})};
+        S.posView='backoffice';S.posBackofficeTab='dashboard';render();
+      } catch(error) {
+        btn.disabled=false;
+        showPOSNotice(error.message||'The store type could not be saved.','Store configuration');
+      }
     });
   });
 
@@ -4043,7 +4050,7 @@ function renderPOSBackoffice() {
 
 function renderPOSTopNav() {
   const u = S.posActiveUser;
-  const storeTypeLabel = {retail:'Retail',bakery:'Bakery & Food',clothes:'Clothes',furniture:'Furniture',restaurant:'Restaurant',electronics:'Electronics'}[S.posStoreType] || 'Retail';
+  const storeTypeLabel = {retail:'Retail',bakery_food:'Bakery & Food',fashion:'Fashion',furniture_home:'Furniture & Home',restaurant:'Restaurant',electronics:'Electronics'}[S.posStoreType] || 'Retail';
   const tab = S.posBackofficeTab;
   const dd = S.posNavDropdown;
   const isOpen = S.posSession?.state === 'OPENED';

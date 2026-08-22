@@ -1707,23 +1707,42 @@ class PosService
         return $raw;
     }
 
+    /**
+     * P13 fix - The unique scope now includes pos_config_id so the same UUID
+     * accidentally reused at Bakaara POS and Airport POS in the same company
+     * does NOT collide. Callers that don't know a config pass 0 (the shared
+     * bucket for events that aren't POS-config scoped, e.g. company-wide
+     * settlement without a live session).
+     */
+    private function activeConfigId(int $companyId): int
+    {
+        try {
+            $user = \Core\Auth::user() ?: [];
+            $branchId = isset($user['branch_id']) ? (int)$user['branch_id'] : null;
+            $config = $this->resolveConfig($companyId, $branchId);
+            return (int)$config['id'];
+        } catch (\Throwable $e) { return 0; }
+    }
+
     private function idemBegin(int $companyId, string $action, string $key, array $payload): ?array
     {
         $hash = $this->requestHash($payload);
+        $configId = $this->activeConfigId($companyId);
         try {
             $this->db->query(
                 "INSERT INTO pos_idempotency_keys
-                    (company_id, action, idempotency_key, request_hash, status)
-                 VALUES (:company, :action, :key, :hash, 'PROCESSING')",
-                ['company' => $companyId, 'action' => $action, 'key' => $key, 'hash' => $hash]
+                    (company_id, pos_config_id, action, idempotency_key, request_hash, status)
+                 VALUES (:company, :config, :action, :key, :hash, 'PROCESSING')",
+                ['company' => $companyId, 'config' => $configId, 'action' => $action, 'key' => $key, 'hash' => $hash]
             );
             return null; // caller proceeds
         } catch (\PDOException $e) {
             if (!in_array((string)$e->getCode(), ['23000', '23505'], true)) throw $e;
             $row = $this->db->query(
                 "SELECT * FROM pos_idempotency_keys
-                 WHERE company_id=:company AND action=:action AND idempotency_key=:key LIMIT 1",
-                ['company' => $companyId, 'action' => $action, 'key' => $key]
+                 WHERE company_id=:company AND pos_config_id=:config
+                   AND action=:action AND idempotency_key=:key LIMIT 1",
+                ['company' => $companyId, 'config' => $configId, 'action' => $action, 'key' => $key]
             )->fetch();
             if (!$row) throw $e;
             if ($row['request_hash'] !== $hash) {
@@ -1740,14 +1759,16 @@ class PosService
 
     private function idemComplete(int $companyId, string $action, string $key, array $result): void
     {
+        $configId = $this->activeConfigId($companyId);
         $this->db->query(
             "UPDATE pos_idempotency_keys
              SET status='COMPLETED', response_data=:body, entity_id=:eid, http_status=201, completed_at=NOW()
-             WHERE company_id=:company AND action=:action AND idempotency_key=:key",
+             WHERE company_id=:company AND pos_config_id=:config AND action=:action AND idempotency_key=:key",
             [
                 'body'    => json_encode($result),
                 'eid'     => is_numeric($result['id'] ?? null) ? (int)$result['id'] : null,
                 'company' => $companyId,
+                'config'  => $configId,
                 'action'  => $action,
                 'key'     => $key,
             ]
@@ -1756,10 +1777,12 @@ class PosService
 
     private function idemRelease(int $companyId, string $action, string $key): void
     {
+        $configId = $this->activeConfigId($companyId);
         $this->db->query(
             "DELETE FROM pos_idempotency_keys
-             WHERE company_id=:company AND action=:action AND idempotency_key=:key AND status='PROCESSING'",
-            ['company' => $companyId, 'action' => $action, 'key' => $key]
+             WHERE company_id=:company AND pos_config_id=:config
+               AND action=:action AND idempotency_key=:key AND status='PROCESSING'",
+            ['company' => $companyId, 'config' => $configId, 'action' => $action, 'key' => $key]
         );
     }
 

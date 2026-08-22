@@ -156,9 +156,6 @@ const S = {
   // POS — core
   posCart: [],
   posSearchTerm: '',
-  // Legacy single-method state kept only for the "add-line" click handler that
-  // consults it as a UI hint. Financial source of truth is posPaymentLines.
-  posPaymentMethod: 'cash',
   // Odoo-style split-payment lines. Each entry:
   //   { method_name, method_type: 'cash'|'mobile'|'credit', amount, tendered?, reference? }
   // The backend independently validates and re-derives change from tendered.
@@ -179,10 +176,6 @@ const S = {
   confirmDeleteModal: null, // { type:'product'|'customer'|'staff'|'transaction', id:any }
 
   // POS — mobile money modal
-  posMobileMoneyModal: false,
-  mobilePhone: '',
-  mobileTxId: '',
-  mobileError: '',
 
   // POS — debt (Buugga Deynta)
   posDebtCustomerId: null,
@@ -238,7 +231,6 @@ const S = {
   //     amount, note, counted, managerPin, error, result }
   posRegisterModal: null,
   posDialog: null,          // application notice/confirmation; never native browser UI
-  posCashTendered: '',       // USD amount entered by cashier for cash payment
   posHeldOrders: [],         // [{ id, cashier, items, customer, ts }]
   posShowHeld: false,        // toggle held orders panel
   posPayments: [],
@@ -3039,26 +3031,26 @@ function renderPharmSettings() {
 // RETAIL POS MODULE
 // ============================================================
 const POS_PRODUCTS = [
-  { id:1,  name:'Basmati Rice 5kg',      cat:'Groceries',     price:12.00, wholesalePrice:88.00,  stock:84,  barcode:'6901234001' },
-  { id:2,  name:'Sunflower Oil 3L',      cat:'Groceries',     price:8.50,  wholesalePrice:62.00,  stock:62,  barcode:'6901234002' },
-  { id:3,  name:'Sugar 1kg',             cat:'Groceries',     price:1.80,  wholesalePrice:11.80,  stock:150, barcode:'6901234003' },
-  { id:4,  name:'Wheat Flour 2kg',       cat:'Groceries',     price:3.20,  wholesalePrice:22.00,  stock:95,  barcode:'6901234004' },
-  { id:5,  name:'Powdered Milk 400g',    cat:'Groceries',     price:6.50,  wholesalePrice:47.00,  stock:45,  barcode:'6901234005' },
-  { id:6,  name:'Coca-Cola 330ml',       cat:'Beverages',     price:0.80,  wholesalePrice:8.00,   stock:200, barcode:'6901234006' },
-  { id:7,  name:'Bottled Water 1.5L',    cat:'Beverages',     price:0.50,  wholesalePrice:4.50,   stock:300, barcode:'6901234007' },
-  { id:8,  name:'Fresh Juice Mango 1L',  cat:'Beverages',     price:2.40,  wholesalePrice:16.00,  stock:38,  barcode:'6901234008' },
-  { id:9,  name:'Laundry Detergent 1kg', cat:'Household',     price:4.20,  wholesalePrice:30.00,  stock:55,  barcode:'6901234009' },
-  { id:10, name:'Dish Soap 500ml',       cat:'Household',     price:1.50,  wholesalePrice:10.00,  stock:72,  barcode:'6901234010' },
-  { id:11, name:'Toothpaste 100ml',      cat:'Personal Care', price:2.00,  wholesalePrice:13.50,  stock:90,  barcode:'6901234011' },
-  { id:12, name:'Shampoo 250ml',         cat:'Personal Care', price:3.80,  wholesalePrice:26.00,  stock:48,  barcode:'6901234012' },
-  { id:13, name:'Canned Tuna 170g',      cat:'Groceries',     price:2.20,  wholesalePrice:15.00,  stock:110, barcode:'6901234013' },
-  { id:14, name:'Tea Bags x25',          cat:'Beverages',     price:1.60,  wholesalePrice:11.00,  stock:130, barcode:'6901234014' },
-  { id:15, name:'Instant Coffee 200g',   cat:'Beverages',     price:5.00,  wholesalePrice:36.00,  stock:40,  barcode:'6901234015' },
-  { id:16, name:'Biscuits 200g',         cat:'Snacks',        price:1.20,  wholesalePrice:8.50,   stock:160, barcode:'6901234016' },
-  { id:17, name:'Chocolate Bar 50g',     cat:'Snacks',        price:0.90,  wholesalePrice:6.00,   stock:180, barcode:'6901234017' },
-  { id:18, name:'Fresh Bread Loaf',      cat:'Bakery',        price:1.00,  wholesalePrice:7.00,   stock:60,  barcode:'6901234018' },
-  { id:19, name:'Eggs Tray x30',         cat:'Fresh',         price:4.50,  wholesalePrice:32.00,  stock:35,  barcode:'6901234019' },
-  { id:20, name:'Bananas 1kg',           cat:'Fresh',         price:1.40,  wholesalePrice:9.00,   stock:50,  barcode:'6901234020' },
+  { id:1,  name:'Basmati Rice 5kg',      cat:'Groceries',     price:12.00, stock:84,  barcode:'6901234001' },
+  { id:2,  name:'Sunflower Oil 3L',      cat:'Groceries',     price:8.50,  stock:62,  barcode:'6901234002' },
+  { id:3,  name:'Sugar 1kg',             cat:'Groceries',     price:1.80,  stock:150, barcode:'6901234003' },
+  { id:4,  name:'Wheat Flour 2kg',       cat:'Groceries',     price:3.20,  stock:95,  barcode:'6901234004' },
+  { id:5,  name:'Powdered Milk 400g',    cat:'Groceries',     price:6.50,  stock:45,  barcode:'6901234005' },
+  { id:6,  name:'Coca-Cola 330ml',       cat:'Beverages',     price:0.80,  stock:200, barcode:'6901234006' },
+  { id:7,  name:'Bottled Water 1.5L',    cat:'Beverages',     price:0.50,  stock:300, barcode:'6901234007' },
+  { id:8,  name:'Fresh Juice Mango 1L',  cat:'Beverages',     price:2.40,  stock:38,  barcode:'6901234008' },
+  { id:9,  name:'Laundry Detergent 1kg', cat:'Household',     price:4.20,  stock:55,  barcode:'6901234009' },
+  { id:10, name:'Dish Soap 500ml',       cat:'Household',     price:1.50,  stock:72,  barcode:'6901234010' },
+  { id:11, name:'Toothpaste 100ml',      cat:'Personal Care', price:2.00,  stock:90,  barcode:'6901234011' },
+  { id:12, name:'Shampoo 250ml',         cat:'Personal Care', price:3.80,  stock:48,  barcode:'6901234012' },
+  { id:13, name:'Canned Tuna 170g',      cat:'Groceries',     price:2.20,  stock:110, barcode:'6901234013' },
+  { id:14, name:'Tea Bags x25',          cat:'Beverages',     price:1.60,  stock:130, barcode:'6901234014' },
+  { id:15, name:'Instant Coffee 200g',   cat:'Beverages',     price:5.00,  stock:40,  barcode:'6901234015' },
+  { id:16, name:'Biscuits 200g',         cat:'Snacks',        price:1.20,  stock:160, barcode:'6901234016' },
+  { id:17, name:'Chocolate Bar 50g',     cat:'Snacks',        price:0.90,  stock:180, barcode:'6901234017' },
+  { id:18, name:'Fresh Bread Loaf',      cat:'Bakery',        price:1.00,  stock:60,  barcode:'6901234018' },
+  { id:19, name:'Eggs Tray x30',         cat:'Fresh',         price:4.50,  stock:35,  barcode:'6901234019' },
+  { id:20, name:'Bananas 1kg',           cat:'Fresh',         price:1.40,  stock:50,  barcode:'6901234020' },
 ];
 
 const POS_CUSTOMERS = [
@@ -3374,7 +3366,6 @@ function posResetPaymentLines() {
   S.posPricelistManual = false;
   const defaultPricelist = (S.posPricelists || []).find(p => Number(p.is_default) === 1);
   S.posSelectedPricelistId = defaultPricelist ? Number(defaultPricelist.id) : null;
-  S.posCashTendered = '';
   S.posCheckoutUncertain = false;
 }
 
@@ -4286,12 +4277,6 @@ function renderPOSSession() {
   checkoutArea.className = 'pos-session-checkout';
   checkoutArea.innerHTML = renderPOSCheckout();
 
-  if (S.posMobileMoneyModal) {
-    const overlay = document.createElement('div');
-    overlay.className = 'mm-modal-overlay';
-    overlay.innerHTML = renderMobileMoneyModal();
-    checkoutArea.appendChild(overlay);
-  }
 
   wrap.appendChild(bar);
   wrap.appendChild(checkoutArea);
@@ -5205,39 +5190,6 @@ function renderPOSCheckout() {
   `;
 }
 
-function renderMobileMoneyModal() {
-  const methodLabels = {evc:'EVC Plus \u00b7 Hormuud',edahab:'eDahab \u00b7 Somtel',zaad:'Zaad \u00b7 Telesom'};
-  const label = methodLabels[S.posPaymentMethod] || 'Mobile Money';
-  const cart = S.posCart;
-  const subtotal = cart.reduce((s,item)=>{ const p=item.isWholesale?item.wholesalePrice:item.price; return s+p*item.qty; }, 0);
-  const total = subtotal * 1.05;
-  const sos = (usd) => (usd * S.exchangeRate).toLocaleString();
-  return `
-    <div class="mm-modal">
-      <div class="mm-modal-icon">
-        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--gold)" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18" stroke-linecap="round"/></svg>
-      </div>
-      <h3 class="mm-modal-title">${label}</h3>
-      <p class="mm-modal-amount">$${total.toFixed(2)}</p>
-      <div class="mm-modal-fields">
-        <div class="mm-field">
-          <label class="mm-label">Lambarka telefoonka</label>
-          <input class="mm-input" id="mm-phone" type="tel" placeholder="061 XXX XXXX" value="${S.mobilePhone||''}" maxlength="15"/>
-        </div>
-        <div class="mm-field">
-          <label class="mm-label">Transaction ID (6 lambar)</label>
-          <input class="mm-input" id="mm-txid" type="text" placeholder="123456" value="${S.mobileTxId||''}" maxlength="8" style="font-family:var(--font-mono);letter-spacing:3px"/>
-        </div>
-        ${S.mobileError ? `<div class="mm-error">${S.mobileError}</div>` : ''}
-      </div>
-      <div class="mm-modal-actions">
-        <button class="btn btn-gold" id="btn-mm-confirm">Xaqiiji \u2713</button>
-        <button class="btn btn-ghost" id="btn-mm-cancel" style="color:var(--purple-800)">Jooji</button>
-      </div>
-    </div>
-  `;
-}
-
 function renderPOSReceipt() {
   const r = S.posLastReceipt;
   const isRefund = !!r.isRefund;
@@ -5418,7 +5370,7 @@ function renderPOSCustomerAccountModal() {
   const selectedMeta=methods.find(method=>method.name===selectedMethod);
   const typeLabels={DEYN_SALE:'Customer Account Sale',DEYN_PAYMENT:'Customer Account Payment',DEYN_REFUND_REVERSAL:'Refund Reversal'};
   return `<div class="crud-overlay">
-    <div class="crud-modal" style="max-width:980px;width:calc(100vw - 30px)">
+    <div class="crud-modal" style="max-width:980px;width:calc(100vw - 48px);min-width:0">
       <div class="crud-modal-header"><div><h3>Customer Account — ${esc(c.name)}</h3><div style="font-size:11px;color:var(--text-muted)">Sales, payments and refund reversals are kept separate from Loyalty.</div></div><button class="crud-close-btn" id="btn-account-close">×</button></div>
       <div class="crud-modal-body">
         ${data.invariant_ok===false && posCan('settings') ? '<div class="crud-error">Admin warning: the stored balance does not match the account ledger.</div>' : ''}
@@ -6696,7 +6648,7 @@ function wirePOSEvents() {
     if(!product)return;
     S.posTab='products';
     S.crudModal={type:'product',mode:'edit',id:product.id};
-    S.crudForm={name:product.name,cat:product.cat,price:product.price,wholesalePrice:product.wholesalePrice,stock:product.stock,minimumStock:product.minimumStock,barcode:product.barcode};
+    S.crudForm={name:product.name,cat:product.cat,price:product.price,stock:product.stock,minimumStock:product.minimumStock,barcode:product.barcode};
     render();
   }));
 
@@ -6711,7 +6663,7 @@ function wirePOSEvents() {
       const p = POS_PRODUCTS.find(x=>x.id===parseInt(btn.dataset.editProduct));
       if (!p) return;
       S.crudModal = { type:'product', mode:'edit', id:p.id };
-      S.crudForm = { name:p.name, cat:p.cat, price:p.price, wholesalePrice:p.wholesalePrice, stock:p.stock, minimumStock:p.minimumStock, barcode:p.barcode };
+      S.crudForm = { name:p.name, cat:p.cat, price:p.price, stock:p.stock, minimumStock:p.minimumStock, barcode:p.barcode };
       render();
     });
   });
@@ -6781,16 +6733,6 @@ function wirePOSEvents() {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       S.viewModal = { type:'transaction', id:btn.dataset.viewTxnBtn };
-      render();
-    });
-  });
-  document.querySelectorAll('[data-delete-txn]').forEach(btn => {
-    // Retained for any legacy trigger — but the trash-style refund shortcut
-    // is now the explicit ↩ Refund button below. This falls through to the
-    // same confirmation for backwards compat.
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      S.confirmDeleteModal = { type:'transaction', id:btn.dataset.deleteTxn };
       render();
     });
   });
@@ -7053,14 +6995,10 @@ function wirePOSEvents() {
         if (!prod) return;
         const existing = S.posCart.find(item=>item.id===id);
         if (existing) { existing.qty++; }
-        else { S.posCart.push({ id:prod.id, name:prod.name, price:prod.price, wholesalePrice:prod.wholesalePrice, qty:1, isWholesale:false }); }
+        else { S.posCart.push({ id:prod.id, name:prod.name, price:prod.price, qty:1 }); }
         posScheduleQuote();
         render();
       });
-    });
-
-    document.querySelectorAll('.pos-wholesale-cb').forEach(cb => {
-      cb.addEventListener('change', () => { if(S.posCheckoutUncertain)return; S.posPendingOrderId = null; S.posCart[parseInt(cb.dataset.cartIdx)].isWholesale = cb.checked; posScheduleQuote(); render(); });
     });
 
     document.querySelectorAll('[data-qty-plus]').forEach(btn => {
@@ -7203,7 +7141,7 @@ function wirePOSEvents() {
         const idx = parseInt(btn.dataset.resumeHeld);
         const held = (S.posHeldOrders||[])[idx];
         if (!held) return;
-        const resume=()=>{S.posCart=[...held.items];S.posDebtCustomerId=held.customer||null;S.posPaymentLines=Array.isArray(held.payment_lines)?[...held.payment_lines]:[];S.posCashTendered='';posScheduleQuote(0);S.posHeldOrders.splice(idx,1);S.posShowHeld=false;render();};
+        const resume=()=>{S.posCart=[...held.items];S.posDebtCustomerId=held.customer||null;S.posPaymentLines=Array.isArray(held.payment_lines)?[...held.payment_lines]:[];posScheduleQuote(0);S.posHeldOrders.splice(idx,1);S.posShowHeld=false;render();};
         if(S.posCart.length>0)showPOSConfirm('Replace the current cart with this held order?',resume,'Resume held order','Replace cart');
         else resume();
       });
@@ -7228,26 +7166,6 @@ function wirePOSEvents() {
     }
     const clearBtn = document.getElementById('btn-pos-clear');
     if (clearBtn) clearBtn.addEventListener('click', () => { if(S.posCheckoutUncertain)return; S.posPendingOrderId=null;S.posCart=[];posResetPaymentLines();render(); });
-  }
-
-  if (S.posMobileMoneyModal) {
-    const phoneInput = document.getElementById('mm-phone');
-    const txInput = document.getElementById('mm-txid');
-    if (phoneInput) phoneInput.addEventListener('input', () => { S.mobilePhone=phoneInput.value; });
-    if (txInput) txInput.addEventListener('input', () => { S.mobileTxId=txInput.value; });
-    const confirmBtn = document.getElementById('btn-mm-confirm');
-    if (confirmBtn) {
-      confirmBtn.addEventListener('click', async () => {
-        const phone=(S.mobilePhone||'').trim();
-        const txid=(S.mobileTxId||'').trim();
-        if (!/^[\d\s\-+]{7,}$/.test(phone)) { S.mobileError='Geli lambarka telefoonka saxda ah.'; render(); return; }
-        if (!/^\d{4,8}$/.test(txid)) { S.mobileError='Transaction ID waa inuu noqdaa 4\u20138 lambar.'; render(); return; }
-        S.posMobileMoneyModal=false;
-        await finalizeCharge();
-      });
-    }
-    const cancelBtn = document.getElementById('btn-mm-cancel');
-    if (cancelBtn) cancelBtn.addEventListener('click', () => { S.posMobileMoneyModal=false; render(); });
   }
 
   if (S.posReceiptVisible) {
@@ -7363,7 +7281,6 @@ async function finalizeCharge() {
     S.posCheckoutUncertain = false;
     S.posCart = [];
     posResetPaymentLines();
-    S.posMobileMoneyModal = false;
     await posBootstrap();
     if (S.posLastReceipt.credit_warning) {
       // Odoo-mode warn: surface after the sale succeeded (Rule #28).
@@ -7372,7 +7289,6 @@ async function finalizeCharge() {
     }
   } catch (error) {
     if (error.simulatedLostResponse) S.posCheckoutUncertain = true;
-    S.posMobileMoneyModal = false;
     showPOSNotice(error.message,'Checkout failed');
     render();
   }

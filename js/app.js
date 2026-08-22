@@ -5585,11 +5585,11 @@ function renderPOSTransactions() {
   if (S.viewModal && S.viewModal.type === 'transaction') {
     const t = POS_TRANSACTIONS.find(x=>x.id===S.viewModal.id);
     if (t) viewHtml = `
-      <div class="crud-overlay">
+      <div class="crud-overlay" data-view-backdrop>
         <div class="crud-modal" style="max-width:440px">
           <div class="crud-modal-header">
             <h3>Transaction Detail</h3>
-            <button class="crud-close-btn" id="btn-view-close">×</button>
+            <button class="crud-close-btn" data-view-close aria-label="Close transaction detail">×</button>
           </div>
           <div class="crud-modal-body">
             <div class="txn-detail-grid">
@@ -5613,7 +5613,7 @@ function renderPOSTransactions() {
             </div>
           </div>
           <div class="crud-modal-footer">
-            <button class="btn btn-outline" id="btn-view-close">Close</button>
+            <button class="btn btn-outline" data-view-close>Close</button>
           </div>
         </div>
       </div>`;
@@ -6784,7 +6784,11 @@ function wirePOSEvents() {
   // ---- Shared modal close/cancel ----
   document.getElementById('btn-crud-close')?.addEventListener('click', () => { S.crudModal=null; S.crudForm={}; render(); });
   document.getElementById('btn-crud-cancel')?.addEventListener('click', () => { S.crudModal=null; S.crudForm={}; render(); });
-  document.getElementById('btn-view-close')?.addEventListener('click', () => { S.viewModal=null; render(); });
+  const closeViewModal = () => { S.viewModal=null; render(); };
+  document.querySelectorAll('[data-view-close]').forEach(button => button.addEventListener('click', closeViewModal));
+  document.querySelector('[data-view-backdrop]')?.addEventListener('click', event => {
+    if (event.target === event.currentTarget) closeViewModal();
+  });
   document.getElementById('btn-delete-cancel')?.addEventListener('click', () => { S.confirmDeleteModal=null; render(); });
 
   // ---- Shared SAVE ----

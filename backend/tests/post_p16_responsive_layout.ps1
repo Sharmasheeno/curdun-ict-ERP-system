@@ -64,6 +64,10 @@ try {
   if($brandSurfaces.exceptionDetails){throw($brandSurfaces.exceptionDetails|ConvertTo-Json -Depth 12)}
   $invalidBrandSurfaces=@($brandSurfaces.result.value|Where-Object{!$_.loaded-or$_.width-lt160})
   if($brandSurfaces.result.value.Count-ne2-or$invalidBrandSurfaces.Count-gt0){throw "Curdun login/selector brand surfaces failed: $($brandSurfaces.result.value|ConvertTo-Json -Compress)"}
+  $modalClose=Invoke-Cdp 'Runtime.evaluate' @{expression="(async()=>{const pause=ms=>new Promise(r=>setTimeout(r,ms)),id=POS_TRANSACTIONS[0]?.id;if(!id)throw Error('No transaction fixture');const open=async()=>{S.posBackofficeTab='orders';S.viewModal={type:'transaction',id};render();await pause(20)};await open();const initialButtons=document.querySelectorAll('[data-view-close]').length;document.querySelectorAll('[data-view-close]')[1]?.click();const footerClosed=!S.viewModal;await open();document.querySelector('[data-view-close]')?.click();const headerClosed=!S.viewModal;await open();const backdrop=document.querySelector('[data-view-backdrop]');backdrop?.dispatchEvent(new MouseEvent('click',{bubbles:true}));const backdropClosed=!S.viewModal;return {initialButtons,footerClosed,headerClosed,backdropClosed}})()";awaitPromise=$true;returnByValue=$true}
+  if($modalClose.exceptionDetails){throw($modalClose.exceptionDetails|ConvertTo-Json -Depth 12)}
+  $modalResult=$modalClose.result.value
+  if($modalResult.initialButtons-ne2-or!$modalResult.footerClosed-or!$modalResult.headerClosed-or!$modalResult.backdropClosed){throw "Transaction detail close regression failed: $($modalResult|ConvertTo-Json -Compress)"}
   $results|ConvertTo-Json -Depth 8
 }
 finally {

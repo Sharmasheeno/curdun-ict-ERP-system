@@ -93,6 +93,12 @@ async function posLoadCustomerLedger(customerId) {
   return posApiFetch(`/pos/customers/${customerId}/ledger`);
 }
 
+async function posLoadAuditLogs(filters={}) {
+  const query=new URLSearchParams();
+  Object.entries(filters).forEach(([key,value])=>{if(value!==null&&value!==undefined&&String(value).trim()!=='')query.set(key,String(value).trim());});
+  return posApiFetch(`/pos/audit-logs?${query}`);
+}
+
 // P14.2 — authoritative live cart quote. A monotonically increasing request
 // number prevents a slow response for qty 9 from overwriting the newer qty 10
 // response. The endpoint accepts no client price fields.

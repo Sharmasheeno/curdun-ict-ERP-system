@@ -199,6 +199,10 @@ const S = {
   posRewardsOpen: false,
   posPaymentMethodsMeta: [],
   posCustomerAccount: null,
+  posAuditData: null,
+  posAuditLoading: false,
+  posAuditError: '',
+  posAuditFilters: {date_from:'',date_to:'',action:'',result:'',account_user:'',pos_employee:'',pos:'',session:'',entity:''},
 
   // POS — management reports and stock notifications
   posReportFrom: new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10),
@@ -3985,7 +3989,7 @@ function renderPOSTopNav() {
   const canReports      = posCan('viewMargin')   === true; // reports leak margin — same gate
 
   const navItem = (key, label, hasChild) => {
-    const menuTabs = { orders:['orders','sessions','payments','customers'], products:['products','categories','combos'], reporting:['reports-orders','reports-sales','reports-session','reports-stock'], configuration:['config-settings','config-payments','config-staff','config-currencies'] };
+    const menuTabs = { orders:['orders','sessions','payments','customers'], products:['products','categories','combos'], reporting:['reports-orders','reports-sales','reports-session','reports-stock'], configuration:['config-settings','config-payments','config-staff','config-currencies','config-audit'] };
     const active = menuTabs[key]?.includes(tab) || tab === key;
     return `
       <div class="pos-topnav-item ${active?'active':''}" data-nav-menu="${key}">
@@ -4011,6 +4015,7 @@ function renderPOSTopNav() {
             ${canOpenSettings ? `<button class="pos-dd-item" data-bo-tab="config-payments">Payment Methods</button>` : ''}
             ${canManageStaff  ? `<button class="pos-dd-item" data-bo-tab="config-staff">Staff & Users</button>` : ''}
             ${canOpenSettings ? `<button class="pos-dd-item" data-bo-tab="config-currencies">Currencies</button>` : ''}
+            ${canOpenSettings ? `<button class="pos-dd-item" data-bo-tab="config-audit">Audit Logs</button>` : ''}
             ${!(canOpenSettings || canManageStaff) ? `<div style="padding:12px 14px;color:var(--text-muted);font-size:12px;font-style:italic">No configuration options available for your role.</div>` : ''}
           `}
         </div>` : ''}
@@ -4148,6 +4153,7 @@ function renderPOSBackofficeTab() {
     'config-payments':   () => posCan('settings')     === true,
     'config-staff':      () => posCan('manageStaff')  === true,
     'config-currencies': () => posCan('settings')     === true,
+    'config-audit':      () => posCan('settings')     === true,
     'categories':        () => posCan('editProducts') === true,
     'combos':            () => posCan('editProducts') === true,
   };
@@ -4171,6 +4177,7 @@ function renderPOSBackofficeTab() {
     case 'config-payments':  return renderPOSConfigPayments();
     case 'config-staff':     return renderPOSStaff();
     case 'config-currencies':return renderPOSConfigCurrencies();
+    case 'config-audit':     return renderPOSAuditLogs();
     default:                 return renderPOSDash();
   }
 }
@@ -5377,6 +5384,21 @@ function renderPOSCustomerAccountModal() {
       </div>
     </div>
   </div>`;
+}
+
+function renderPOSAuditLogs() {
+  const f=S.posAuditFilters||{}; const rows=S.posAuditData?.items||[];
+  return `<div class="page-header"><div><h2 class="page-title">Audit Logs</h2><div class="page-subtitle">Company-scoped operational history with account and POS employee identity.</div></div></div>
+    <div class="data-section" style="padding:14px;margin-bottom:14px">
+      <div class="crud-grid-2" style="grid-template-columns:repeat(4,minmax(140px,1fr))">
+        ${[['date_from','Date from','date'],['date_to','Date to','date'],['action','Action','text'],['result','Result','text'],['account_user','Account User','text'],['pos_employee','POS Employee','text'],['pos','POS','text'],['session','Session','text'],['entity','Entity ID','text']].map(([key,label,type])=>`<div class="form-group"><label class="form-label">${label}</label><input class="form-input pos-audit-filter" data-audit-filter="${key}" type="${type}" value="${esc(f[key]||'')}"/></div>`).join('')}
+      </div>
+      <div style="display:flex;gap:8px"><button class="btn btn-primary btn-sm" id="btn-audit-run" ${S.posAuditLoading?'disabled':''}>${S.posAuditLoading?'Loading…':'Apply filters'}</button><button class="btn btn-outline btn-sm" id="btn-audit-clear">Clear</button></div>
+      ${S.posAuditError?`<div class="crud-error" style="margin-top:10px">${esc(S.posAuditError)}</div>`:''}
+    </div>
+    <div class="data-section"><div class="section-header-bar"><h3 class="chart-title">POS audit trail</h3><span class="ml-auto" style="font-size:12px;color:var(--text-muted)">${rows.length} rows</span></div><div class="overflow-x-auto"><table class="data-table" style="min-width:1050px"><thead><tr><th>Date</th><th>Action</th><th>Result</th><th>Account User</th><th>POS Employee</th><th>POS</th><th>Session</th><th>Entity</th></tr></thead><tbody>
+      ${rows.length?rows.map(row=>`<tr><td>${esc(row.date||'—')}</td><td><span class="pill pill-gold">${esc(row.action||'—')}</span></td><td><span class="pill ${row.result==='SUCCESS'?'pill-green':'pill-red'}">${esc(row.result||'—')}</span></td><td>${esc(row.account_user||'—')}</td><td>${esc(row.pos_employee||'—')}</td><td>${esc(row.pos||'—')}</td><td>${esc(row.session||'—')}</td><td>${esc(row.entity?.type||'Entity')} #${esc(row.entity?.id||'—')}</td></tr>`).join(''):'<tr><td colspan="8" style="text-align:center;color:var(--text-muted)">Run the audit query to view company activity.</td></tr>'}
+    </tbody></table></div></div>`;
 }
 
 function renderPOSCustomers() {
@@ -6857,6 +6879,19 @@ function wirePOSEvents() {
       try { await posSaveSettings(S.storeSettings); }
       catch (error) { cb.checked = !cb.checked; S.storeSettings.payments[cb.dataset.paymentToggle] = cb.checked; alert(error.message); }
     });
+  });
+
+  document.querySelectorAll('.pos-audit-filter').forEach(input => {
+    input.addEventListener('change', () => { S.posAuditFilters={...S.posAuditFilters,[input.dataset.auditFilter]:input.value}; });
+  });
+  document.getElementById('btn-audit-run')?.addEventListener('click', async () => {
+    S.posAuditLoading=true;S.posAuditError='';render();
+    try { S.posAuditData=await posLoadAuditLogs(S.posAuditFilters); }
+    catch(error){S.posAuditError=error.message||'Audit logs could not be loaded.';}
+    finally{S.posAuditLoading=false;render();}
+  });
+  document.getElementById('btn-audit-clear')?.addEventListener('click', () => {
+    S.posAuditFilters={date_from:'',date_to:'',action:'',result:'',account_user:'',pos_employee:'',pos:'',session:'',entity:''};S.posAuditData=null;S.posAuditError='';render();
   });
 
   // Shift reconciliation

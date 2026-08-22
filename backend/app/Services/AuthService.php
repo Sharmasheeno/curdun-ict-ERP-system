@@ -332,6 +332,7 @@ class AuthService
 
         $this->auditLogRepository->create([
             'user_id'    => $cashier['id'] ?? null,
+            'company_id' => $companyId,
             'module'     => 'POS',
             'action'     => 'MANAGER_APPROVAL',
             'record_id'  => $manager['id'],
@@ -345,6 +346,12 @@ class AuthService
                 'approved_by'     => $manager['name'] ?? null,
                 'requested_by_id' => $cashier['id'] ?? null,
                 'requested_by'    => $cashier['name'] ?? null,
+                'actor'           => [
+                    'account_user_id'   => $accountForAudit ? (int)$accountForAudit['id'] : null,
+                    'account_user_name' => $accountForAudit['name'] ?? null,
+                    'pos_cashier_id'    => $cashier ? (int)$cashier['id'] : null,
+                    'pos_cashier_name'  => $cashier['name'] ?? null,
+                ],
                 'reason'          => $reason,
                 'approval_id'     => $approvalId,
                 // P12 Rule #14 - never leak any part of the raw token.

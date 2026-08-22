@@ -2532,6 +2532,55 @@ class PosService
         return $defaults;
     }
     public function settings(): array { [, $companyId]=$this->context();return $this->settingsData($companyId); }
+
+    /** P14.6 tenant-scoped POS audit viewer query. Client company_id is ignored. */
+    public function auditLogs(array $filters=[]): array
+    {
+        [, $companyId] = $this->context();
+        $where = ["a.company_id=:company", "a.module='POS'"];
+        $params = ['company'=>$companyId];
+        $map = [
+            'action'       => "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.canonical_action')),a.action)",
+            'result'       => "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.result')),'SUCCESS')",
+            'account_user' => "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.actor.account_user_name')),'')",
+            'pos_employee' => "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.actor.pos_cashier_name')),JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.requested_by')),u.name,'')",
+            'session'      => "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.session_id')),JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.actor.session_id')),'')",
+            'pos'          => "COALESCE(pc.name,CAST(pc.id AS CHAR),'')",
+            'entity'       => "CAST(a.record_id AS CHAR)",
+        ];
+        foreach ($map as $key=>$expr) {
+            $value=trim((string)($filters[$key]??''));
+            if ($value==='') continue;
+            $where[]="$expr LIKE :$key"; $params[$key]='%'.$value.'%';
+        }
+        if (!empty($filters['date_from'])) { $where[]='DATE(a.created_at)>=:date_from';$params['date_from']=$filters['date_from']; }
+        if (!empty($filters['date_to']))   { $where[]='DATE(a.created_at)<=:date_to';$params['date_to']=$filters['date_to']; }
+        $rows=$this->db->query(
+            "SELECT a.id,a.action,a.record_id,a.new_values,a.created_at,u.name user_name,pc.name pos_name
+             FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id
+             LEFT JOIN pos_sessions ps ON ps.id=CAST(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.session_id')) AS UNSIGNED) AND ps.company_id=a.company_id
+             LEFT JOIN pos_configs pc ON pc.id=ps.config_id AND pc.company_id=a.company_id
+             WHERE ".implode(' AND ',$where)." ORDER BY a.id DESC LIMIT 500",$params
+        )->fetchAll();
+        $items=[];
+        foreach($rows as $row){
+            $meta=json_decode((string)($row['new_values']??''),true)?:[];
+            foreach(['pin','password','token','approval_token','session_cookie','auth_token','secret','api_key'] as $secret) unset($meta[$secret]);
+            $actor=(array)($meta['actor']??[]);
+            $items[]=[
+                'id'=>(int)$row['id'],'date'=>$row['created_at'],
+                'action'=>$meta['canonical_action']??$row['action'],
+                'result'=>$meta['result']??'SUCCESS',
+                'account_user'=>$actor['account_user_name']??null,
+                'pos_employee'=>$actor['pos_cashier_name']??($meta['requested_by']??$row['user_name']),
+                'pos'=>$row['pos_name']??($meta['pos_config_name']??($meta['pos_config_id']??null)),
+                'session'=>$meta['session_id']??null,
+                'entity'=>['type'=>$meta['entity_type']??null,'id'=>$row['record_id']?(int)$row['record_id']:null],
+                'details'=>$meta,
+            ];
+        }
+        return ['items'=>$items,'count'=>count($items),'company_id'=>$companyId];
+    }
     public function updateSettings(array $data): array
     {
         // Settings is ERP-account gated — AccountPermissionMiddleware

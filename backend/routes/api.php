@@ -133,6 +133,7 @@ $router->group('/api/v1', function($router) {
     $router->put    ('/pos/settings',           [PosController::class, 'updateSettings'],[$ACC('settings.manage')]);
     $router->post   ('/pos/staff',              [PosController::class, 'createStaff'],  [$ACC('users.create')]);
     $router->put    ('/pos/staff/{id}',         [PosController::class, 'updateStaff'],  [$ACC('users.update')]);
+    $router->get    ('/pos/audit-logs',         [PosController::class, 'auditLogs'],    [$ACC('settings.manage')]);
     $router->get('/pos/reports', [PosController::class, 'reports']);
     $router->get('/pos/stock-alerts', [PosController::class, 'stockAlerts']);
     $router->post('/pos/stock-alerts/read-all', [PosController::class, 'markAllStockAlertsRead']);

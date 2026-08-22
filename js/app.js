@@ -3379,6 +3379,10 @@ function requireManagerApproval(action, options, onApproved) {
     action,
     label: options.label || action,
     reason: options.reason || '',
+    targetType: options.targetType || null,
+    targetId: options.targetId || null,
+    amount: options.amount ?? null,
+    sessionId: options.sessionId || null,
     onApproved,
     pin: '',
     error: '',
@@ -3653,9 +3657,7 @@ function renderRegisterModal() {
           <strong class="${varianceCls}">${varianceLabel}</strong>
         </div>
         ${overLimit ? `
-          <label class="form-label" style="margin-top:14px;color:var(--red-dark)">Manager PIN required (|variance| &gt; ${money(maxDiff)})</label>
-          <input class="form-input mono" id="rc-close-manager-pin" type="password" inputmode="numeric"
-                 maxlength="4" placeholder="••••" value="${m.managerPin || ''}"/>
+          <div class="pos-deyn-warning" style="margin-top:10px">Manager approval may be required when this closing difference is submitted.</div>
         ` : ''}
       ` : ''}
       <label class="form-label" style="margin-top:14px">Closing note (optional)</label>
@@ -3695,6 +3697,7 @@ function renderRegisterModal() {
         <div class="avatar" style="width:44px;height:44px;background:var(--gold);color:var(--purple-800);font-size:14px;font-weight:900">!</div>
         <div>
           <div style="font-weight:800;font-size:14px">${esc(m.label)}</div>
+          ${m.amount!==null?`<div style="font-size:12px;color:var(--text-secondary)">Amount: <strong>$${Number(m.amount).toFixed(2)}</strong></div>`:''}
           <div style="font-size:12px;color:var(--text-secondary);margin-top:2px">
             Requested by <strong>${esc(cashierName)}</strong>. A Store Manager or Admin PIN is needed to approve.
           </div>
@@ -3789,12 +3792,7 @@ function wireRegisterModal() {
     const expected = Number(S.posSessionSummary?.expected_cash ?? S.posSession?.opening_cash ?? 0);
     const variance = counted - expected;
     const maxDiff  = Number(S.storeSettings?.maximumDifference ?? 2);
-    let approve = false;
-    if (Math.abs(variance) > maxDiff) {
-      const pin = (document.getElementById('rc-close-manager-pin')?.value || '').trim();
-      if (!pin || pin.length !== 4) { m.error = 'Manager PIN is required to close with this difference.'; render(); return; }
-      approve = true;   // Backend will re-validate the manager PIN against the users table.
-    }
+    const approve = Math.abs(variance) > maxDiff;
 
     m.busy = true; m.error = ''; render();
     try {
@@ -3802,8 +3800,17 @@ function wireRegisterModal() {
       try {
         result = await posCloseShift(Number(S.posSession?.opened_by || S.posActiveUser?.id), counted, approve);
       } catch (err) {
-        if (err.status === 409 && /approve/i.test(err.message)) {
-          result = await posCloseShift(Number(S.posSession?.opened_by || S.posActiveUser?.id), counted, true);
+        if (err.status===403 && /approval/i.test(err.message)) {
+          requireManagerApproval('close-variance', {
+            label:'Close Register Difference', reason:'Approve closing cash variance', amount:Math.abs(variance),
+            targetType:'pos_session', targetId:Number(S.posSession?.id), sessionId:Number(S.posSession?.id),
+          }, async ({approvalId}) => {
+            try {
+              const approved=await posCloseShift(Number(S.posSession?.opened_by||S.posActiveUser?.id),counted,true,approvalId);
+              S.posRegisterModal={mode:'closed-summary',result:approved}; await posBootstrap(); render();
+            } catch(error){ alert(error.message||'Approved register close failed.'); }
+          });
+          return;
         } else { throw err; }
       }
       S.posRegisterModal = { mode: 'closed-summary', result };
@@ -3824,11 +3831,13 @@ function wireRegisterModal() {
     if (!reason) { m.error = 'A reason is required for the audit log.'; render(); return; }
     m.busy = true; m.error = ''; render();
     try {
-      const result = await posVerifyManagerPin(pin, m.action || 'unknown', reason, S.posActiveUser?.branchId || null);
+      const result = await posVerifyManagerPin(pin, m.action || 'unknown', reason, S.posActiveUser?.branchId || null, {
+        targetType:m.targetType,targetId:m.targetId,amount:m.amount,sessionId:m.sessionId,
+      });
       const cb = m.onApproved;
       S.posRegisterModal = null;
       render();
-      try { cb?.({ approved_by: result.approved_by, reason }); } catch (e) { alert(e.message || String(e)); }
+      try { cb?.({ approvalId:result.approval?.approval_id, approved_by:result.approved_by, reason }); } catch (e) { alert(e.message || String(e)); }
     } catch (err) {
       m.busy = false;
       m.error = err.message || 'That PIN does not match any Store Manager or Admin.';
@@ -3848,6 +3857,16 @@ function wireRegisterModal() {
       S.posRegisterModal = null;
       render();
     } catch (err) {
+      if (err.status === 403 && /approval/i.test(err.message) && m.mode === 'cash-out') {
+        requireManagerApproval('cash-out', {
+          label:'Cash Out', reason, amount, targetType:'pos_session',
+          targetId:Number(S.posSession?.id), sessionId:Number(S.posSession?.id),
+        }, async ({approvalId}) => {
+          try { await posRecordCashMovement('OUT',amount,reason,approvalId); S.posRegisterModal=null; render(); }
+          catch(error){ alert(error.message||'Approved Cash Out failed.'); }
+        });
+        return;
+      }
       m.busy = false; m.error = err.message || 'Could not record the movement.';
       render();
     }
@@ -5799,13 +5818,15 @@ function wireRefundModal() {
   if (submit) submit.addEventListener('click', async () => {
     if (submit.disabled) return;
     submit.disabled = true; submit.textContent = 'Validating…';
-    try {
-      const items = S.posRefundModal.lines
+    const items = S.posRefundModal.lines
         .filter(l => Number(l.refund_qty) > 0)
         .map(l => ({ order_item_id: Number(l.item.id), quantity: Number(l.refund_qty) }));
-      const payments = S.posRefundModal.payments.map(p => ({ method: p.method, amount: Number(p.amount) }));
-      const result = await posSubmitRefund(S.posRefundModal.orderId, { items, payments, reason: 'POS refund via Odoo-style workflow' });
-      const modalOrder = S.posRefundModal.data.order;
+    const payments = S.posRefundModal.payments.map(p => ({ method: p.method, amount: Number(p.amount) }));
+    const orderId = S.posRefundModal.orderId;
+    const modalOrder = S.posRefundModal.data.order;
+    const refundAmount = payments.reduce((sum,p)=>sum+Number(p.amount||0),0);
+    const finishRefund = async approvalId => {
+      const result = await posSubmitRefund(orderId, { items, payments, reason: 'POS refund via Odoo-style workflow' }, approvalId);
       S.posRefundModal = null;
       S.posLastReceipt = {
         id: result.reference_number,
@@ -5822,7 +5843,19 @@ function wireRefundModal() {
       };
       S.posReceiptVisible = true;
       render();
+    };
+    try {
+      await finishRefund(null);
     } catch (e) {
+      if (e.status===403 && /approval/i.test(e.message)) {
+        requireManagerApproval('refund', {
+          label:'Refund', reason:'Approve the selected refund lines', amount:refundAmount,
+          targetType:'order', targetId:orderId, sessionId:Number(S.posSession?.id),
+        }, async ({approvalId}) => {
+          try { await finishRefund(approvalId); } catch(error){ alert(error.message||'Approved refund failed.'); }
+        });
+        return;
+      }
       alert(e.message || 'Refund failed.');
       submit.disabled = false; submit.textContent = 'Validate refund';
     }
@@ -6726,15 +6759,16 @@ function wirePOSEvents() {
       // Refund permission — Cashier needs Manager PIN; Senior+ passes silently.
       const perm = posCan('refund');
       if (perm === false) { alert('Your role cannot issue refunds.'); return; }
-      const runRefund = () => posVoidTransaction(transaction._backendId).then(()=>{ S.confirmDeleteModal = null; render(); }).catch(err=>alert(err.message));
-      if (perm === 'pin') {
-        S.confirmDeleteModal = null; // close the delete modal first so the PIN overlay isn't sandwiched
-        requireManagerApproval('refund', {
-          label: `Refund order #${transaction._backendId}`,
-        }, () => runRefund());
-        return;
-      }
-      await posVoidTransaction(transaction._backendId);
+      const runRefund = async approvalId => {
+        try { await posVoidTransaction(transaction._backendId,approvalId); S.confirmDeleteModal=null; render(); }
+        catch(error) {
+          if (!approvalId && error.status===403 && /approval/i.test(error.message)) {
+            S.confirmDeleteModal=null;
+            requireManagerApproval('refund', { label:`Refund order #${transaction._backendId}`,reason:'Approve full refund',amount:Math.abs(Number(transaction.total||0)),targetType:'order',targetId:transaction._backendId }, ({approvalId:id})=>runRefund(id));
+          } else alert(error.message);
+        }
+      };
+      await runRefund(null);
     }
     S.confirmDeleteModal = null; render();
   });
@@ -6837,8 +6871,15 @@ function wirePOSEvents() {
       let result;
       try { result = await posCloseShift(S.shiftCashier, parseFloat(S.shiftCountedUSD)||0); }
       catch (error) {
-        if (error.status === 409 && /approve/i.test(error.message) && confirm(`${error.message}\n\nApprove this cash difference and close the register?`)) result = await posCloseShift(S.shiftCashier, parseFloat(S.shiftCountedUSD)||0, true);
-        else throw error;
+        if (error.status===403 && /approval/i.test(error.message)) {
+          const cashierId=S.shiftCashier; const counted=parseFloat(S.shiftCountedUSD)||0;
+          const expected=Number(S.posSessionSummary?.expected_cash||0); const variance=Math.abs(counted-expected);
+          requireManagerApproval('close-variance', {label:'Close Register Difference',reason:'Approve closing cash variance',amount:variance,targetType:'pos_session',targetId:Number(S.posSession?.id),sessionId:Number(S.posSession?.id)}, async ({approvalId})=>{
+            try { const approved=await posCloseShift(cashierId,counted,true,approvalId); alert(`Shift saved.\nSystem cash: $${Number(approved.system_cash).toFixed(2)}\nCounted: $${Number(approved.counted_cash).toFixed(2)}\nVariance: $${Number(approved.variance).toFixed(2)}`); S.shiftCountedUSD='';S.shiftCashier=null;render(); }
+            catch(err){alert(err.message||'Approved register close failed.');}
+          });
+          return;
+        } else throw error;
       }
       alert(`Shift saved.\nSystem cash: $${Number(result.system_cash).toFixed(2)}\nCounted: $${Number(result.counted_cash).toFixed(2)}\nVariance: $${Number(result.variance).toFixed(2)}`);
       S.shiftCountedUSD=''; S.shiftCashier=null;

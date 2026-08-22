@@ -239,13 +239,14 @@ class AuthService
 
     /**
      * Verify a Manager+ PIN for a specific restricted POS action and mint
-     * a one-time approval token bound to that action + target + cashier +
-     * amount. The token expires in 5 minutes and can be used exactly once.
+     * a one-time approval bound to that action + target + cashier + amount.
+     * It expires in 5 minutes and can be used exactly once.
      *
      * The calling cashier's session is NOT altered — POS authorization keeps
      * running against the cashier's own role. Only the specific restricted
      * operation named in { action, target } is unblocked, and only for the
-     * one attempt that presents this token via X-Manager-Approval.
+     * one attempt that presents the safe approval id. The secret token is
+     * retained entirely server-side.
      *
      * Extra params (all optional beyond action):
      *   $target = ['type'=>'order','id'=>1054]
@@ -327,6 +328,7 @@ class AuthService
                 'expires' => $expires,
             ]
         );
+        $approvalId = (int)\Core\Database::getInstance()->lastInsertId();
 
         $this->auditLogRepository->create([
             'user_id'    => $cashier['id'] ?? null,
@@ -344,6 +346,7 @@ class AuthService
                 'requested_by_id' => $cashier['id'] ?? null,
                 'requested_by'    => $cashier['name'] ?? null,
                 'reason'          => $reason,
+                'approval_id'     => $approvalId,
                 // P12 Rule #14 - never leak any part of the raw token.
                 // approval_id below is the safe reference.
                 'expires_at'      => $expires,
@@ -353,7 +356,9 @@ class AuthService
 
         return [
             'approval' => [
-                'token'      => $token,
+                // Safe browser reference. The raw one-time token remains
+                // server-side and is never returned to JavaScript.
+                'approval_id'=> $approvalId,
                 'action'     => $action,
                 'target'     => $target,
                 'amount'     => $amount,
@@ -369,6 +374,18 @@ class AuthService
             'action' => $action,
             'reason' => $reason,
         ];
+    }
+
+    /** Consume a browser-safe approval id; the secret token never leaves PHP. */
+    public function consumeApprovalId(?int $approvalId, array $constraints, string $ip): array
+    {
+        if (!$approvalId || $approvalId <= 0) {
+            throw new Exception('Manager approval is required for this action.', 403);
+        }
+        $db = \Core\Database::getInstance();
+        $row = $db->query("SELECT token FROM pos_manager_approvals WHERE id=:id LIMIT 1", ['id'=>$approvalId])->fetch();
+        if (!$row) throw new Exception('Manager approval is not valid.', 403);
+        return $this->consumeApproval($row['token'], $constraints, $ip);
     }
 
     /**
@@ -410,10 +427,15 @@ class AuthService
             && (int)$row['target_id'] !== (int)$constraints['target_id']) {
             throw new Exception('Manager approval is for a different record.', 403);
         }
-        // Amount tolerance: if approval set an amount, actual must be <= approved (rounded).
+        if (!empty($row['target_type']) && isset($constraints['target_type'])
+            && $row['target_type'] !== $constraints['target_type']) {
+            throw new Exception('Manager approval is for a different record type.', 403);
+        }
+        // Amount is exact-scoped. Increasing OR decreasing the intended
+        // financial amount after approval requires a fresh manager decision.
         if ($row['amount'] !== null && isset($constraints['amount'])
-            && round((float)$constraints['amount'], 2) > round((float)$row['amount'], 2) + 0.01) {
-            throw new Exception('Manager approval was for a smaller amount.', 403);
+            && abs(round((float)$constraints['amount'], 2) - round((float)$row['amount'], 2)) > 0.01) {
+            throw new Exception('Manager approval is for a different amount.', 403);
         }
         // The approval must have been requested by the current cashier.
         $cashier = $this->session->get('pos_cashier') ?: $this->session->get('user');

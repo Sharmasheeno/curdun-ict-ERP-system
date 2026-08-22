@@ -142,14 +142,15 @@ async function posLoadRefundable(orderId) {
   return posApiFetch(`/pos/orders/${orderId}/refundable`);
 }
 // Post the refund with a payments[] split.
-async function posSubmitRefund(orderId, payload) {
+async function posSubmitRefund(orderId, payload, approvalId=null) {
   // P14 - preserve the refund idempotency key across retries so a lost
   // response never creates a duplicate refund. Key is scoped by the target
   // order + the client-composed items[] hash so a different quantity picker
   // legitimately gets a different UUID (and thus a new refund).
   const slot = `refund:${orderId}:${JSON.stringify(payload.items || [])}`;
   const body = { ...payload, idempotency_key: _idemKey(slot) };
-  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body });
+  const headers = approvalId ? { 'X-Manager-Approval-ID': String(approvalId) } : {};
+  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body, headers });
   _clearIdemKey(slot);
   await refreshPOSSessionState();
   await posBootstrap();
@@ -316,9 +317,10 @@ function _idemKey(slot) {
 }
 function _clearIdemKey(slot) { if (S.posPendingKeys) delete S.posPendingKeys[slot]; }
 
-async function posVoidTransaction(orderId) {
+async function posVoidTransaction(orderId, approvalId=null) {
   const key = _idemKey(`refund:${orderId}`);
-  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body:{ idempotency_key:key, reason:'Full refund from POS' }});
+  const headers = approvalId ? { 'X-Manager-Approval-ID': String(approvalId) } : {};
+  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body:{ idempotency_key:key, reason:'Full refund from POS' }, headers });
   _clearIdemKey(`refund:${orderId}`);
   await refreshPOSSessionState();
   await posBootstrap();
@@ -345,17 +347,19 @@ async function posOpenSession(openingCash=0, note=null) {
   await refreshPOSSessionState();
   return S.posSession;
 }
-async function posRecordCashMovement(type, amount, reason) {
+async function posRecordCashMovement(type, amount, reason, approvalId=null) {
   if (!S.posSession?.id) throw new Error('Open the register first.');
   const slot = `cash:${type}:${amount}:${reason}`;
   const key = _idemKey(slot);
-  const row = await posApiFetch(`/pos/sessions/${S.posSession.id}/cash-movements`, { method:'POST', body:{ idempotency_key:key, type, amount, reason }});
+  const headers = approvalId ? { 'X-Manager-Approval-ID': String(approvalId) } : {};
+  const row = await posApiFetch(`/pos/sessions/${S.posSession.id}/cash-movements`, { method:'POST', body:{ idempotency_key:key, type, amount, reason }, headers });
   _clearIdemKey(slot);
   await refreshPOSSessionState();
   return row;
 }
-async function posCloseShift(cashierId, countedCash, approveDifference=false) {
-  const result = await posApiFetch('/pos/shifts/close', { method:'POST', body:{ cashier_id:cashierId, counted_cash:countedCash, approve_difference:approveDifference }});
+async function posCloseShift(cashierId, countedCash, approveDifference=false, approvalId=null) {
+  const headers = approvalId ? { 'X-Manager-Approval-ID': String(approvalId) } : {};
+  const result = await posApiFetch('/pos/shifts/close', { method:'POST', body:{ cashier_id:cashierId, counted_cash:countedCash, approve_difference:approveDifference }, headers });
   await refreshPOSSessionState();
   return result;
 }
@@ -407,10 +411,12 @@ async function posPinLogin(pin, userId, branchId) {
 
 // Manager PIN approval — verifies a Store Manager or Admin PIN WITHOUT
 // hijacking the current cashier's session. Returns { approved_by, action, reason }.
-async function posVerifyManagerPin(pin, action, reason, branchId) {
+async function posVerifyManagerPin(pin, action, reason, branchId, scope={}) {
   return posApiFetch('/auth/manager-approval', {
     method: 'POST',
-    body: { pin, action, reason, branch_id: branchId || null },
+    body: { pin, action, reason, branch_id: branchId || null,
+      target_type:scope.targetType||null, target_id:scope.targetId||null,
+      amount:scope.amount??null, session_id:scope.sessionId||null },
   });
 }
 async function posEmailLogin(email,password) { const result=await posApiFetch('/auth/login',{method:'POST',body:{email,password}});return result.user||result; }

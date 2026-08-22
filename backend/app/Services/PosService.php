@@ -23,8 +23,8 @@ class PosService
      * discount overrides, and void-paid without a manager approval overlay.
      * A tenant that wants stricter behaviour enables toggles in
      * pos_settings.extra_security; only then do we require an
-     * X-Manager-Approval token (issued by /auth/manager-approval and
-     * consumed once here).
+     * browser-safe X-Manager-Approval-ID (issued by /auth/manager-approval
+     * and consumed once here). The secret token never leaves the server.
      *
      *   $action  — must match the action name the approval was issued for.
      *   $context — ['target_id'=>..., 'amount'=>...] optional constraints.
@@ -53,13 +53,16 @@ class PosService
         }
         if (!$required) return;
 
-        $headerToken = $_SERVER['HTTP_X_MANAGER_APPROVAL'] ?? null;
+        $approvalId = isset($_SERVER['HTTP_X_MANAGER_APPROVAL_ID'])
+            ? (int)$_SERVER['HTTP_X_MANAGER_APPROVAL_ID'] : null;
         $ip = $_SERVER['REMOTE_ADDR'] ?? '';
         $constraints = ['action' => $action];
+        if (isset($context['target_type'])) $constraints['target_type'] = (string)$context['target_type'];
         if (isset($context['target_id'])) $constraints['target_id'] = (int)$context['target_id'];
         if (isset($context['amount']))    $constraints['amount']    = (float)$context['amount'];
-        // consumeApproval throws with a clear 403 on any mismatch/expiry/reuse.
-        $this->auth->consumeApproval($headerToken, $constraints, $ip);
+        // The browser only carries a safe row id. The secret token is looked
+        // up and consumed inside AuthService and never exposed to JavaScript.
+        $this->auth->consumeApprovalId($approvalId, $constraints, $ip);
     }
 
     /**
@@ -744,14 +747,14 @@ class PosService
         $replay = $this->idemBegin($companyId, $action, $idemKey, $payloadForHash);
         if ($replay !== null) return $replay;
         try {
+            $session=$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company AND state='OPENED'",['id'=>$sessionId,'company'=>$companyId])->fetch();
+            if(!$session)throw new Exception('The POS register is not open.',409);
             // Optional Curdun Extra Security (Rule #9): cash OUT can require an
             // approval token when the tenant enables the extra_security.cash_out
             // toggle. Cash IN never does — Odoo treats it as a routine deposit.
             if ($type === 'OUT') {
-                $this->enforceExtraSecurity($companyId,'cash-out',['target_id'=>$sessionId,'amount'=>$amount],'cash_out');
+                $this->enforceExtraSecurity($companyId,'cash-out',['target_type'=>'pos_session','target_id'=>$sessionId,'amount'=>$amount],'cash_out');
             }
-            $session=$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company AND state='OPENED'",['id'=>$sessionId,'company'=>$companyId])->fetch();
-            if(!$session)throw new Exception('The POS register is not open.',409);
             $this->db->query("INSERT INTO pos_cash_movements (company_id,session_id,user_id,movement_type,subtype,amount,reason) VALUES (:company,:session,:user,:type,'MANUAL',:amount,:reason)",['company'=>$companyId,'session'=>$sessionId,'user'=>$user['id'],'type'=>$type,'amount'=>$amount,'reason'=>$reason]);
             $id=(int)$this->db->lastInsertId();$this->log($user,$companyId,'CASH_'.$type,$id,['session_id'=>$sessionId,'amount'=>$amount,'reason'=>$reason]);
             $response = ['id'=>$id,'session_id'=>$sessionId,'type'=>$type,'amount'=>$amount,'reason'=>$reason,'created_at'=>date('c')];
@@ -908,13 +911,6 @@ class PosService
         unset($payloadForHash['idempotency_key']);
         $replay = $this->idemBegin($companyId, 'REFUND', $refundKey, $payloadForHash);
         if ($replay !== null) return $replay;
-        // Optional Curdun Extra Security (Rule #9). Odoo default = off.
-        try {
-            $this->enforceExtraSecurity($companyId,'refund',['target_id'=>$id],'refund');
-        } catch (\Throwable $e) {
-            $this->idemRelease($companyId, 'REFUND', $refundKey);
-            throw $e;
-        }
         $this->db->beginTransaction();
         try {
             $order=$this->db->query("SELECT * FROM orders WHERE id=:id AND company_id=:company FOR UPDATE",['id'=>$id,'company'=>$companyId])->fetch();
@@ -939,7 +935,12 @@ class PosService
                 $subtotal-=$lineSubtotal;$tax-=$lineTax;$refundLines[]=['item'=>$item,'quantity'=>$qty,'subtotal'=>$lineSubtotal,'tax'=>$lineTax,'total'=>round($lineSubtotal+$lineTax,2)];
             }
             if(!$refundLines)throw new Exception('Select at least one refundable item.',422);
-            $total=round($subtotal+$tax,2);$sequence=$this->nextSequence((int)$config['id']);$reference=$this->posReference($config,$sequence,'REF');$uuid=$this->uuid();
+            $total=round($subtotal+$tax,2);
+            // Approval is scoped to the backend-calculated refund amount,
+            // never the browser's payment preview. Changing lines/quantity
+            // after approval therefore fails the amount constraint.
+            $this->enforceExtraSecurity($companyId,'refund',['target_type'=>'order','target_id'=>$id,'amount'=>abs($total)],'refund');
+            $sequence=$this->nextSequence((int)$config['id']);$reference=$this->posReference($config,$sequence,'REF');$uuid=$this->uuid();
             $this->db->query("INSERT INTO orders (company_id,customer_id,user_id,warehouse_id,pos_session_id,uuid,sequence_number,reference_number,status,pos_state,order_date,subtotal,tax_amount,discount_amount,total_amount,amount_paid,refunded_order_id,notes) VALUES (:company,:customer,:user,:warehouse,:session,:uuid,:sequence,:reference,'COMPLETED','done',CURDATE(),:subtotal,:tax,0,:total,:paid,:original,:notes)",
                 ['company'=>$companyId,'customer'=>$order['customer_id'],'user'=>$user['id'],'warehouse'=>$order['warehouse_id'],'session'=>$session['id'],'uuid'=>$uuid,'sequence'=>$sequence,'reference'=>$reference,'subtotal'=>$subtotal,'tax'=>$tax,'total'=>$total,'paid'=>$total,'original'=>$id,'notes'=>$data['reason']??'POS refund']);
             $refundId=(int)$this->db->lastInsertId();
@@ -2454,7 +2455,7 @@ class PosService
         $this->enforceExtraSecurity(
             $companyId,
             'close-variance',
-            ['target_id'=>(int)$session['id'],'amount'=>abs($variance),'_threshold_value'=>abs($variance)],
+            ['target_type'=>'pos_session','target_id'=>(int)$session['id'],'amount'=>abs($variance),'_threshold_value'=>abs($variance)],
             ['variance_above'=>(float)($this->settingsData($companyId)['extra_security']['variance_above']??0)]
         );
         $this->db->beginTransaction();try{
@@ -2469,7 +2470,7 @@ class PosService
     private function settingsData(int $companyId): array
     {
         // Odoo defaults for Extra Security (Rule #9): every toggle OFF. Enable
-        // per company to require an X-Manager-Approval header for these ops.
+        // per company to require an X-Manager-Approval-ID for these ops.
         $extraSecurityDefaults = [
             'refund'                     => false,
             'cash_out'                   => false,

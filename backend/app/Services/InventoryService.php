@@ -71,6 +71,13 @@ class InventoryService
             fn(array $product): bool => $product['stock_status'] !== self::NORMAL));
     }
 
+    public function getPosVariants(int $companyId, bool $activeOnly = false): array
+    {
+        $active=$activeOnly?' AND v.active=1':'';$rows=$this->db->query("SELECT v.*,p.name product_name,p.purchase_price,p.selling_price FROM pos_product_variants v JOIN products p ON p.id=v.product_id WHERE v.company_id=:company AND p.deleted_at IS NULL{$active} ORDER BY p.name,v.name",['company'=>$companyId])->fetchAll();
+        foreach($rows as &$row){$stock=(float)$row['stock_quantity'];$minimum=(float)$row['minimum_stock'];$row['stock_status']=$this->resolveStatus($stock,$minimum);$row['needed']=max($minimum-$stock,0);$row['cost_value']=round($stock*(float)$row['purchase_price'],2);$row['retail_value']=round($stock*((float)$row['selling_price']+(float)$row['price_extra']),2);$row['inventory_context']=['product_id'=>(int)$row['product_id'],'variant_id'=>(int)$row['id'],'batch_id'=>null,'serial_id'=>null,'location_id'=>null];}
+        unset($row);return $rows;
+    }
+
     public function getPosSummary(int $companyId): array
     {
         $products = $this->getPosProducts($companyId, true);

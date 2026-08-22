@@ -81,6 +81,12 @@ function mapProduct(product) {
     stockStatus: product.stock_status || 'NORMAL', needed: Number(product.needed || 0),
     costValue: Number(product.cost_value || 0), retailValue: Number(product.retail_value || 0),
     inventoryContext: product.inventory_context || null,
+    hasVariants: Boolean(product.has_variants), variants: (product.variants || []).map(variant => ({
+      id:Number(variant.id), name:variant.name, sku:variant.sku || '', barcode:variant.barcode || '',
+      priceAdjustment:Number(variant.price_extra || 0), stock:Number(variant.stock_quantity || 0),
+      minimumStock:Number(variant.minimum_stock || 0), stockStatus:variant.stock_status,
+      active:Boolean(Number(variant.active)), attributes:variant.attributes || {},
+    })),
   };
 }
 
@@ -162,6 +168,7 @@ function posScheduleQuote(delay = 120) {
       customer_id: S.posDebtCustomerId || null,
       items: (S.posCart || []).map(item => ({
         product_id: item.id,
+        variant_id: item.variantId || null,
         quantity: item.qty,
         discount_percent: Number(item.discountPercent || 0),
       })),
@@ -312,6 +319,7 @@ async function refreshPOSSessionState() {
 }
 
 async function posCreateProduct(form) { const row=await posApiFetch('/pos/products',{method:'POST',body:{name:form.name,category_name:form.cat,selling_price:form.price,current_stock:form.stock,minimum_stock:form.minimumStock,barcode:form.barcode}});POS_PRODUCTS.push(mapProduct(row));await posLoadStockAlerts(false);return row; }
+async function posCreateProductVariants(productId,definitions,stock=0,minimumStock=0){let attributes=await posApiFetch('/pos/attributes');const selections=[];for(const definition of definitions){let attribute=attributes.find(a=>a.name.toLowerCase()===definition.name.toLowerCase());if(!attribute){attribute=await posApiFetch('/pos/attributes',{method:'POST',body:{name:definition.name,values:definition.values}});attributes.push(attribute);}const wanted=definition.values.map(v=>v.toLowerCase()),valueIds=attribute.values.filter(v=>wanted.includes(v.value.toLowerCase())).map(v=>Number(v.id));if(valueIds.length!==definition.values.length)throw new Error(`Some ${definition.name} values are unavailable.`);selections.push({attribute_id:Number(attribute.id),value_ids:valueIds});}const count=definitions.reduce((n,d)=>n*d.values.length,1),perVariant=count?Number(stock||0)/count:0;const result=await posApiFetch(`/pos/products/${productId}/variants/generate`,{method:'POST',body:{attributes:selections,variants:Array.from({length:count},()=>({stock:perVariant,minimum_stock:Number(minimumStock||0)}))}});await posBootstrap();return result;}
 async function posUpdateProduct(id,form) { const row=await posApiFetch(`/pos/products/${id}`,{method:'PUT',body:{name:form.name,category_name:form.cat,selling_price:form.price,current_stock:form.stock,minimum_stock:form.minimumStock,barcode:form.barcode}});const i=POS_PRODUCTS.findIndex(item=>item.id===Number(id));if(i>=0)POS_PRODUCTS[i]=mapProduct(row);await posLoadStockAlerts(false);return row; }
 async function posDeleteProduct(id) { await posApiFetch(`/pos/products/${id}`,{method:'DELETE'});const i=POS_PRODUCTS.findIndex(item=>item.id===Number(id));if(i>=0)POS_PRODUCTS.splice(i,1);await posLoadStockAlerts(false); }
 async function posCreateCustomer(form) { const row=await posApiFetch('/pos/customers',{method:'POST',body:{name:form.name,phone:form.phone,email:form.email,credit_limit:form.creditLimit}});POS_CUSTOMERS.push(mapCustomer(row));return row; }
@@ -335,7 +343,7 @@ async function posCompleteCheckout(cart, customerId, payments) {
     client_order_id: S.posPendingOrderId,
     customer_id: customerId || null,
     payments: lines,
-    items: cart.map(item => ({ product_id:item.id, quantity:item.qty, discount_percent:Number(item.discountPercent||0) })),
+    items: cart.map(item => ({ product_id:item.id, variant_id:item.variantId||null, quantity:item.qty, discount_percent:Number(item.discountPercent||0) })),
   };
   // P14 - Pass the selected pricelist (P9 backend). Null means "use POS default".
   // Only an explicit cashier choice is sent. In automatic mode the backend

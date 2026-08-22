@@ -264,7 +264,8 @@ const POS_STORE_FEATURE_CATALOG = [
   {key:'pricelists',label:'Pricelists',implemented:true,core:true},
   {key:'refunds',label:'Refunds',implemented:true,core:true},
   {key:'cash_control',label:'Cash Control',implemented:true,core:true},
-  {key:'variants',label:'Variants',implemented:false,phase:'V2-P4'},
+  {key:'variants',label:'Variants',implemented:true,phase:'V2-P4'},
+  {key:'attributes',label:'Attributes',implemented:true,phase:'V2-P4'},
   {key:'serial_numbers',label:'Serial Numbers',implemented:false,phase:'V2-P5'},
   {key:'warranties',label:'Warranties',implemented:false,phase:'V2-P5'},
   {key:'batches',label:'Batches',implemented:false,phase:'V2-P6'},
@@ -4991,7 +4992,7 @@ function renderPOSDash() {
 function renderPOSCheckout() {
   const cart = S.posCart;
   const quote = S.posQuote;
-  const quotedLines = new Map((quote?.lines || []).map(line => [Number(line.product_id), line]));
+  const quotedLines = new Map((quote?.lines || []).map(line => [`${Number(line.product_id)}:${Number(line.variant_id||0)}`, line]));
   const eligibleRewards = quote?.loyalty?.eligible_rewards || [];
   const selectedReward = quote?.loyalty?.selected_reward || null;
   const subtotal = quote ? Number(quote.subtotal || 0) : cart.reduce((s,item)=>s+item.price*item.qty,0);
@@ -4999,7 +5000,7 @@ function renderPOSCheckout() {
   const tax = quote ? Number(quote.tax || 0) : subtotal * taxRate / 100;
   const total = quote ? Number(quote.total || 0) : Number((subtotal + tax).toFixed(2));
   const term = (S.posSearchTerm||'').toLowerCase();
-  const filtered = term ? POS_PRODUCTS.filter(p=>p.name.toLowerCase().includes(term)||p.barcode.includes(term)||p.cat.toLowerCase().includes(term)) : POS_PRODUCTS;
+  const filtered = term ? POS_PRODUCTS.filter(p=>p.name.toLowerCase().includes(term)||p.barcode.includes(term)||p.cat.toLowerCase().includes(term)||p.variants.some(v=>v.barcode===S.posSearchTerm||v.sku.toLowerCase().includes(term))) : POS_PRODUCTS;
   const catEmoji = {Groceries:'\ud83d\uded2',Beverages:'\ud83e\udd64',Household:'\ud83c\udfe0','Personal Care':'\ud83e\uddf4',Snacks:'\ud83c\udf6a',Bakery:'\ud83c\udf5e',Fresh:'\ud83e\udd6c'};
 
   if (S.posReceiptVisible && S.posLastReceipt) return renderPOSReceipt();
@@ -5020,7 +5021,8 @@ function renderPOSCheckout() {
     && !!quote && !S.posQuoteLoading && !S.posQuoteError
     && validation.ok;
 
-  return `
+  const variantPicker=S.posVariantPicker;return `
+    ${variantPicker?`<div class="crud-overlay" data-variant-close><div class="crud-modal" style="max-width:560px" onclick="event.stopPropagation()"><div class="crud-modal-header"><h3>${esc(variantPicker.name)} variants</h3><button class="crud-close" data-variant-close>×</button></div><div class="crud-modal-body"><p style="color:var(--text-muted);margin-bottom:12px">Choose the exact physical SKU.</p><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px">${variantPicker.variants.filter(v=>v.active).map(v=>`<button class="btn btn-outline" data-select-variant="${v.id}" ${v.stock<=0?'disabled':''} style="text-align:left"><strong>${esc(v.name)}</strong><br><small>${esc(v.sku)} · ${v.stock} stock${v.priceAdjustment?` · ${v.priceAdjustment>0?'+':''}${posMoney(v.priceAdjustment)}`:''}</small></button>`).join('')}</div></div></div></div>`:''}
     ${S.posSession?.state==='OPENED' ? `<div class="cashier-shift-banner" style="margin-bottom:12px"><span>🟢 Register #${S.posSession.id} open · ${esc(S.posSession.config_name||S.posConfig?.name||'Main Register')}</span><span class="shift-duration-badge">Expected $${Number(S.posSessionSummary?.expected_cash||S.posSession.opening_cash||0).toFixed(2)}</span></div>` : `<div class="cashier-shift-banner cashier-shift-idle" style="margin-bottom:12px;display:flex;align-items:center"><span style="flex:1">🔒 Register closed — ${posCan('openRegister')?'open it before validating an order':'a Senior Cashier or higher must open it'}</span>${posCan('openRegister')?'<button class="btn btn-primary btn-sm" id="btn-checkout-open-register">Open register</button>':''}</div>`}
     ${S.posCheckoutUncertain ? `<div class="pos-deyn-warning" style="margin-bottom:10px"><strong>We couldn't confirm the sale.</strong> Retry Validate to check the committed transaction. Cart, customer, pricing, reward and payments stay locked until the retry succeeds.</div>` : ''}
     <div class="pos-checkout-layout ${S.posCheckoutUncertain?'pos-intent-locked':''}" aria-busy="${S.posCheckoutUncertain?'true':'false'}">
@@ -5084,10 +5086,11 @@ function renderPOSCheckout() {
               <div style="font-size:13px;color:rgba(255,255,255,0.4);margin-top:8px">Cart is empty</div>
               <div style="font-size:11px;color:rgba(255,255,255,0.25)">Tap a product to add it</div>
             </div>
-          ` : cart.map((item,i)=>{ const quoted=quotedLines.get(Number(item.id)); const effPrice=Number(quoted?.final_unit_price ?? item.price); const rowTotal=Number(quoted?.line_subtotal ?? effPrice*item.qty); return `
+          ` : cart.map((item,i)=>{ const quoted=quotedLines.get(`${Number(item.id)}:${Number(item.variantId||0)}`); const effPrice=Number(quoted?.final_unit_price ?? item.price); const rowTotal=Number(quoted?.line_subtotal ?? effPrice*item.qty); return `
             <div class="pos-cart-row">
               <div class="pos-cart-item-info">
                 <div class="pos-cart-item-name">${esc(item.name)}</div>
+                ${item.variantName?`<div style="font-size:11px;color:#F5C411">${esc(item.variantName)} · ${esc(item.variantSku||'')}</div>`:''}
                 <div class="pos-cart-item-price">$${effPrice.toFixed(2)}${quoted?.applied_rule ? ` · qty ${Number(quoted.applied_rule.min_quantity)}+ rule` : ''}</div>
               </div>
               <div class="pos-cart-qty">
@@ -5316,6 +5319,7 @@ function renderPOSProducts() {
               <div class="form-group"><label class="form-label">Low-stock alert level</label><input class="form-input" id="cf-minimumStock" type="number" min="0" value="${f.minimumStock ?? 5}"/><div style="font-size:11px;color:var(--text-muted);margin-top:4px">Managers are notified at or below this quantity.</div></div>
               <div class="form-group"><label class="form-label">Barcode</label><input class="form-input" id="cf-barcode" value="${esc(f.barcode||'')}"/></div>
             </div>
+            ${!isEdit&&posHasStoreCapability('variants')?`<div class="form-group" style="margin-top:12px"><label class="form-label">Variant attributes</label><textarea class="form-input" id="cf-attributes" rows="3" placeholder="Size: S, M, L&#10;Color: Black, White">${esc(f.attributes||'')}</textarea><div style="font-size:12px;color:var(--text-muted);margin-top:5px">One attribute per line. Example creates 6 exact variants; starting stock is divided equally.</div></div>`:''}
             ${S.crudForm._error ? `<div class="crud-error">${S.crudForm._error}</div>` : ''}
           </div>
           <div class="crud-modal-footer">
@@ -5369,13 +5373,13 @@ function renderPOSProducts() {
           <tbody>
             ${POS_PRODUCTS.map(p=>`
               <tr>
-                <td style="font-weight:700">${esc(p.name)}</td>
+                <td style="font-weight:700">${esc(p.name)}${p.hasVariants?` <span class="pill pill-gold">${p.variants.filter(v=>v.active).length} variants</span>`:''}</td>
                 <td><span class="pill" style="background:var(--gray-50);color:var(--text-secondary)">${esc(p.cat)}</span></td>
                 <td style="font-weight:800">$${p.price.toFixed(2)}</td>
                 <td style="font-weight:700;color:${p.stock<40?'#B45309':'var(--text-primary)'}">${p.stock}</td>
                 <td>${Number(p.minimumStock||0)}</td>
                 <td style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">${esc(p.barcode)}</td>
-                <td><span class="pill ${p.stock<=0?'pill-red':(p.stock<=p.minimumStock?'pill-amber':'pill-green')}">${p.stock<=0?'Out of Stock':(p.stock<=p.minimumStock?'Low Stock':'Normal')}</span></td>
+                <td><span class="pill ${p.stockStatus==='OUT_OF_STOCK'?'pill-red':(p.stockStatus==='LOW_STOCK'?'pill-amber':'pill-green')}">${p.stockStatus==='OUT_OF_STOCK'?'Out of Stock':(p.stockStatus==='LOW_STOCK'?'Low Stock':'Normal')}</span></td>
                 <td class="col-right">
                   <div class="crud-actions">
                     <button class="crud-btn crud-btn-edit" data-edit-product="${p.id}" title="Edit">✏️</button>
@@ -5383,6 +5387,7 @@ function renderPOSProducts() {
                   </div>
                 </td>
               </tr>
+              ${p.variants.filter(v=>v.active).map(v=>`<tr style="background:var(--gray-50)"><td style="padding-left:34px"><strong>↳ ${esc(v.name)}</strong></td><td>${Object.entries(v.attributes).map(([k,val])=>`${esc(k)}: ${esc(val)}`).join(' · ')}</td><td>${posMoney(p.price+v.priceAdjustment)}</td><td>${v.stock}</td><td>${v.minimumStock}</td><td style="font-family:var(--font-mono);font-size:11px">${esc(v.barcode||v.sku)}</td><td><span class="pill ${v.stockStatus==='OUT_OF_STOCK'?'pill-red':v.stockStatus==='LOW_STOCK'?'pill-amber':'pill-green'}">${v.stockStatus.replaceAll('_',' ')}</span></td><td></td></tr>`).join('')}
             `).join('')}
           </tbody>
         </table>
@@ -6869,6 +6874,7 @@ function wirePOSEvents() {
       if (el) f[id] = el.value.trim();
     });
 
+    const attributeInput=document.getElementById('cf-attributes');if(attributeInput)f.attributes=attributeInput.value.trim();
     const { type, mode, id } = S.crudModal;
 
     try {
@@ -6876,7 +6882,8 @@ function wirePOSEvents() {
       if (!f.name) { S.crudForm._error='Product name is required.'; render(); return; }
       if (f.price<=0) { S.crudForm._error='Price must be greater than 0.'; render(); return; }
       if (mode === 'add') {
-        await posCreateProduct(f);
+        const created=await posCreateProduct(f);
+        if(f.attributes){const definitions=f.attributes.split(/\r?\n/).map(line=>{const [name,...rest]=line.split(':');return{name:(name||'').trim(),values:rest.join(':').split(',').map(v=>v.trim()).filter(Boolean)}}).filter(d=>d.name&&d.values.length);if(!definitions.length)throw new Error('Use Attribute: Value 1, Value 2 format.');await posCreateProductVariants(created.id,definitions,f.stock,f.minimumStock);}
       } else {
         await posUpdateProduct(id,f);
       }
@@ -7088,7 +7095,8 @@ function wirePOSEvents() {
 
   if (S.posTab === 'checkout') {
     const searchInput = document.getElementById('pos-search');
-    if (searchInput) { searchInput.addEventListener('input', e => { S.posSearchTerm = e.target.value; render(); }); searchInput.focus(); }
+    const addVariant=(prod,variant)=>{const existing=S.posCart.find(item=>item.id===prod.id&&Number(item.variantId||0)===variant.id);if(existing)existing.qty++;else S.posCart.push({id:prod.id,variantId:variant.id,variantName:variant.name,variantSku:variant.sku,name:prod.name,price:prod.price+variant.priceAdjustment,qty:1});S.posVariantPicker=null;S.posPendingOrderId=null;posScheduleQuote();render();};
+    if (searchInput) { searchInput.addEventListener('input', e => { S.posSearchTerm = e.target.value; render(); });searchInput.addEventListener('keydown',e=>{if(e.key!=='Enter')return;const code=e.target.value.trim();for(const prod of POS_PRODUCTS){const variant=prod.variants.find(v=>v.active&&v.barcode===code);if(variant){addVariant(prod,variant);S.posSearchTerm='';return;}}}); searchInput.focus(); }
 
     document.querySelectorAll('[data-add-product]').forEach(btn => {
       if (btn.dataset.posWired === '1') return;
@@ -7099,6 +7107,7 @@ function wirePOSEvents() {
         const id = parseInt(btn.dataset.addProduct);
         const prod = POS_PRODUCTS.find(p=>p.id===id);
         if (!prod) return;
+        if(prod.hasVariants){S.posVariantPicker=prod;render();return;}
         const existing = S.posCart.find(item=>item.id===id);
         if (existing) { existing.qty++; }
         else { S.posCart.push({ id:prod.id, name:prod.name, price:prod.price, qty:1 }); }
@@ -7232,6 +7241,8 @@ function wirePOSEvents() {
         render();
       });
     });
+    document.querySelectorAll('[data-select-variant]').forEach(btn=>btn.addEventListener('click',()=>{const prod=S.posVariantPicker,variant=prod?.variants.find(v=>v.id===Number(btn.dataset.selectVariant));if(prod&&variant)addVariant(prod,variant);}));
+    document.querySelectorAll('[data-variant-close]').forEach(btn=>btn.addEventListener('click',()=>{S.posVariantPicker=null;render();}));
 
     // ---- Hold / Resume / Discard ----
     document.getElementById('btn-hold-order')?.addEventListener('click', () => {
@@ -7366,7 +7377,7 @@ async function finalizeCharge() {
       id: result.reference_number,
       date: new Date(result.created_at || Date.now()).toLocaleString(),
       items: cart.map(item => {
-        const line=(acceptedQuote?.lines||[]).find(q=>Number(q.product_id)===Number(item.id));
+        const line=(acceptedQuote?.lines||[]).find(q=>Number(q.product_id)===Number(item.id)&&Number(q.variant_id||0)===Number(item.variantId||0));
         return { ...item, price:Number(line?.final_unit_price ?? item.price), quotedLineTotal:Number(line?.line_subtotal ?? item.price*item.qty) };
       }),
       subtotal: Number(result.subtotal ?? subtotal),

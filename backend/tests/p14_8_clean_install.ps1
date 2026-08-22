@@ -33,7 +33,9 @@ $migrationOrder = @(
     '2026_08_22_pos_config_payment_methods.sql',
     '2026_08_22_pricelists.sql',
     '2026_08_22_loyalty.sql',
-    '2026_08_22_remove_stale_promotion_rule.sql'
+    '2026_08_22_remove_stale_promotion_rule.sql',
+    '2026_08_22_v2_store_capabilities.sql',
+    '2026_08_22_v2_fashion_variants.sql'
 )
 $known = @(Get-ChildItem (Join-Path $databaseDir 'migrations\*.sql') | Select-Object -ExpandProperty Name)
 $missingFromManifest = @($known | Where-Object { $_ -notin $migrationOrder })

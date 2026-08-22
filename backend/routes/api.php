@@ -68,6 +68,7 @@ $router->group('/api/v1', function($router) {
     $router->get('/pos/dashboard', [PosController::class, 'dashboard']);
     // --- Read endpoints (everyone signed in can view) ---
     $router->get('/pos/products', [PosController::class, 'products']);
+    $router->get('/pos/attributes', [PosController::class, 'attributes']);
     $router->get('/pos/customers', [PosController::class, 'customers']);
     $router->get('/pos/transactions', [PosController::class, 'transactions']);
     $router->get('/pos/sessions', [PosController::class, 'sessions']);
@@ -121,6 +122,9 @@ $router->group('/api/v1', function($router) {
     // cashier add a customer during selling); customer admin edit/delete is
     // ERP-permission gated. Settings and Staff are ERP-permission-only.
     $router->post   ('/pos/products',                       [PosController::class, 'createProduct'],   [$CAP('pos.product_admin'), $ACC('products.create')]);
+    $router->post   ('/pos/attributes',                     [PosController::class, 'createAttribute'],[$CAP('pos.product_admin'), $ACC('products.create')]);
+    $router->post   ('/pos/products/{id}/variants/generate',[PosController::class, 'generateVariants'],[$CAP('pos.product_admin'), $ACC('products.create')]);
+    $router->put    ('/pos/variants/{id}/archive',          [PosController::class, 'archiveVariant'], [$CAP('pos.product_admin'), $ACC('products.update')]);
     $router->put    ('/pos/products/{id}',                  [PosController::class, 'updateProduct'],   [$CAP('pos.product_admin'), $ACC('products.update')]);
     $router->delete ('/pos/products/{id}',                  [PosController::class, 'deleteProduct'],   [$CAP('pos.product_admin'), $ACC('products.delete')]);
     $router->post   ('/pos/customers',                      [PosController::class, 'createCustomer'], [$CAP('pos.customer_create')]);

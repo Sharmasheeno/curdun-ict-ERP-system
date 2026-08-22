@@ -61,3 +61,22 @@ rows in stable product-id order before checking availability, preventing
 concurrent final-unit overselling. Transaction rollback prevents failed
 checkout mutations, and the existing checkout idempotency guard returns the
 committed response without applying stock a second time.
+
+## V2-P4 Fashion variants (implementation checkpoint)
+
+Fashion and Furniture resolve `variants` and `attributes`; Retail keeps both
+off by default. The additive schema supports normalized attributes and values,
+variant combinations, company-unique SKU/barcode, variant price adjustment,
+stock/minimum, archival, order-line identity snapshots, and variant movement
+attribution.
+
+Quote and checkout require an exact active variant for a variant-enabled parent.
+The backend adds the variant adjustment before the existing pricelist engine,
+locks and validates the exact variant quantity, and snapshots its name/SKU.
+Refund restores that same variant. Parent stock is maintained as the sum of
+active variants; variant inventory and sales are exposed separately in reports.
+
+The browser provides a variant picker and direct exact-barcode resolution, and
+receipts retain the selected variant presentation. V2-P4 remains in progress
+until its isolated sale/refund/idempotency matrix and complete Fashion admin UX
+are driven end-to-end; this checkpoint does not claim those tests passed.

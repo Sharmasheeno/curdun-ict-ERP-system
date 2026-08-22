@@ -203,6 +203,8 @@ class PosService
             'top_products'=>$this->db->query("SELECT p.id,p.sku,p.name,COALESCE(c.name,'General') category,ROUND(SUM(oi.quantity),3) quantity_sold,ROUND(SUM(oi.total),2) sales FROM order_items oi JOIN orders o ON o.id=oi.order_id JOIN products p ON p.id=oi.product_id LEFT JOIN categories c ON c.id=p.category_id WHERE o.company_id=:company AND o.status='COMPLETED' AND o.order_date BETWEEN :from AND :to GROUP BY p.id,p.sku,p.name,c.name ORDER BY quantity_sold DESC LIMIT 100",$range)->fetchAll(),
             'orders'=>$this->db->query("SELECT o.reference_number,o.order_date,o.created_at,o.status,o.pos_state,o.refunded_order_id,u.name cashier,COALESCE(c.name,'Walk-in') customer,COUNT(DISTINCT oi.id) items,o.subtotal,o.tax_amount,o.total_amount,COALESCE(GROUP_CONCAT(DISTINCT pp.method_name ORDER BY pp.id SEPARATOR ' + '),MAX(pm.name),'Deyn') payment_method FROM orders o JOIN users u ON u.id=o.user_id LEFT JOIN customers c ON c.id=o.customer_id LEFT JOIN order_items oi ON oi.order_id=o.id LEFT JOIN invoices i ON i.id=o.invoice_id LEFT JOIN payments pay ON pay.invoice_id=i.id AND pay.status IN ('COMPLETED','REFUNDED') LEFT JOIN payment_methods pm ON pm.id=pay.payment_method_id LEFT JOIN pos_payments pp ON pp.order_id=o.id AND pp.status='COMPLETED' WHERE o.company_id=:company AND o.order_date BETWEEN :from AND :to GROUP BY o.id,o.reference_number,o.order_date,o.created_at,o.status,o.pos_state,o.refunded_order_id,u.name,c.name,o.subtotal,o.tax_amount,o.total_amount ORDER BY o.created_at DESC LIMIT 1000",$range)->fetchAll(),
             'inventory'=>$this->inventory->getPosProducts($companyId,true),
+            'variant_sales'=>$this->db->query("SELECT oi.variant_id,oi.variant_name_snapshot variant_name,oi.variant_sku_snapshot sku,p.name product_name,ROUND(SUM(oi.quantity),3) quantity_sold,ROUND(SUM(oi.total),2) sales FROM order_items oi JOIN orders o ON o.id=oi.order_id JOIN products p ON p.id=oi.product_id WHERE o.company_id=:company AND o.status='COMPLETED' AND o.order_date BETWEEN :from AND :to AND oi.variant_id IS NOT NULL GROUP BY oi.variant_id,oi.variant_name_snapshot,oi.variant_sku_snapshot,p.name ORDER BY quantity_sold DESC",$range)->fetchAll(),
+            'variant_inventory'=>$this->inventory->getPosVariants($companyId),
             'customers'=>$this->db->query("SELECT customer_code,name,phone,email,credit_limit,balance,status,created_at FROM customers WHERE company_id=:company AND deleted_at IS NULL ORDER BY balance DESC,name",['company'=>$companyId])->fetchAll(),
             'staff'=>$this->db->query("SELECT u.name,u.email,u.status,COALESCE(b.name,'Unassigned') branch,
                     GROUP_CONCAT(DISTINCT r.display_name) roles,COALESCE(MAX(performance.completed_orders),0) completed_orders,
@@ -261,7 +263,7 @@ class PosService
         // Drive the report from live inventory, not from notification rows.
         // An alert may be read/resolved independently; the product remains in
         // this result for as long as its canonical stock condition requires it.
-        return $this->db->query("SELECT a.id,p.id product_id,
+        $rows=$this->db->query("SELECT a.id,p.id product_id,
                 CASE WHEN {$stock['out']} THEN 'out' ELSE 'low' END severity,
                 p.current_stock,p.minimum_stock,{$stock['case']} stock_status,
                 GREATEST(p.minimum_stock-p.current_stock,0) needed,a.detected_at,a.last_seen_at,
@@ -274,6 +276,8 @@ class PosService
             WHERE p.company_id=:company AND p.deleted_at IS NULL AND p.status='active'
               AND (({$stock['out']}) OR ({$stock['low']}))
             ORDER BY ({$stock['out']}) DESC,p.name",['user'=>$userId,'company'=>$companyId])->fetchAll();
+        foreach($this->inventory->getPosVariants($companyId,true) as $variant){if($variant['stock_status']===InventoryService::NORMAL)continue;$rows[]=['id'=>'variant-'.$variant['id'],'product_id'=>$variant['product_id'],'variant_id'=>$variant['id'],'severity'=>$variant['stock_status']===InventoryService::OUT_OF_STOCK?'out':'low','current_stock'=>$variant['stock_quantity'],'minimum_stock'=>$variant['minimum_stock'],'stock_status'=>$variant['stock_status'],'needed'=>$variant['needed'],'detected_at'=>$variant['updated_at'],'last_seen_at'=>$variant['updated_at'],'product_name'=>$variant['product_name'].' — '.$variant['name'],'sku'=>$variant['sku'],'barcode'=>$variant['barcode'],'unread'=>0,'open_notification'=>0];}
+        usort($rows,fn($a,$b)=>($a['severity']===$b['severity']?strcmp($a['product_name'],$b['product_name']):($a['severity']==='out'?-1:1)));return $rows;
     }
 
     private function syncStockAlerts(int $companyId): void
@@ -289,7 +293,7 @@ class PosService
 
     private function dashboardData(int $companyId): array
     {
-        $params=['company'=>$companyId];$inventory=$this->inventory->getPosSummary($companyId);
+        $params=['company'=>$companyId];$inventory=$this->inventory->getPosSummary($companyId);$variants=$this->inventory->getPosVariants($companyId,true);$variantLow=count(array_filter($variants,fn($v)=>$v['stock_status']===InventoryService::LOW_STOCK));$variantOut=count(array_filter($variants,fn($v)=>$v['stock_status']===InventoryService::OUT_OF_STOCK));
         return [
             'today_revenue'=>(float)($this->db->query("SELECT COALESCE(SUM(total_amount),0) FROM orders WHERE company_id=:company AND status='COMPLETED' AND order_date=CURDATE()",$params)->fetchColumn() ?: 0),
             'gross_sales'=>(float)($this->db->query("SELECT COALESCE(SUM(total_amount),0) FROM orders WHERE company_id=:company AND status='COMPLETED' AND total_amount>0 AND order_date=CURDATE()",$params)->fetchColumn() ?: 0),
@@ -303,6 +307,9 @@ class PosService
             'inventory_cost_value'=>$inventory['inventory_cost_value'],
             'inventory_retail_value'=>$inventory['inventory_retail_value'],
             'inventory_scope'=>$inventory['inventory_scope'],
+            'variant_products'=>count($variants),
+            'low_stock_variants'=>$variantLow,
+            'out_of_stock_variants'=>$variantOut,
             'active_staff'=>(int)$this->db->query("SELECT COUNT(*) FROM users WHERE company_id=:company AND deleted_at IS NULL AND status='active'",$params)->fetchColumn(),
             'outstanding_debt'=>(float)($this->db->query("SELECT COALESCE(SUM(balance),0) FROM customers WHERE company_id=:company AND deleted_at IS NULL",$params)->fetchColumn() ?: 0),
             'hourly_sales'=>$this->db->query("SELECT HOUR(created_at) hour,ROUND(SUM(total_amount),2) total,COUNT(*) orders FROM orders WHERE company_id=:company AND status='COMPLETED' AND order_date=CURDATE() GROUP BY HOUR(created_at) ORDER BY hour",$params)->fetchAll(),
@@ -338,7 +345,41 @@ class PosService
 
     private function productsData(int $companyId): array
     {
-        return $this->inventory->getPosProducts($companyId);
+        $products=$this->inventory->getPosProducts($companyId);
+        $variants=$this->db->query("SELECT v.*,p.name product_name FROM pos_product_variants v JOIN products p ON p.id=v.product_id WHERE v.company_id=:company ORDER BY p.name,v.name",['company'=>$companyId])->fetchAll();
+        $grouped=[];foreach($variants as $variant){$variant['attributes']=json_decode((string)$variant['attributes'],true)?:[];$variant['stock_status']=$this->inventory->resolveStatus((float)$variant['stock_quantity'],(float)$variant['minimum_stock']);$variant['needed']=max((float)$variant['minimum_stock']-(float)$variant['stock_quantity'],0);$grouped[(int)$variant['product_id']][]=$variant;}
+        foreach($products as &$product){$product['variants']=$grouped[(int)$product['id']]??[];$active=array_filter($product['variants'],fn($v)=>(int)$v['active']===1);$product['has_variants']=count($active)>0;if($product['has_variants']){$product['current_stock']=array_sum(array_map(fn($v)=>(float)$v['stock_quantity'],$active));$product['stock_status']=$this->inventory->resolveStatus((float)$product['current_stock'],(float)$product['minimum_stock']);$product['needed']=max((float)$product['minimum_stock']-(float)$product['current_stock'],0);$product['cost_value']=round((float)$product['current_stock']*(float)$product['purchase_price'],2);$product['retail_value']=round(array_sum(array_map(fn($v)=>(float)$v['stock_quantity']*((float)$product['selling_price']+(float)$v['price_extra']),$active)),2);}}
+        unset($product);return $products;
+    }
+
+    public function attributes(): array
+    {
+        [$user,$companyId]=$this->context();$config=$this->resolveConfig($companyId,isset($user['branch_id'])?(int)$user['branch_id']:null);$this->requireStoreCapability($config,'attributes');
+        $attributes=$this->db->query("SELECT * FROM product_attributes WHERE company_id=:company AND active=1 ORDER BY name",['company'=>$companyId])->fetchAll();
+        foreach($attributes as &$attribute){$attribute['values']=$this->db->query("SELECT * FROM product_attribute_values WHERE attribute_id=:id AND active=1 ORDER BY sort_order,id",['id'=>$attribute['id']])->fetchAll();}unset($attribute);return $attributes;
+    }
+
+    public function createAttribute(array $data): array
+    {
+        [$user,$companyId]=$this->context(false,'pos.product_admin');$config=$this->resolveConfig($companyId,isset($user['branch_id'])?(int)$user['branch_id']:null);$this->requireStoreCapability($config,'attributes');
+        $name=trim((string)($data['name']??''));$values=array_values(array_unique(array_filter(array_map(fn($v)=>trim((string)$v),(array)($data['values']??[])))));
+        if($name===''||!$values)throw new Exception('Attribute name and at least one value are required.',422);
+        $this->db->beginTransaction();try{$this->db->query("INSERT INTO product_attributes (company_id,name) VALUES (:company,:name)",['company'=>$companyId,'name'=>$name]);$id=(int)$this->db->lastInsertId();foreach($values as $index=>$value)$this->db->query("INSERT INTO product_attribute_values (attribute_id,value,sort_order) VALUES (:attribute,:value,:sort)",['attribute'=>$id,'value'=>$value,'sort'=>$index]);$this->db->commit();}catch(Exception $e){$this->db->rollBack();if(str_contains($e->getMessage(),'Duplicate'))throw new Exception('Attribute or value already exists.',409);throw $e;}return array_values(array_filter($this->attributes(),fn($a)=>(int)$a['id']===$id))[0];
+    }
+
+    public function generateVariants(int $productId,array $data): array
+    {
+        [$user,$companyId]=$this->context(false,'pos.product_admin');$config=$this->resolveConfig($companyId,isset($user['branch_id'])?(int)$user['branch_id']:null);$this->requireStoreCapability($config,'variants');
+        $product=$this->db->query("SELECT * FROM products WHERE id=:id AND company_id=:company AND deleted_at IS NULL",['id'=>$productId,'company'=>$companyId])->fetch();if(!$product)throw new Exception('Product not found.',404);
+        $sets=(array)($data['attributes']??[]);if(!$sets)throw new Exception('Select at least one attribute.',422);$dimensions=[];
+        foreach($sets as $set){$attributeId=(int)($set['attribute_id']??0);$ids=array_values(array_unique(array_map('intval',(array)($set['value_ids']??[]))));if(!$attributeId||!$ids)throw new Exception('Each attribute needs at least one value.',422);$marks=implode(',',array_fill(0,count($ids),'?'));$stmt=$this->db->prepare("SELECT av.id,av.value,a.name attribute_name FROM product_attribute_values av JOIN product_attributes a ON a.id=av.attribute_id WHERE a.company_id=? AND a.id=? AND av.active=1 AND av.id IN ({$marks}) ORDER BY av.sort_order,av.id");$stmt->execute(array_merge([$companyId,$attributeId],$ids));$values=$stmt->fetchAll();if(count($values)!==count($ids))throw new Exception('An attribute value is unavailable.',422);$dimensions[]=$values;}
+        $combinations=[[]];foreach($dimensions as $dimension){$next=[];foreach($combinations as $combo)foreach($dimension as $value)$next[]=array_merge($combo,[$value]);$combinations=$next;}
+        if(count($combinations)>200)throw new Exception('A maximum of 200 variants can be generated at once.',422);$overrides=(array)($data['variants']??[]);$created=[];$this->db->beginTransaction();try{foreach($combinations as $index=>$combo){$name=implode(' / ',array_column($combo,'value'));$attrs=[];$valueIds=[];foreach($combo as $value){$attrs[$value['attribute_name']]=$value['value'];$valueIds[]=(int)$value['id'];}$custom=(array)($overrides[$name]??$overrides[$index]??[]);$sku=trim((string)($custom['sku']??($product['sku'].'-'.strtoupper(preg_replace('/[^A-Z0-9]+/i','-',implode('-',array_column($combo,'value')))))));$barcode=trim((string)($custom['barcode']??''))?:null;$this->db->query("INSERT INTO pos_product_variants (company_id,product_id,name,attributes,sku,barcode,price_extra,stock_quantity,minimum_stock,active) VALUES (:company,:product,:name,:attributes,:sku,:barcode,:price,:stock,:minimum,1)",['company'=>$companyId,'product'=>$productId,'name'=>$name,'attributes'=>json_encode($attrs),'sku'=>$sku,'barcode'=>$barcode,'price'=>(float)($custom['price_adjustment']??$custom['price_extra']??0),'stock'=>(float)($custom['stock']??0),'minimum'=>(float)($custom['minimum_stock']??0)]);$variantId=(int)$this->db->lastInsertId();foreach($valueIds as $valueId)$this->db->query("INSERT INTO product_variant_values (variant_id,attribute_value_id) VALUES (:variant,:value)",['variant'=>$variantId,'value'=>$valueId]);$created[]=$variantId;}$this->db->query("UPDATE products SET current_stock=(SELECT COALESCE(SUM(stock_quantity),0) FROM pos_product_variants WHERE product_id=:id AND active=1) WHERE id=:id",['id'=>$productId]);$this->db->commit();}catch(Exception $e){$this->db->rollBack();if(str_contains($e->getMessage(),'Duplicate'))throw new Exception('A variant combination, SKU, or barcode already exists.',409);throw $e;}return ['created'=>count($created),'product_id'=>$productId,'variants'=>array_values(array_filter($this->productsData($companyId),fn($p)=>(int)$p['id']===$productId))[0]['variants']];
+    }
+
+    public function archiveVariant(int $variantId): void
+    {
+        [$user,$companyId]=$this->context(false,'pos.product_admin');$config=$this->resolveConfig($companyId,isset($user['branch_id'])?(int)$user['branch_id']:null);$this->requireStoreCapability($config,'variants');$variant=$this->db->query("SELECT * FROM pos_product_variants WHERE id=:id AND company_id=:company",['id'=>$variantId,'company'=>$companyId])->fetch();if(!$variant)throw new Exception('Variant not found.',404);$this->db->query("UPDATE pos_product_variants SET active=0 WHERE id=:id",['id'=>$variantId]);$this->db->query("UPDATE products SET current_stock=(SELECT COALESCE(SUM(stock_quantity),0) FROM pos_product_variants WHERE product_id=:product AND active=1) WHERE id=:product",['product'=>$variant['product_id']]);
     }
 
     public function createProduct(array $data): array
@@ -503,12 +544,12 @@ class PosService
 
     private function storeCapabilityDefaults(string $type): array
     {
-        $base=['inventory'=>true,'customer_account'=>true,'loyalty'=>true,'pricelists'=>true,'refunds'=>true,'cash_control'=>true,'variants'=>false,'batches'=>false,'expiry_tracking'=>false,'serial_numbers'=>false,'warranties'=>false,'tables'=>false,'kitchen_orders'=>false,'order_notes'=>false,'dine_in'=>false,'takeaway'=>false,'delivery'=>false];
+        $base=['inventory'=>true,'customer_account'=>true,'loyalty'=>true,'pricelists'=>true,'refunds'=>true,'cash_control'=>true,'variants'=>false,'attributes'=>false,'batches'=>false,'expiry_tracking'=>false,'serial_numbers'=>false,'warranties'=>false,'tables'=>false,'kitchen_orders'=>false,'order_notes'=>false,'dine_in'=>false,'takeaway'=>false,'delivery'=>false];
         return array_replace($base,match($type){
-            'fashion'=>['variants'=>true],
+            'fashion'=>['variants'=>true,'attributes'=>true],
             'electronics'=>['serial_numbers'=>true,'warranties'=>true],
             'bakery_food'=>['batches'=>true,'expiry_tracking'=>true],
-            'furniture_home'=>['variants'=>true,'delivery'=>true],
+            'furniture_home'=>['variants'=>true,'attributes'=>true,'delivery'=>true],
             'restaurant'=>['tables'=>true,'kitchen_orders'=>true,'order_notes'=>true,'dine_in'=>true,'takeaway'=>true,'delivery'=>true,'expiry_tracking'=>true],
             default=>[],
         });
@@ -516,7 +557,7 @@ class PosService
 
     private function storeCapabilityOverrideKeys(): array
     {
-        return ['variants','batches','expiry_tracking','serial_numbers','warranties','tables','kitchen_orders','order_notes','dine_in','takeaway','delivery'];
+        return ['variants','attributes','batches','expiry_tracking','serial_numbers','warranties','tables','kitchen_orders','order_notes','dine_in','takeaway','delivery'];
     }
 
     private function decorateStoreConfig(array $config): array
@@ -907,7 +948,7 @@ class PosService
         if ($order['status'] !== 'COMPLETED') throw new Exception('Only completed sales can be refunded.', 409);
 
         $items = $this->db->query(
-            "SELECT oi.id, oi.product_id, p.name AS product_name, p.sku,
+            "SELECT oi.id,oi.product_id,oi.variant_id,oi.variant_name_snapshot,oi.variant_sku_snapshot,p.name AS product_name,p.sku,
                     oi.quantity AS original_qty, oi.unit_price, oi.discount_percent,
                     oi.tax_rate, oi.tax_amount, oi.total
              FROM order_items oi
@@ -1015,11 +1056,11 @@ class PosService
             $this->db->query("INSERT INTO orders (company_id,customer_id,user_id,warehouse_id,pos_session_id,uuid,sequence_number,reference_number,status,pos_state,order_date,subtotal,tax_amount,discount_amount,total_amount,amount_paid,refunded_order_id,notes) VALUES (:company,:customer,:user,:warehouse,:session,:uuid,:sequence,:reference,'COMPLETED','done',CURDATE(),:subtotal,:tax,0,:total,:paid,:original,:notes)",
                 ['company'=>$companyId,'customer'=>$order['customer_id'],'user'=>$user['id'],'warehouse'=>$order['warehouse_id'],'session'=>$session['id'],'uuid'=>$uuid,'sequence'=>$sequence,'reference'=>$reference,'subtotal'=>$subtotal,'tax'=>$tax,'total'=>$total,'paid'=>$total,'original'=>$id,'notes'=>$data['reason']??'POS refund']);
             $refundId=(int)$this->db->lastInsertId();
-            foreach($refundLines as $line){$item=$line['item'];$before=(float)$item['current_stock'];$after=$before+$line['quantity'];
-                $this->db->query("INSERT INTO order_items (order_id,line_uuid,product_id,quantity,unit_price,discount,discount_percent,tax_rate,tax_amount,total,refunded_order_item_id) VALUES (:order,:uuid,:product,:quantity,:price,0,:discount,:rate,:tax,:total,:original)",
-                    ['order'=>$refundId,'uuid'=>$this->uuid(),'product'=>$item['product_id'],'quantity'=>-$line['quantity'],'price'=>$item['unit_price'],'discount'=>$item['discount_percent']??0,'rate'=>$item['tax_rate']??0,'tax'=>-$line['tax'],'total'=>-$line['total'],'original'=>$item['id']]);
-                $this->db->query("UPDATE products SET current_stock=:stock WHERE id=:id AND company_id=:company",['stock'=>$after,'id'=>$item['product_id'],'company'=>$companyId]);
-                $this->db->query("INSERT INTO stock_movements (product_id,warehouse_id,user_id,reference_type,reference_id,type,quantity,quantity_before,quantity_after,notes) VALUES (:product,:warehouse,:user,'POS_REFUND',:reference,'RETURN',:quantity,:before,:after,:notes)",['product'=>$item['product_id'],'warehouse'=>$order['warehouse_id'],'user'=>$user['id'],'reference'=>$refundId,'quantity'=>$line['quantity'],'before'=>$before,'after'=>$after,'notes'=>$data['reason']??'POS refund']);
+            foreach($refundLines as $line){$item=$line['item'];$variantId=(int)($item['variant_id']??0);$before=$variantId?(float)$this->db->query("SELECT stock_quantity FROM pos_product_variants WHERE id=:id FOR UPDATE",['id'=>$variantId])->fetchColumn():(float)$item['current_stock'];$after=$before+$line['quantity'];
+                $this->db->query("INSERT INTO order_items (order_id,line_uuid,product_id,variant_id,variant_name_snapshot,variant_sku_snapshot,quantity,unit_price,discount,discount_percent,tax_rate,tax_amount,total,refunded_order_item_id) VALUES (:order,:uuid,:product,:variant,:variant_name,:variant_sku,:quantity,:price,0,:discount,:rate,:tax,:total,:original)",
+                    ['order'=>$refundId,'uuid'=>$this->uuid(),'product'=>$item['product_id'],'variant'=>$variantId?:null,'variant_name'=>$item['variant_name_snapshot']??null,'variant_sku'=>$item['variant_sku_snapshot']??null,'quantity'=>-$line['quantity'],'price'=>$item['unit_price'],'discount'=>$item['discount_percent']??0,'rate'=>$item['tax_rate']??0,'tax'=>-$line['tax'],'total'=>-$line['total'],'original'=>$item['id']]);
+                if($variantId){$this->db->query("UPDATE pos_product_variants SET stock_quantity=:stock WHERE id=:id AND company_id=:company",['stock'=>$after,'id'=>$variantId,'company'=>$companyId]);$this->db->query("UPDATE products SET current_stock=(SELECT COALESCE(SUM(stock_quantity),0) FROM pos_product_variants WHERE product_id=:id AND active=1) WHERE id=:id",['id'=>$item['product_id']]);}else{$this->db->query("UPDATE products SET current_stock=:stock WHERE id=:id AND company_id=:company",['stock'=>$after,'id'=>$item['product_id'],'company'=>$companyId]);}
+                $this->db->query("INSERT INTO stock_movements (product_id,variant_id,warehouse_id,user_id,reference_type,reference_id,type,quantity,quantity_before,quantity_after,notes) VALUES (:product,:variant,:warehouse,:user,'POS_REFUND',:reference,'RETURN',:quantity,:before,:after,:notes)",['product'=>$item['product_id'],'variant'=>$variantId?:null,'warehouse'=>$order['warehouse_id'],'user'=>$user['id'],'reference'=>$refundId,'quantity'=>$line['quantity'],'before'=>$before,'after'=>$after,'notes'=>$data['reason']??'POS refund']);
             }
             // ---- Refund payment allocation (Rule #7 / #12) ---------------
             // Accept a full split-refund via data['payments'] = [{method,amount},…].
@@ -1303,21 +1344,18 @@ class PosService
             $aggregatedQty = [];
             foreach ($items as $it) {
                 $pid = (int)($it['product_id'] ?? $it['id'] ?? 0);
+                $vid = (int)($it['variant_id'] ?? 0);
                 $q   = (float)($it['quantity'] ?? $it['qty'] ?? 0);
                 if ($pid <= 0 || $q <= 0) throw new Exception('Invalid checkout item.', 422);
-                $aggregatedQty[$pid] = ($aggregatedQty[$pid] ?? 0) + $q;
+                $key=$pid.':'.$vid;$aggregatedQty[$key]=($aggregatedQty[$key]??0)+$q;
             }
             // Stable lock order prevents two concurrent final-unit checkouts
             // from both passing the availability probe (and avoids deadlocks
             // when carts contain the same products in a different order).
-            ksort($aggregatedQty, SORT_NUMERIC);
-            foreach ($aggregatedQty as $pid => $totalQty) {
-                $probe = $this->db->query(
-                    "SELECT name, current_stock FROM products
-                     WHERE id = :id AND company_id = :company AND deleted_at IS NULL
-                     FOR UPDATE",
-                    ['id' => $pid, 'company' => $companyId]
-                )->fetch();
+            ksort($aggregatedQty, SORT_NATURAL);
+            foreach ($aggregatedQty as $stockKey => $totalQty) {
+                [$pid,$vid]=array_map('intval',explode(':',$stockKey));
+                $probe=$vid>0?$this->db->query("SELECT v.name,v.stock_quantity current_stock FROM pos_product_variants v JOIN products p ON p.id=v.product_id WHERE v.id=:variant AND v.product_id=:id AND v.company_id=:company AND v.active=1 AND p.deleted_at IS NULL FOR UPDATE",['variant'=>$vid,'id'=>$pid,'company'=>$companyId])->fetch():$this->db->query("SELECT name,current_stock FROM products WHERE id=:id AND company_id=:company AND deleted_at IS NULL FOR UPDATE",['id'=>$pid,'company'=>$companyId])->fetch();
                 if (!$probe) throw new Exception('A product was not found.', 404);
                 if ((float)$probe['current_stock'] < $totalQty) {
                     throw new Exception("Insufficient stock for {$probe['name']}.", 409);
@@ -1325,10 +1363,12 @@ class PosService
             }
             $subtotal=0;$normalized=[];
             foreach($items as $item){
-                $productId=(int)($item['product_id']??$item['id']??0);$qty=(float)($item['quantity']??$item['qty']??0);
+                $productId=(int)($item['product_id']??$item['id']??0);$variantId=(int)($item['variant_id']??0);$qty=(float)($item['quantity']??$item['qty']??0);
                 if($productId<=0||$qty<=0)throw new Exception('Invalid checkout item.',422);
                 $p=$this->db->query("SELECT * FROM products WHERE id=:id AND company_id=:company AND deleted_at IS NULL FOR UPDATE",['id'=>$productId,'company'=>$companyId])->fetch();
                 if(!$p)throw new Exception('A product was not found.',404);if((float)$p['current_stock']<$qty)throw new Exception("Insufficient stock for {$p['name']}.",409);
+                $variant=null;if($variantId>0){$variant=$this->db->query("SELECT * FROM pos_product_variants WHERE id=:variant AND product_id=:product AND company_id=:company AND active=1 FOR UPDATE",['variant'=>$variantId,'product'=>$productId,'company'=>$companyId])->fetch();if(!$variant)throw new Exception('The selected product variant is unavailable.',409);if((float)$variant['stock_quantity']<$qty)throw new Exception("Insufficient stock for {$p['name']} / {$variant['name']}.",409);$p['selling_price']=(float)$p['selling_price']+(float)$variant['price_extra'];}
+                elseif((int)$this->db->query("SELECT COUNT(*) FROM pos_product_variants WHERE product_id=:product AND active=1",['product'=>$productId])->fetchColumn()>0)throw new Exception('Select an exact product variant.',422);
 
                 // P9 — server-side price resolution. NEVER trusts client
                 // `unit_price` (Rule #18 — a modified HTTP request cannot
@@ -1350,6 +1390,7 @@ class PosService
                 $subtotal+=$line;
                 $normalized[]=[
                     'product'          => $p,
+                    'variant'          => $variant,
                     'quantity'         => $qty,
                     'unit_price'       => $unit,
                     'base_price'       => $basePrice,
@@ -1503,19 +1544,19 @@ class PosService
             $this->db->query("INSERT INTO orders (company_id,customer_id,user_id,warehouse_id,pos_session_id,pricelist_id,pricelist_name,loyalty_points_earned,loyalty_points_redeemed,loyalty_reward_id,loyalty_discount_amount,uuid,sequence_number,reference_number,status,pos_state,order_date,subtotal,tax_amount,discount_amount,total_amount,amount_paid,amount_return,to_invoice,notes) VALUES (:company,:customer,:user,:warehouse,:session,:pricelist_id,:pricelist_name,:pts_earned,:pts_redeemed,:reward_id,:reward_discount,:uuid,:sequence,:reference,'COMPLETED','done',CURDATE(),:subtotal,:tax,:discount,:total,:paid,:returned,:invoice,:notes)",
                 ['company'=>$companyId,'customer'=>$customerId,'user'=>$user['id'],'warehouse'=>$data['warehouse_id']??null,'session'=>$session['id'],'pricelist_id'=>$pricelistId,'pricelist_name'=>$pricelistName,'pts_earned'=>$pointsEarned,'pts_redeemed'=>$redeemedPoints,'reward_id'=>$rewardId,'reward_discount'=>$rewardDiscount,'uuid'=>$clientUuid,'sequence'=>$sequence,'reference'=>$reference,'subtotal'=>$subtotal,'tax'=>$tax,'discount'=>$discount,'total'=>$total,'paid'=>$tendered-$change,'returned'=>$change,'invoice'=>$toInvoice?1:0,'notes'=>$data['notes']??null]);
             $orderId=(int)$this->db->lastInsertId();
-            foreach($normalized as $line){$p=$line['product'];$after=(float)$p['current_stock']-$line['quantity'];
+            foreach($normalized as $line){$p=$line['product'];$variant=$line['variant'];$after=(float)$p['current_stock']-$line['quantity'];
                 // P9 — snapshot base_price + pricelist_price + pricelist_item_id
                 // per line so refund/receipt/report can render Rule #10-safe
                 // historical pricing regardless of later pricelist edits.
-                $this->db->query("INSERT INTO order_items (order_id,line_uuid,product_id,quantity,unit_price,base_price,pricelist_price,pricelist_item_id,discount,discount_percent,tax_rate,tax_amount,total) VALUES (:order,:uuid,:product,:quantity,:price,:base_price,:pricelist_price,:pricelist_item_id,:discount_amount,:discount,:rate,:tax,:total)",['order'=>$orderId,'uuid'=>$this->uuid(),'product'=>$p['id'],'quantity'=>$line['quantity'],'price'=>$line['unit_price'],'base_price'=>$line['base_price'],'pricelist_price'=>$line['pricelist_price'],'pricelist_item_id'=>$line['pricelist_item_id'],'discount_amount'=>round($line['unit_price']*$line['quantity']-$line['subtotal'],2),'discount'=>$line['discount_percent'],'rate'=>$line['tax_rate'],'tax'=>$line['tax'],'total'=>$line['total']]);
+                $this->db->query("INSERT INTO order_items (order_id,line_uuid,product_id,variant_id,variant_name_snapshot,variant_sku_snapshot,quantity,unit_price,base_price,pricelist_price,pricelist_item_id,discount,discount_percent,tax_rate,tax_amount,total) VALUES (:order,:uuid,:product,:variant,:variant_name,:variant_sku,:quantity,:price,:base_price,:pricelist_price,:pricelist_item_id,:discount_amount,:discount,:rate,:tax,:total)",['order'=>$orderId,'uuid'=>$this->uuid(),'product'=>$p['id'],'variant'=>$variant['id']??null,'variant_name'=>$variant['name']??null,'variant_sku'=>$variant['sku']??null,'quantity'=>$line['quantity'],'price'=>$line['unit_price'],'base_price'=>$line['base_price'],'pricelist_price'=>$line['pricelist_price'],'pricelist_item_id'=>$line['pricelist_item_id'],'discount_amount'=>round($line['unit_price']*$line['quantity']-$line['subtotal'],2),'discount'=>$line['discount_percent'],'rate'=>$line['tax_rate'],'tax'=>$line['tax'],'total'=>$line['total']]);
                 // P11 Rule #10 — Use a RELATIVE UPDATE so two lines of the
                 // same product decrement from the live DB value, not from a
                 // stale $p['current_stock'] captured earlier. Then re-read
                 // the actual after-value for the stock_movements row.
-                $this->db->query("UPDATE products SET current_stock = current_stock - :qty WHERE id=:id",['qty'=>$line['quantity'],'id'=>$p['id']]);
-                $liveAfter = (float)$this->db->query("SELECT current_stock FROM products WHERE id=:id",['id'=>$p['id']])->fetchColumn();
+                if($variant){$this->db->query("UPDATE pos_product_variants SET stock_quantity=stock_quantity-:qty WHERE id=:id",['qty'=>$line['quantity'],'id'=>$variant['id']]);$this->db->query("UPDATE products SET current_stock=(SELECT COALESCE(SUM(stock_quantity),0) FROM pos_product_variants WHERE product_id=:id AND active=1) WHERE id=:id",['id'=>$p['id']]);}else{$this->db->query("UPDATE products SET current_stock = current_stock - :qty WHERE id=:id",['qty'=>$line['quantity'],'id'=>$p['id']]);}
+                $liveAfter=$variant?(float)$this->db->query("SELECT stock_quantity FROM pos_product_variants WHERE id=:id",['id'=>$variant['id']])->fetchColumn():(float)$this->db->query("SELECT current_stock FROM products WHERE id=:id",['id'=>$p['id']])->fetchColumn();
                 $liveBefore = $liveAfter + (float)$line['quantity'];
-                $this->db->query("INSERT INTO stock_movements (product_id,warehouse_id,user_id,reference_type,reference_id,type,quantity,quantity_before,quantity_after,notes) VALUES (:product,:warehouse,:user,'POS_ORDER',:reference,'SALE',:quantity,:before,:after,'Retail POS sale')",['product'=>$p['id'],'warehouse'=>$data['warehouse_id']??null,'user'=>$user['id'],'reference'=>$orderId,'quantity'=>-$line['quantity'],'before'=>$liveBefore,'after'=>$liveAfter]);
+                $this->db->query("INSERT INTO stock_movements (product_id,variant_id,warehouse_id,user_id,reference_type,reference_id,type,quantity,quantity_before,quantity_after,notes) VALUES (:product,:variant,:warehouse,:user,'POS_ORDER',:reference,'SALE',:quantity,:before,:after,'Retail POS sale')",['product'=>$p['id'],'variant'=>$variant['id']??null,'warehouse'=>$data['warehouse_id']??null,'user'=>$user['id'],'reference'=>$orderId,'quantity'=>-$line['quantity'],'before'=>$liveBefore,'after'=>$liveAfter]);
             }
             foreach($payments as $paymentLine){
                 $payment=$paymentLine['method'];
@@ -1661,6 +1702,7 @@ class PosService
         $warnings = [];
         foreach ($items as $item) {
             $productId = (int)($item['product_id'] ?? $item['id'] ?? 0);
+            $variantId = (int)($item['variant_id'] ?? 0);
             $qty = (float)($item['quantity'] ?? $item['qty'] ?? 0);
             if ($productId <= 0 || $qty <= 0) throw new Exception('Invalid quote item.', 422);
             $product = $this->db->query(
@@ -1668,6 +1710,8 @@ class PosService
                 ['id'=>$productId, 'company'=>$companyId]
             )->fetch();
             if (!$product) throw new Exception('A product was not found.', 404);
+            $variant=null;if($variantId>0){$variant=$this->db->query("SELECT * FROM pos_product_variants WHERE id=:variant AND product_id=:product AND company_id=:company AND active=1",['variant'=>$variantId,'product'=>$productId,'company'=>$companyId])->fetch();if(!$variant)throw new Exception('The selected product variant is unavailable.',409);$product['selling_price']=(float)$product['selling_price']+(float)$variant['price_extra'];}
+            elseif((int)$this->db->query("SELECT COUNT(*) FROM pos_product_variants WHERE product_id=:product AND active=1",['product'=>$productId])->fetchColumn()>0)throw new Exception('Select an exact product variant.',422);
 
             $price = $this->resolveUnitPrice($product, $qty, $pricelist, date('Y-m-d'));
             $manualPct = max(0.0, min(100.0, (float)($item['discount_percent'] ?? 0)));
@@ -1676,16 +1720,21 @@ class PosService
             $lineSubtotal = round($beforeManual - $manualAmount, 2);
             $subtotal += $lineSubtotal;
             $manualDiscountTotal += $manualAmount;
-            if ((float)$product['current_stock'] < $qty) {
+            $available=$variant?(float)$variant['stock_quantity']:(float)$product['current_stock'];
+            if ($available < $qty) {
                 $warnings[] = [
                     'code'=>'INSUFFICIENT_STOCK', 'severity'=>'error',
                     'product_id'=>$productId,
+                    'variant_id'=>$variantId?:null,
                     'message'=>"Insufficient stock for {$product['name']}.",
                 ];
             }
             $lines[] = [
                 'product_id'       => $productId,
                 'product_name'     => $product['name'],
+                'variant_id'       => $variantId?:null,
+                'variant_name'     => $variant['name']??null,
+                'variant_sku'      => $variant['sku']??null,
                 'qty'              => $qty,
                 'base_price'       => $price['base_price'],
                 'pricelist_price'  => $price['pricelist_price'],
@@ -1695,7 +1744,7 @@ class PosService
                 'manual_discount_percent' => $manualPct,
                 'final_unit_price' => $price['unit_price'],
                 'line_subtotal'    => $lineSubtotal,
-                'available_stock'  => (float)$product['current_stock'],
+                'available_stock'  => $available,
             ];
         }
 

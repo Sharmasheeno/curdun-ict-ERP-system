@@ -12,6 +12,10 @@ class PosController extends BaseController
     public function bootstrap(Request $r): void { Response::success('POS workspace loaded.',$this->pos->bootstrap()); }
     public function dashboard(Request $r): void { Response::success('POS dashboard loaded.',$this->pos->dashboard()); }
     public function products(Request $r): void { Response::success('Products retrieved.',$this->pos->products()); }
+    public function attributes(Request $r): void { Response::success('Product attributes retrieved.',$this->pos->attributes()); }
+    public function createAttribute(Request $r): void { Response::created('Product attribute created.',$this->pos->createAttribute($r->getBody())); }
+    public function generateVariants(Request $r,int $id): void { Response::created('Product variants generated.',$this->pos->generateVariants($id,$r->getBody())); }
+    public function archiveVariant(Request $r,int $id): void { $this->pos->archiveVariant($id);Response::success('Product variant archived.'); }
     public function createProduct(Request $r): void { Response::created('Product created.',$this->pos->createProduct($r->getBody())); }
     public function updateProduct(Request $r,int $id): void { Response::success('Product updated.',$this->pos->updateProduct($id,$r->getBody())); }
     public function deleteProduct(Request $r,int $id): void { $this->pos->deleteProduct($id);Response::success('Product deleted.'); }

@@ -2543,6 +2543,9 @@ class PosService
     public function auditLogs(array $filters=[]): array
     {
         [, $companyId] = $this->context();
+        $page = max(1, (int)($filters['page'] ?? 1));
+        $perPage = min(100, max(10, (int)($filters['per_page'] ?? 50)));
+        $offset = ($page - 1) * $perPage;
         $where = ["a.company_id=:company", "a.module='POS'"];
         $params = ['company'=>$companyId];
         $map = [
@@ -2550,7 +2553,7 @@ class PosService
             'result'       => "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.result')),'SUCCESS')",
             'account_user' => "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.actor.account_user_name')),'')",
             'pos_employee' => "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.actor.pos_cashier_name')),JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.requested_by')),u.name,'')",
-            'session'      => "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.session_id')),JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.actor.session_id')),'')",
+            'session'      => "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.session_id')),JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.actor.session_id')),CAST(po.pos_session_id AS CHAR),'')",
             'pos'          => "COALESCE(pc.name,CAST(pc.id AS CHAR),'')",
             'entity'       => "CAST(a.record_id AS CHAR)",
         ];
@@ -2561,31 +2564,69 @@ class PosService
         }
         if (!empty($filters['date_from'])) { $where[]='DATE(a.created_at)>=:date_from';$params['date_from']=$filters['date_from']; }
         if (!empty($filters['date_to']))   { $where[]='DATE(a.created_at)<=:date_to';$params['date_to']=$filters['date_to']; }
-        $rows=$this->db->query(
-            "SELECT a.id,a.action,a.record_id,a.new_values,a.created_at,u.name user_name,pc.name pos_name
-             FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id
-             LEFT JOIN pos_sessions ps ON ps.id=CAST(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.session_id')) AS UNSIGNED) AND ps.company_id=a.company_id
+        $whereSql = implode(' AND ', $where);
+        $total = (int)($this->db->query(
+            "SELECT COUNT(*) total FROM audit_logs a
+             LEFT JOIN users u ON u.id=a.user_id
+             LEFT JOIN orders po ON po.id=a.record_id AND a.action IN ('CHECKOUT','ORDER_REFUND') AND po.company_id=a.company_id
+             LEFT JOIN pos_sessions ps ON ps.id=COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.session_id')) AS UNSIGNED),po.pos_session_id) AND ps.company_id=a.company_id
              LEFT JOIN pos_configs pc ON pc.id=ps.config_id AND pc.company_id=a.company_id
-             WHERE ".implode(' AND ',$where)." ORDER BY a.id DESC LIMIT 500",$params
+             WHERE $whereSql", $params
+        )->fetch()['total'] ?? 0);
+        $rows=$this->db->query(
+            "SELECT a.id,a.action,a.record_id,a.old_values,a.new_values,a.created_at,u.name user_name,pc.name pos_name,po.pos_session_id order_session_id,
+                    manager.name manager_name
+             FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id
+             LEFT JOIN orders po ON po.id=a.record_id AND a.action IN ('CHECKOUT','ORDER_REFUND') AND po.company_id=a.company_id
+             LEFT JOIN pos_sessions ps ON ps.id=COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.session_id')) AS UNSIGNED),po.pos_session_id) AND ps.company_id=a.company_id
+             LEFT JOIN pos_configs pc ON pc.id=ps.config_id AND pc.company_id=a.company_id
+             LEFT JOIN users manager ON manager.id=CAST(COALESCE(
+                JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.approved_by_id')),
+                JSON_UNQUOTE(JSON_EXTRACT(a.new_values,'$.authorized_by'))
+             ) AS UNSIGNED) AND manager.company_id=a.company_id
+             WHERE $whereSql ORDER BY a.id DESC LIMIT $perPage OFFSET $offset",$params
         )->fetchAll();
         $items=[];
         foreach($rows as $row){
-            $meta=json_decode((string)($row['new_values']??''),true)?:[];
-            foreach(['pin','password','token','approval_token','session_cookie','auth_token','secret','api_key'] as $secret) unset($meta[$secret]);
+            $meta=$this->redactAuditMetadata(json_decode((string)($row['new_values']??''),true)?:[]);
+            $old=$this->redactAuditMetadata(json_decode((string)($row['old_values']??''),true)?:[]);
             $actor=(array)($meta['actor']??[]);
+            $action=$meta['canonical_action']??$row['action'];
+            $entityType=$meta['entity_type']??match($action){
+                'ORDER_VALIDATE','ORDER_REFUND'=>'Order',
+                'CASH_IN','CASH_OUT'=>'Cash Movement',
+                'CUSTOMER_ACCOUNT_PAYMENT','CUSTOMER_ACCOUNT_SALE','CUSTOMER_ACCOUNT_REFUND_REVERSAL'=>'Customer Account',
+                'MANAGER_APPROVAL_GRANTED','MANAGER_APPROVAL_USED'=>'Approval',
+                'REGISTER_OPEN','REGISTER_CLOSE'=>'Register Session',
+                default=>'Entity',
+            };
             $items[]=[
                 'id'=>(int)$row['id'],'date'=>$row['created_at'],
-                'action'=>$meta['canonical_action']??$row['action'],
+                'action'=>$action,
+                'historical_action'=>$row['action']!==$action?$row['action']:null,
                 'result'=>$meta['result']??'SUCCESS',
-                'account_user'=>$actor['account_user_name']??null,
+                'account_user'=>$actor['account_user_name']??$row['user_name']??null,
                 'pos_employee'=>$actor['pos_cashier_name']??($meta['requested_by']??$row['user_name']),
+                'approving_manager'=>$meta['approved_by']??$row['manager_name']??null,
                 'pos'=>$row['pos_name']??($meta['pos_config_name']??($meta['pos_config_id']??null)),
-                'session'=>$meta['session_id']??null,
-                'entity'=>['type'=>$meta['entity_type']??null,'id'=>$row['record_id']?(int)$row['record_id']:null],
+                'session'=>$meta['session_id']??($row['order_session_id']??null),
+                'entity'=>['type'=>$entityType,'id'=>$row['record_id']?(int)$row['record_id']:null,'reference'=>$meta['reference']??null],
+                'before'=>$old,
                 'details'=>$meta,
             ];
         }
-        return ['items'=>$items,'count'=>count($items),'company_id'=>$companyId];
+        return ['items'=>$items,'count'=>count($items),'total'=>$total,'page'=>$page,'per_page'=>$perPage,'pages'=>max(1,(int)ceil($total/$perPage)),'company_id'=>$companyId];
+    }
+
+    /** Remove sensitive keys at every nesting level before audit data leaves the server. */
+    private function redactAuditMetadata(array $values): array
+    {
+        $sensitive=['password','pin','pin_hash','token','token_prefix','approval_token','session_cookie','authorization','auth_token','secret','api_key'];
+        foreach($values as $key=>$value){
+            if(in_array(strtolower((string)$key),$sensitive,true)){unset($values[$key]);continue;}
+            if(is_array($value))$values[$key]=$this->redactAuditMetadata($value);
+        }
+        return $values;
     }
     public function updateSettings(array $data): array
     {
@@ -2594,7 +2635,7 @@ class PosService
         // POS Advanced here, otherwise a BASIC cashier PINned in over an
         // authorised admin browser account gets 403 for a purely back-office
         // action the account is allowed to perform.
-        [$user,$companyId]=$this->context();$allowed=['store_name','tax_rate','receipt_header','receipt_footer','receipt_barcode','default_branch_id','cash_control','opening_control','maximum_difference','payments','extra_security'];
+        [$user,$companyId]=$this->context();$beforeSettings=$this->settingsData($companyId);$allowed=['store_name','tax_rate','receipt_header','receipt_footer','receipt_barcode','default_branch_id','cash_control','opening_control','maximum_difference','payments','extra_security'];
         foreach($allowed as $key){
             if(!array_key_exists($key,$data))continue;
             // P8.1 — payments is a per-POS assignment, not a generic setting.
@@ -2628,7 +2669,9 @@ class PosService
             );
         }
         $this->db->query("UPDATE pos_configs SET cash_control=:cash,opening_control=:opening,maximum_difference=:difference WHERE id=:id AND company_id=:company",['cash'=>array_key_exists('cash_control',$data)?(!empty($data['cash_control'])?1:0):($config['cash_control']??1),'opening'=>array_key_exists('opening_control',$data)?(!empty($data['opening_control'])?1:0):($config['opening_control']??1),'difference'=>max(0,(float)($data['maximum_difference']??$config['maximum_difference']??20)),'id'=>$config['id'],'company'=>$companyId]);
-        $this->log($user,$companyId,'SETTINGS_UPDATE',null,$data);return $this->settingsData($companyId);
+        $afterSettings=$this->settingsData($companyId);$changes=[];
+        foreach($allowed as $key){if(!array_key_exists($key,$data))continue;$changes[$key]=['before'=>$beforeSettings[$key]??null,'after'=>$afterSettings[$key]??null];}
+        $this->log($user,$companyId,'SETTINGS_UPDATE',null,['changed_fields'=>$changes]);return $afterSettings;
     }
     private function settingValue(int $companyId,string $key,mixed $default): mixed{$row=$this->db->query("SELECT value FROM settings WHERE company_id=:company AND `key`=:key",['company'=>$companyId,'key'=>$key])->fetch();return $row?$row['value']:$default;}
     /**

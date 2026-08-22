@@ -25,6 +25,7 @@ function Invoke-RoleCase($case,[int]$port) {
     }
     if(!$page){throw "No browser page for $($case.name)"}
     $ws=[Net.WebSockets.ClientWebSocket]::new();$ws.ConnectAsync([Uri]$page.webSocketDebuggerUrl,[Threading.CancellationToken]::None).GetAwaiter().GetResult()|Out-Null
+    $closeProbeExpr=if($case.name -eq 'ADVANCED'){"{status:null,message:'Skipped: destructive against live register'}"}else{"await api('/pos/sessions/0/close','POST',{counted_cash:0})"}
     $script=@"
 (async()=>{
  const wait=async(fn,label)=>{for(let i=0;i<100;i++){const v=fn();if(v)return v;await new Promise(r=>setTimeout(r,100));}throw new Error('Timeout '+label)};
@@ -73,8 +74,9 @@ function Invoke-RoleCase($case,[int]$port) {
  const orders={screen:document.body.textContent.includes('Transactions')||document.body.textContent.includes('Orders'),refund:!!document.querySelector('[data-refund-txn]')};
  document.querySelector('[data-nav-menu="reporting"]')?.click();await new Promise(r=>setTimeout(r,200));document.querySelector('[data-bo-tab="reports-orders"]')?.click();await new Promise(r=>setTimeout(r,200));
  const reports={screen:document.body.textContent.includes('Orders')&&!!document.querySelector('[data-nav-menu="reporting"]')};
- let probes={};if(!$($SkipProbes.IsPresent.ToString().ToLower()))probes={transactions:await api('/pos/transactions'),reports:await api('/pos/reports'),settings:await api('/pos/settings'),manual_pricelist:await api('/pos/quote','POST',{pricelist_id:6,items:[{product_id:1,quantity:1}],payments:[]}),refund:await api('/pos/orders/0/refund','POST',{idempotency_key:crypto.randomUUID(),reason:'authorization probe'}),cash:await api('/pos/sessions/0/cash-movements','POST',{idempotency_key:crypto.randomUUID(),type:'IN',amount:1,reason:'authorization probe'}),open:await api('/pos/sessions/open','POST',{config_id:0,opening_cash:0}),close:await api('/pos/sessions/0/close','POST',{counted_cash:0}),loyalty:await api('/pos/quote','POST',{customer_id:1,loyalty_reward_id:1,items:[{product_id:1,quantity:1}],payments:[]})};
- return {role:'$($case.name)',account:'$($case.email)',employee:S.posActiveUser.name,level:posLevelForUser(S.posActiveUser),register_id:S.posSession?.id||null,caps,visible:{checkout,sessions,orders,reports},pricelistWorkflow,loyaltyWorkflow,loyaltyPersistence,loyaltyHistory,loyaltyRefundWorkflow,accountLoyaltySeparation,dualSale,probes};
+ const auditAccess={configurationMenu:!!document.querySelector('[data-nav-menu="configuration"]'),auditNavigation:!!document.querySelector('[data-bo-tab="config-audit"]')};
+ let probes={};if(!$($SkipProbes.IsPresent.ToString().ToLower()))probes={transactions:await api('/pos/transactions'),reports:await api('/pos/reports'),settings:await api('/pos/settings'),audit:await api('/pos/audit-logs'),manual_pricelist:await api('/pos/quote','POST',{pricelist_id:6,items:[{product_id:1,quantity:1}],payments:[]}),refund:await api('/pos/orders/0/refund','POST',{idempotency_key:crypto.randomUUID(),reason:'authorization probe'}),cash:await api('/pos/sessions/0/cash-movements','POST',{idempotency_key:crypto.randomUUID(),type:'IN',amount:1,reason:'authorization probe'}),open:await api('/pos/sessions/open','POST',{config_id:0,opening_cash:0}),close:$closeProbeExpr,loyalty:await api('/pos/quote','POST',{customer_id:1,loyalty_reward_id:1,items:[{product_id:1,quantity:1}],payments:[]})};
+ return {role:'$($case.name)',account:'$($case.email)',employee:S.posActiveUser.name,level:posLevelForUser(S.posActiveUser),register_id:S.posSession?.id||null,caps,visible:{checkout,sessions,orders,reports},auditAccess,pricelistWorkflow,loyaltyWorkflow,loyaltyPersistence,loyaltyHistory,loyaltyRefundWorkflow,accountLoyaltySeparation,dualSale,probes};
 })()
 "@
     $msg=@{id=1;method='Runtime.evaluate';params=@{expression=$script;awaitPromise=$true;returnByValue=$true}}|ConvertTo-Json -Depth 8 -Compress

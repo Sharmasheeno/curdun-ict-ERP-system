@@ -89,6 +89,10 @@ async function posLoadCustomerLoyalty(customerId) {
   } catch (_) { S.posCustomerLoyalty = null; return null; }
 }
 
+async function posLoadCustomerLedger(customerId) {
+  return posApiFetch(`/pos/customers/${customerId}/ledger`);
+}
+
 // P14.2 — authoritative live cart quote. A monotonically increasing request
 // number prevents a slow response for qty 9 from overwriting the newer qty 10
 // response. The endpoint accepts no client price fields.
@@ -191,6 +195,7 @@ function posApplyBootstrap(data) {
     S.storeSettings.openingControl = Boolean(data.settings.opening_control ?? S.storeSettings.openingControl);
     S.storeSettings.maximumDifference = Number(data.settings.maximum_difference ?? S.storeSettings.maximumDifference);
     S.storeSettings.payments = data.settings.payments || S.storeSettings.payments;
+    S.posPaymentMethodsMeta = data.settings.payment_methods || [];
     const branch = S.posBranches.find(item => Number(item.id) === Number(data.settings.default_branch_id)) || S.posBranches[0];
     if (branch) { S.storeSettings.defaultStore = branch.name; S.currentStore = `${branch.name} Store`; }
   }
@@ -319,12 +324,14 @@ async function posVoidTransaction(orderId) {
   await posBootstrap();
   return row;
 }
-async function posCollectDebt(id, amount, method='Cash') {
-  const key = _idemKey(`settlement:${id}:${amount}:${method}`);
-  const row = await posApiFetch(`/pos/customers/${id}/collect-debt`, { method:'POST', body:{ idempotency_key:key, amount, payment_method:method }});
-  _clearIdemKey(`settlement:${id}:${amount}:${method}`);
+async function posCollectDebt(id, amount, method='Cash', reference='') {
+  const slot = `settlement:${id}:${amount}:${method}:${reference}`;
+  const key = _idemKey(slot);
+  const row = await posApiFetch(`/pos/customers/${id}/collect-debt`, { method:'POST', body:{ idempotency_key:key, amount, payment_method:method, reference:reference||null }});
+  _clearIdemKey(slot);
   const i = POS_CUSTOMERS.findIndex(item => item.id === Number(id));
   if (i >= 0) POS_CUSTOMERS[i] = mapCustomer(row);
+  await refreshPOSSessionState();
   return row;
 }
 async function posOpenSession(openingCash=0, note=null) {

@@ -197,6 +197,8 @@ const S = {
   posQuoteError: null,
   posSelectedRewardId: null,
   posRewardsOpen: false,
+  posPaymentMethodsMeta: [],
+  posCustomerAccount: null,
 
   // POS — management reports and stock notifications
   posReportFrom: new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10),
@@ -3264,6 +3266,12 @@ function posMethodType(name) {
 // posSaveSettings). Never hardcode the six names — an Admin can turn any
 // of them off or add another method later.
 function posConfiguredMethods() {
+  if (Array.isArray(S.posPaymentMethodsMeta) && S.posPaymentMethodsMeta.length) {
+    return S.posPaymentMethodsMeta.filter(method => method.enabled).map(method => ({
+      id: Number(method.id), name: method.name, type: method.type,
+      identifyCustomer: Boolean(Number(method.identify_customer)),
+    }));
+  }
   const cfg = (S.storeSettings && S.storeSettings.payments) || {};
   return Object.keys(cfg)
     .filter(name => cfg[name])
@@ -5310,6 +5318,48 @@ function renderPOSProducts() {
 
 
 
+function renderPOSCustomerAccountModal() {
+  const state = S.posCustomerAccount;
+  if (!state) return '';
+  const data = state.data;
+  if (state.loading) return `<div class="crud-overlay"><div class="crud-modal"><div class="crud-modal-body">Loading Customer Account…</div></div></div>`;
+  if (!data) return `<div class="crud-overlay"><div class="crud-confirm"><h3>Customer Account unavailable</h3><p>${esc(state.error||'Unable to load the ledger.')}</p><button class="btn btn-outline" id="btn-account-close">Close</button></div></div>`;
+  const c=data.customer; const totals=data.totals||{}; const entries=data.entries||[];
+  const methods=posConfiguredMethods().filter(method=>method.type!=='credit'&&!method.identifyCustomer);
+  const selectedMethod=state.method || methods[0]?.name || '';
+  const selectedMeta=methods.find(method=>method.name===selectedMethod);
+  const typeLabels={DEYN_SALE:'Deyn Sale',DEYN_PAYMENT:'Payment',DEYN_REFUND_REVERSAL:'Refund Reversal'};
+  return `<div class="crud-overlay">
+    <div class="crud-modal" style="max-width:980px;width:calc(100vw - 30px)">
+      <div class="crud-modal-header"><div><h3>Customer Account — ${esc(c.name)}</h3><div style="font-size:11px;color:var(--text-muted)">Sales, payments and refund reversals are kept separate from Loyalty.</div></div><button class="crud-close-btn" id="btn-account-close">×</button></div>
+      <div class="crud-modal-body">
+        ${data.invariant_ok===false && posCan('settings') ? '<div class="crud-error">Admin warning: the stored balance does not match the account ledger.</div>' : ''}
+        <div class="kpi-grid" style="margin-bottom:14px">
+          <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Outstanding Balance</div><div class="kpi-value">$${Number(c.balance).toFixed(2)}</div></div>
+          <div class="kpi-card light"><div class="kpi-eyebrow">Credit Limit</div><div class="kpi-value">$${Number(c.credit_limit).toFixed(2)}</div></div>
+          <div class="kpi-card light"><div class="kpi-eyebrow">Available Credit</div><div class="kpi-value">$${Number(c.available_credit).toFixed(2)}</div></div>
+          <div class="kpi-card light"><div class="kpi-eyebrow">Deyn Sales</div><div class="kpi-value">$${Number(totals.purchases||0).toFixed(2)}</div><div class="kpi-trend">Payments $${Number(totals.payments||0).toFixed(2)} · Reversals $${Number(totals.reversals||0).toFixed(2)}</div></div>
+        </div>
+        ${state.settleOpen ? `<div style="padding:14px;border:1px solid var(--border);border-radius:10px;margin-bottom:14px;background:var(--gray-50)">
+          <h4 style="margin:0 0 10px;color:var(--purple-800)">Customer Account Payment</h4>
+          <div class="crud-grid-2">
+            <div class="form-group"><label class="form-label">Outstanding</label><input class="form-input" disabled value="$${Number(c.balance).toFixed(2)}"/></div>
+            <div class="form-group"><label class="form-label">Amount</label><input class="form-input" id="account-payment-amount" type="number" min="0.01" step="0.01" max="${Number(c.balance).toFixed(2)}" value="${esc(state.amount||'')}"/></div>
+            <div class="form-group"><label class="form-label">Payment Method</label><select class="form-select" id="account-payment-method">${methods.map(method=>`<option ${method.name===selectedMethod?'selected':''}>${esc(method.name)}</option>`).join('')}</select></div>
+            ${selectedMeta?.type==='mobile' ? `<div class="form-group"><label class="form-label">Reference</label><input class="form-input" id="account-payment-reference" value="${esc(state.reference||'')}" placeholder="Transaction reference"/></div>` : ''}
+          </div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">This will be recorded as <strong>Customer Account Payment — ${esc(selectedMethod)}</strong>${selectedMeta?.type==='cash'?', and included in the register drawer as a settlement.':'.'}</div>
+          ${state.submitError?`<div class="crud-error">${esc(state.submitError)}</div>`:''}
+          <div style="display:flex;gap:8px"><button class="btn btn-primary" id="btn-account-payment-submit" ${!methods.length||state.submitting?'disabled':''}>${state.submitting?'Recording…':'Record payment'}</button><button class="btn btn-outline" id="btn-account-payment-cancel">Cancel</button></div>
+        </div>` : `<button class="btn btn-primary btn-sm" id="btn-account-payment-open" ${Number(c.balance)<=0?'disabled':''} style="margin-bottom:12px">Record Customer Account Payment</button>`}
+        <div class="overflow-x-auto"><table class="data-table" style="min-width:850px"><thead><tr><th>Date</th><th>Type</th><th>Reference</th><th>Payment Method</th><th>Employee</th><th>Amount</th><th>Running Balance</th></tr></thead><tbody>
+          ${entries.length?entries.map(row=>`<tr><td>${esc(row.created_at||'—')}</td><td>${esc(typeLabels[row.type]||row.type)}</td><td>${esc(row.order_reference||row.reference||'—')}</td><td>${esc(row.payment_method||'—')}</td><td>${esc(row.cashier_name||'—')}</td><td style="font-weight:800;color:${Number(row.amount)<0?'#15803D':'#B45309'}">${Number(row.amount)<0?'−':'+'}$${Math.abs(Number(row.amount)).toFixed(2)}</td><td style="font-weight:800">$${Number(row.running_balance).toFixed(2)}</td></tr>`).join(''):'<tr><td colspan="7" style="text-align:center;color:var(--text-muted)">No Customer Account activity yet.</td></tr>'}
+        </tbody></table></div>
+      </div>
+    </div>
+  </div>`;
+}
+
 function renderPOSCustomers() {
   const tierColor = {Gold:'#F5C411',Silver:'#94A3B8',Bronze:'#CD7F32'};
   const totalDebt = POS_CUSTOMERS.reduce((s,c)=>s+c.debtBalance,0);
@@ -5366,7 +5416,7 @@ function renderPOSCustomers() {
   }
 
   return `
-    ${modalHtml}${deleteHtml}
+    ${modalHtml}${deleteHtml}${renderPOSCustomerAccountModal()}
     <div class="buugga-header">
       <div class="buugga-title-row">
         <div>
@@ -5421,7 +5471,8 @@ function renderPOSCustomers() {
                 <td>${statusPill}</td>
                 <td class="col-right">
                   <div class="crud-actions">
-                    <button class="btn btn-xs btn-outline" data-collect-deyn="${c.id}" ${c.debtBalance===0?'disabled':''}>Collect</button>
+                    <button class="btn btn-xs btn-outline" data-account-customer="${c.id}">Account</button>
+                    <button class="btn btn-xs btn-outline" data-collect-deyn="${c.id}" ${c.debtBalance===0?'disabled':''}>Payment</button>
                     <button class="crud-btn crud-btn-edit" data-edit-customer="${c.id}" title="Edit">✏️</button>
                     <button class="crud-btn crud-btn-delete" data-delete-customer="${c.id}" title="Delete">🗑️</button>
                   </div>
@@ -6688,12 +6739,45 @@ function wirePOSEvents() {
     S.confirmDeleteModal = null; render();
   });
 
-  // ---- Deyn: collect ----
+  async function openCustomerAccount(customerId, settleOpen=false) {
+    S.posCustomerAccount = { customerId, loading:true, settleOpen, amount:'', method:'', reference:'', submitError:'' };
+    render();
+    try {
+      const data = await posLoadCustomerLedger(customerId);
+      if (!S.posCustomerAccount || S.posCustomerAccount.customerId !== customerId) return;
+      S.posCustomerAccount = { ...S.posCustomerAccount, loading:false, data };
+    } catch (error) {
+      if (S.posCustomerAccount) S.posCustomerAccount = { ...S.posCustomerAccount, loading:false, error:error.message };
+    }
+    render();
+  }
+
+  document.querySelectorAll('[data-account-customer]').forEach(btn => {
+    btn.addEventListener('click', () => openCustomerAccount(Number(btn.dataset.accountCustomer)));
+  });
+
+  // ---- Customer Account payment ----
   document.querySelectorAll('[data-collect-deyn]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const c = POS_CUSTOMERS.find(x=>x.id===parseInt(btn.dataset.collectDeyn));
-      if (c && c.debtBalance > 0) { try{await posCollectDebt(c.id,c.debtBalance);render();}catch(error){alert(error.message);} }
-    });
+    btn.addEventListener('click', () => openCustomerAccount(Number(btn.dataset.collectDeyn), true));
+  });
+  document.getElementById('btn-account-close')?.addEventListener('click', () => { S.posCustomerAccount=null; render(); });
+  document.getElementById('btn-account-payment-open')?.addEventListener('click', () => { S.posCustomerAccount={...S.posCustomerAccount,settleOpen:true}; render(); });
+  document.getElementById('btn-account-payment-cancel')?.addEventListener('click', () => { S.posCustomerAccount={...S.posCustomerAccount,settleOpen:false,submitError:''}; render(); });
+  document.getElementById('account-payment-method')?.addEventListener('change', event => { S.posCustomerAccount={...S.posCustomerAccount,method:event.target.value,reference:''}; render(); });
+  document.getElementById('btn-account-payment-submit')?.addEventListener('click', async () => {
+    const state=S.posCustomerAccount; if(!state?.data||state.submitting)return;
+    const amount=Number(document.getElementById('account-payment-amount')?.value||0);
+    const method=document.getElementById('account-payment-method')?.value||'';
+    const reference=document.getElementById('account-payment-reference')?.value?.trim()||'';
+    if(amount<=0||amount>Number(state.data.customer.balance)){S.posCustomerAccount={...state,submitError:`Enter an amount between $0.01 and $${Number(state.data.customer.balance).toFixed(2)}.`};render();return;}
+    S.posCustomerAccount={...state,amount:String(amount),method,reference,submitting:true,submitError:''};render();
+    try {
+      await posCollectDebt(state.customerId,amount,method,reference);
+      await posBootstrap();
+      const data=await posLoadCustomerLedger(state.customerId);
+      S.posCustomerAccount={...S.posCustomerAccount,data,loading:false,settleOpen:false,submitting:false,amount:'',reference:''};
+    } catch(error) { S.posCustomerAccount={...S.posCustomerAccount,submitting:false,submitError:error.message}; }
+    render();
   });
 
   // ---- POS Settings tab ----

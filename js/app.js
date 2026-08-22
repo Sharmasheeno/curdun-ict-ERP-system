@@ -6386,7 +6386,7 @@ function renderPOSNotifications() {
         <button class="btn btn-outline btn-sm ml-auto" id="btn-refresh-stock-alerts">Refresh</button>
         <button class="btn btn-primary btn-sm" id="btn-read-all-stock-alerts" ${unread.length?'':'disabled'}>Mark all read</button>
       </div>
-      <div class="overflow-x-auto">
+      <div class="overflow-x-auto pos-stock-alert-table">
         <table class="data-table" style="min-width:780px">
           <thead><tr><th>Product</th><th>SKU / Barcode</th><th>Current Stock</th><th>Minimum</th><th>Needed</th><th>Severity</th><th>Detected</th><th class="col-right">Actions</th></tr></thead>
           <tbody>
@@ -6409,6 +6409,29 @@ function renderPOSNotifications() {
             ${alerts.length?'':'<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:32px">All products are above their minimum stock levels.</td></tr>'}
           </tbody>
         </table>
+      </div>
+      <div class="pos-stock-alert-mobile-list">
+        ${alerts.map(alert=>{
+          const needed=Math.max(0,Number(alert.minimum_stock||0)-Number(alert.current_stock||0)+1);
+          const isOut=alert.severity==='out';
+          return `<article class="pos-stock-alert-mobile-card">
+            <div class="pos-stock-alert-mobile-head">
+              <div><div class="pos-stock-alert-mobile-name">${esc(alert.product_name)}</div><div class="pos-stock-alert-mobile-sku">${esc(alert.sku||alert.barcode||'—')}</div></div>
+              <span class="pill ${isOut?'pill-red':'pill-amber'}">${isOut?'Out of stock':'Low stock'}</span>
+            </div>
+            <dl class="pos-stock-alert-mobile-values">
+              <div><dt>Current</dt><dd class="${isOut?'trend-down':''}">${esc(alert.current_stock)}</dd></div>
+              <div><dt>Minimum</dt><dd>${esc(alert.minimum_stock)}</dd></div>
+              <div><dt>Needed</dt><dd>${needed}</dd></div>
+            </dl>
+            <div class="pos-stock-alert-mobile-meta">Detected ${esc(alert.detected_at)}</div>
+            <div class="pos-stock-alert-mobile-actions">
+              <button class="btn btn-outline btn-sm" data-restock-product="${alert.product_id}">Restock</button>
+              ${Number(alert.unread)?`<button class="btn btn-outline btn-sm" data-read-stock-alert="${alert.id}">Mark read</button>`:''}
+            </div>
+          </article>`;
+        }).join('')}
+        ${alerts.length?'':'<div class="pos-stock-alert-mobile-empty">All products are above their minimum stock levels.</div>'}
       </div>
     </div>
   `;

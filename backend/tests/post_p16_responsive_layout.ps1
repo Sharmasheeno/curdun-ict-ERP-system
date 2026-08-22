@@ -31,10 +31,11 @@ try {
   if($loginResult.exceptionDetails){throw($loginResult.exceptionDetails|ConvertTo-Json -Depth 12)}
 
   $results=@()
-  foreach($width in @(1280,1024,768,390)){
+  foreach($width in @(1440,1280,1024,768,640,600,390,360)){
     Invoke-Cdp 'Emulation.setDeviceMetricsOverride' @{width=$width;height=900;deviceScaleFactor=1;mobile=($width-lt721)}|Out-Null
+    Invoke-Cdp 'Runtime.evaluate' @{expression="S.posBackofficeTab='reports-stock';render();true";returnByValue=$true}|Out-Null
     $measure=@"
-(()=>{window.dispatchEvent(new Event('resize'));const q=s=>document.querySelector(s);const actions=[...document.querySelectorAll('.crud-actions .crud-btn')];const overlaps=actions.some((a,i)=>actions.slice(i+1).some(b=>{const x=a.getBoundingClientRect(),y=b.getBoundingClientRect();return x.left<y.right&&x.right>y.left&&x.top<y.bottom&&x.bottom>y.top}));const scroller=q('.overflow-x-auto');const table=q('.data-table');const nav=q('.pos-topnav');return {width:innerWidth,bodyClient:document.documentElement.clientWidth,bodyScroll:document.documentElement.scrollWidth,navRight:Math.round(nav.getBoundingClientRect().right),contentRight:Math.round(q('.pos-backoffice-content').getBoundingClientRect().right),tableScrollContained:!table||!scroller||table.scrollWidth<=scroller.scrollWidth,scrollerOverflow:scroller?getComputedStyle(scroller).overflowX:null,actionsOverlap:overlaps,actionWidths:actions.map(a=>Math.round(a.getBoundingClientRect().width)),navRows:Math.round(nav.getBoundingClientRect().height)}})()
+(()=>{window.dispatchEvent(new Event('resize'));const q=s=>document.querySelector(s);const visible=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0};const actions=[...document.querySelectorAll('[data-restock-product],[data-read-stock-alert]')].filter(visible);const overlaps=actions.some((a,i)=>actions.slice(i+1).some(b=>{const x=a.getBoundingClientRect(),y=b.getBoundingClientRect();return x.left<y.right&&x.right>y.left&&x.top<y.bottom&&x.bottom>y.top}));const scroller=q('.pos-stock-alert-table');const table=scroller?.querySelector('.data-table');const nav=q('.pos-topnav');const grid=q('.kpi-grid');const mobileList=q('.pos-stock-alert-mobile-list');return {width:innerWidth,bodyClient:document.documentElement.clientWidth,bodyScroll:document.documentElement.scrollWidth,navRight:Math.round(nav.getBoundingClientRect().right),contentRight:Math.round(q('.pos-backoffice-content').getBoundingClientRect().right),tableScrollContained:!table||!scroller||table.scrollWidth<=scroller.scrollWidth,tableVisible:visible(scroller),mobileCardsVisible:visible(mobileList),mobileCardCount:[...document.querySelectorAll('.pos-stock-alert-mobile-card')].filter(visible).length,kpiColumns:getComputedStyle(grid).gridTemplateColumns.split(' ').length,scrollerOverflow:scroller?getComputedStyle(scroller).overflowX:null,actionsOverlap:overlaps,actionWidths:actions.map(a=>Math.round(a.getBoundingClientRect().width)),navRows:Math.round(nav.getBoundingClientRect().height)}})()
 "@
     $measured=Invoke-Cdp 'Runtime.evaluate' @{expression=$measure;returnByValue=$true}
     if($measured.exceptionDetails){throw($measured.exceptionDetails|ConvertTo-Json -Depth 12)}
@@ -42,8 +43,21 @@ try {
     if($value.bodyScroll-gt$value.bodyClient){throw "Page-level horizontal overflow at $width px: $($value|ConvertTo-Json -Compress)"}
     if($value.navRight-gt($width+1)-or$value.contentRight-gt($width+1)){throw "Layout exceeds viewport at $width px"}
     if($value.actionsOverlap){throw "Stock action buttons overlap at $width px"}
-    if($value.actionWidths|Where-Object{$_-lt45}){throw "Text action button is too narrow at $width px"}
+    if($value.actionWidths|Where-Object{$_-lt54}){throw "Text action button is too narrow at $width px"}
     if($value.scrollerOverflow-notin@('auto','scroll')){throw "Table has no horizontal scrolling at $width px"}
+    if($width-le640){
+      if($value.kpiColumns-ne1){throw "KPI cards are not single-column at $width px"}
+      if($value.tableVisible-or!$value.mobileCardsVisible-or$value.mobileCardCount-ne1){throw "Stock alerts did not switch to readable mobile cards at $width px"}
+    } elseif(!$value.tableVisible-or$value.mobileCardsVisible){throw "Desktop/tablet stock table mode is incorrect at $width px"}
+    $value|Add-Member -NotePropertyName screenChecks -NotePropertyValue 0
+    foreach($tab in @('dashboard','orders','sessions','payments','customers','products','reports-stock')){
+      $screen=Invoke-Cdp 'Runtime.evaluate' @{expression="(()=>{S.posBackofficeTab='$tab';render();const root=document.documentElement,content=document.querySelector('.pos-backoffice-content'),minimum=innerWidth<=720?30:24;return {tab:'$tab',bodyClient:root.clientWidth,bodyScroll:root.scrollWidth,contentRight:Math.round(content.getBoundingClientRect().right),tinyControls:[...document.querySelectorAll('button')].filter(b=>{const r=b.getBoundingClientRect();return r.width>0&&r.height>0&&(r.width<minimum||r.height<minimum)}).map(b=>{const r=b.getBoundingClientRect();return {text:b.textContent.trim(),id:b.id,width:Math.round(r.width),height:Math.round(r.height)}})}})()";returnByValue=$true}
+      if($screen.exceptionDetails){throw($screen.exceptionDetails|ConvertTo-Json -Depth 12)}
+      $screenValue=$screen.result.value
+      if($screenValue.bodyScroll-gt$screenValue.bodyClient-or$screenValue.contentRight-gt($width+1)){throw "Page overflow on $tab at $width px: $($screenValue|ConvertTo-Json -Compress)"}
+      if($screenValue.tinyControls.Count-gt0){throw "Undersized visible controls on $tab at $width px`: $($screenValue.tinyControls|ConvertTo-Json -Compress)"}
+      $value.screenChecks++
+    }
     $results+=$value
   }
   $results|ConvertTo-Json -Depth 8

@@ -1846,8 +1846,8 @@
   color: #fff;
   border: none;
   border-radius: 50%;
-  width: 22px;
-  height: 22px;
+  width: 32px;
+  height: 32px;
   font-size: 11px;
   font-weight: 800;
   cursor: pointer;
@@ -1855,6 +1855,8 @@
   align-items: center;
   justify-content: center;
 }
+
+.pos-stock-alert-mobile-list { display: none; }
 
 /* The current POS uses a horizontal top navigation rather than the legacy
    sidebar handled by the older responsive rules above. Keep controls usable
@@ -1903,6 +1905,8 @@
     width: 100%;
     min-width: 0;
   }
+  .pos-backoffice-content .btn-sm,
+  .pos-backoffice-content .btn-xs { min-height: 36px; }
   .pos-topnav-right {
     justify-content: space-between;
     gap: 6px;
@@ -1939,6 +1943,87 @@
   .crud-actions { justify-content: flex-start; }
 }
 
+@media (max-width: 640px) {
+  .pos-backoffice-content .kpi-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pos-backoffice-content .kpi-card {
+    min-width: 0;
+  }
+  .pos-stock-alert-table { display: none; }
+  .pos-stock-alert-mobile-list {
+    display: grid;
+    gap: 10px;
+    padding: 12px;
+  }
+  .pos-stock-alert-mobile-card {
+    min-width: 0;
+    padding: 14px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: #fff;
+  }
+  .pos-stock-alert-mobile-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .pos-stock-alert-mobile-name {
+    font-weight: 800;
+    overflow-wrap: anywhere;
+  }
+  .pos-stock-alert-mobile-sku {
+    margin-top: 3px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+  }
+  .pos-stock-alert-mobile-head .pill {
+    flex: 0 0 auto;
+    max-width: 112px;
+    white-space: normal;
+    text-align: center;
+  }
+  .pos-stock-alert-mobile-values {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin: 14px 0 10px;
+  }
+  .pos-stock-alert-mobile-values > div {
+    min-width: 0;
+    padding: 9px;
+    border-radius: 9px;
+    background: var(--gray-50);
+  }
+  .pos-stock-alert-mobile-values dt {
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+  .pos-stock-alert-mobile-values dd {
+    margin: 4px 0 0;
+    font-size: 14px;
+    font-weight: 900;
+    overflow-wrap: anywhere;
+  }
+  .pos-stock-alert-mobile-meta { color: var(--text-muted); font-size: 11px; }
+  .pos-stock-alert-mobile-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .pos-stock-alert-mobile-actions .btn { flex: 1 1 0; }
+  .pos-stock-alert-mobile-empty {
+    padding: 24px 14px;
+    text-align: center;
+    color: var(--text-muted);
+  }
+}
+
 @media (max-width: 420px) {
   .pos-topnav-right .btn { padding: 7px 9px !important; }
   .pos-topnav-right .pill {
@@ -1946,7 +2031,7 @@
     white-space: normal;
     line-height: 1.2;
   }
-  .pos-topnav-notif { flex: 0 0 22px; }
+  .pos-topnav-notif { flex: 0 0 32px; }
 }
 
 /* ---- SCREEN 3: Session Wrapper ---- */

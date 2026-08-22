@@ -917,6 +917,32 @@
   text-align: center;
 }
 .pos-login-logo { margin-bottom: 16px; }
+
+/* The supplied brand JPEG has a square canvas around a horizontal lockup.
+   These fixed-aspect viewports crop only that blank canvas, never the mark. */
+.curdun-brand-logo {
+  display: block;
+  object-fit: cover;
+  object-position: center;
+  background: #fff;
+  border: 1px solid rgba(255,255,255,.28);
+}
+.curdun-brand-logo-login {
+  width: 210px;
+  height: 70px;
+  max-width: 100%;
+  border-radius: 12px;
+}
+.curdun-brand-logo-selector {
+  width: 168px;
+  height: 56px;
+  border-radius: 10px;
+}
+.curdun-brand-logo-nav {
+  width: 108px;
+  height: 36px;
+  border-radius: 7px;
+}
 .pos-login-title {
   font-size: 20px; font-weight: 900; color: var(--purple-800);
   letter-spacing: -0.3px;
@@ -1920,7 +1946,7 @@
     margin-right: 0;
     gap: 7px;
   }
-  .pos-topnav-brand > span:first-of-type { font-size: 12px; }
+  .curdun-brand-logo-nav { width: 96px; height: 32px; }
   .pos-topnav-store-type { display: none; }
   .pos-topnav-item { padding: 0 12px; font-size: 12px; }
   .pos-topnav-dropdown { top: 100px; }

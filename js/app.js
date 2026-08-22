@@ -3537,7 +3537,7 @@ function renderPOSLogin() {
     <div class="pos-login-screen">
       <div class="pos-login-card">
         <div class="pos-login-logo">
-          <img src="assets/curdun-logo.jpeg" alt="Curdun ICT" style="height:48px;width:auto;object-fit:contain;"/>
+          <img class="curdun-brand-logo curdun-brand-logo-login" src="assets/curdun-logo.jpeg" alt="Curdun ICT Solution"/>
         </div>
         <div class="pos-login-title">Retail POS — Sign In</div>
         <div class="pos-login-sub">${S.currentCompany} · ${S.currentStore}</div>
@@ -3973,7 +3973,7 @@ function renderPOSStoreSelector() {
         Back to workspace
       </button>
       <div style="display:flex;align-items:center;gap:10px">
-        <svg width="32" height="32" viewBox="0 0 64 64" fill="none"><rect x="2" y="2" width="60" height="60" rx="12" fill="#F5C411"/><path d="M22 20 L12 32 L22 44" stroke="#2D1859" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><path d="M42 20 L52 32 L42 44" stroke="#2D1859" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><rect x="30" y="14" width="4" height="36" rx="2" fill="#2D1859" transform="rotate(15 32 32)"/></svg>
+        <img class="curdun-brand-logo curdun-brand-logo-selector" src="assets/curdun-logo.jpeg" alt="Curdun ICT Solution"/>
         <div>
           <div style="font-weight:900;font-size:18px;color:#fff">Curdun Retail POS</div>
           <div style="font-size:12px;color:rgba(255,255,255,0.6)">Point of Sale · v3.0</div>
@@ -4099,8 +4099,7 @@ function renderPOSTopNav() {
   return `
     <div class="pos-topnav-left">
       <button class="pos-topnav-brand" id="btn-pos-home">
-        <svg width="26" height="26" viewBox="0 0 64 64" fill="none"><rect x="2" y="2" width="60" height="60" rx="10" fill="#F5C411"/><path d="M22 20 L12 32 L22 44" stroke="#2D1859" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><path d="M42 20 L52 32 L42 44" stroke="#2D1859" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><rect x="30" y="14" width="4" height="36" rx="2" fill="#2D1859" transform="rotate(15 32 32)"/></svg>
-        <span>Point of Sale</span>
+        <img class="curdun-brand-logo curdun-brand-logo-nav" src="assets/curdun-logo.jpeg" alt="Curdun ICT Solution"/>
         <span class="pos-topnav-store-type">${storeTypeLabel}</span>
       </button>
 

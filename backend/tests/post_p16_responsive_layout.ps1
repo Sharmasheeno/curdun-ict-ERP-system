@@ -26,22 +26,22 @@ try {
       if($reply.id-eq$script:messageId){if($reply.error){throw($reply.error|ConvertTo-Json -Compress)};return $reply.result}
     }
   }
-  $login="(async()=>{const pause=ms=>new Promise(r=>setTimeout(r,ms));for(let i=0;i<150&&typeof posPinLogin!=='function';i++)await pause(100);await posPinLogin('2468',8,1);await posBootstrap();S.view='pos';S.posStoreType='retail';S.posView='backoffice';S.posBackofficeTab='reports-stock';render();await pause(250);return true})()"
+  $login="(async()=>{const pause=ms=>new Promise(r=>setTimeout(r,ms));for(let i=0;i<150&&typeof posPinLogin!=='function';i++)await pause(100);await posPinLogin('2468',8,1);await posBootstrap();S.view='pos';S.posStoreType='retail';S.posView='backoffice';S.posBackofficeTab='reports-stock';render();for(let i=0;i<50&&!document.querySelector('.curdun-brand-logo-nav')?.naturalWidth;i++)await pause(100);return true})()"
   $loginResult=Invoke-Cdp 'Runtime.evaluate' @{expression=$login;awaitPromise=$true;returnByValue=$true}
   if($loginResult.exceptionDetails){throw($loginResult.exceptionDetails|ConvertTo-Json -Depth 12)}
 
   $results=@()
   foreach($width in @(1440,1280,1024,768,640,600,390,360)){
     Invoke-Cdp 'Emulation.setDeviceMetricsOverride' @{width=$width;height=900;deviceScaleFactor=1;mobile=($width-lt721)}|Out-Null
-    Invoke-Cdp 'Runtime.evaluate' @{expression="S.posBackofficeTab='reports-stock';render();true";returnByValue=$true}|Out-Null
     $measure=@"
-(()=>{window.dispatchEvent(new Event('resize'));const q=s=>document.querySelector(s);const visible=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0};const actions=[...document.querySelectorAll('[data-restock-product],[data-read-stock-alert]')].filter(visible);const overlaps=actions.some((a,i)=>actions.slice(i+1).some(b=>{const x=a.getBoundingClientRect(),y=b.getBoundingClientRect();return x.left<y.right&&x.right>y.left&&x.top<y.bottom&&x.bottom>y.top}));const scroller=q('.pos-stock-alert-table');const table=scroller?.querySelector('.data-table');const nav=q('.pos-topnav');const grid=q('.kpi-grid');const mobileList=q('.pos-stock-alert-mobile-list');return {width:innerWidth,bodyClient:document.documentElement.clientWidth,bodyScroll:document.documentElement.scrollWidth,navRight:Math.round(nav.getBoundingClientRect().right),contentRight:Math.round(q('.pos-backoffice-content').getBoundingClientRect().right),tableScrollContained:!table||!scroller||table.scrollWidth<=scroller.scrollWidth,tableVisible:visible(scroller),mobileCardsVisible:visible(mobileList),mobileCardCount:[...document.querySelectorAll('.pos-stock-alert-mobile-card')].filter(visible).length,kpiColumns:getComputedStyle(grid).gridTemplateColumns.split(' ').length,scrollerOverflow:scroller?getComputedStyle(scroller).overflowX:null,actionsOverlap:overlaps,actionWidths:actions.map(a=>Math.round(a.getBoundingClientRect().width)),navRows:Math.round(nav.getBoundingClientRect().height)}})()
+(()=>{window.dispatchEvent(new Event('resize'));const q=s=>document.querySelector(s);const visible=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0};const actions=[...document.querySelectorAll('[data-restock-product],[data-read-stock-alert]')].filter(visible);const overlaps=actions.some((a,i)=>actions.slice(i+1).some(b=>{const x=a.getBoundingClientRect(),y=b.getBoundingClientRect();return x.left<y.right&&x.right>y.left&&x.top<y.bottom&&x.bottom>y.top}));const scroller=q('.pos-stock-alert-table');const table=scroller?.querySelector('.data-table');const nav=q('.pos-topnav');const grid=q('.kpi-grid');const mobileList=q('.pos-stock-alert-mobile-list');const logo=q('.curdun-brand-logo-nav');return {width:innerWidth,bodyClient:document.documentElement.clientWidth,bodyScroll:document.documentElement.scrollWidth,navRight:Math.round(nav.getBoundingClientRect().right),contentRight:Math.round(q('.pos-backoffice-content').getBoundingClientRect().right),logoLoaded:Boolean(logo?.complete&&logo?.naturalWidth),logoWidth:Math.round(logo?.getBoundingClientRect().width||0),tableScrollContained:!table||!scroller||table.scrollWidth<=scroller.scrollWidth,tableVisible:visible(scroller),mobileCardsVisible:visible(mobileList),mobileCardCount:[...document.querySelectorAll('.pos-stock-alert-mobile-card')].filter(visible).length,kpiColumns:getComputedStyle(grid).gridTemplateColumns.split(' ').length,scrollerOverflow:scroller?getComputedStyle(scroller).overflowX:null,actionsOverlap:overlaps,actionWidths:actions.map(a=>Math.round(a.getBoundingClientRect().width)),navRows:Math.round(nav.getBoundingClientRect().height)}})()
 "@
     $measured=Invoke-Cdp 'Runtime.evaluate' @{expression=$measure;returnByValue=$true}
     if($measured.exceptionDetails){throw($measured.exceptionDetails|ConvertTo-Json -Depth 12)}
     $value=$measured.result.value
     if($value.bodyScroll-gt$value.bodyClient){throw "Page-level horizontal overflow at $width px: $($value|ConvertTo-Json -Compress)"}
     if($value.navRight-gt($width+1)-or$value.contentRight-gt($width+1)){throw "Layout exceeds viewport at $width px"}
+    if(!$value.logoLoaded-or$value.logoWidth-lt90){throw "Curdun navigation logo did not load or is unreadably small at $width px`: $($value|ConvertTo-Json -Compress)"}
     if($value.actionsOverlap){throw "Stock action buttons overlap at $width px"}
     if($value.actionWidths|Where-Object{$_-lt54}){throw "Text action button is too narrow at $width px"}
     if($value.scrollerOverflow-notin@('auto','scroll')){throw "Table has no horizontal scrolling at $width px"}
@@ -60,6 +60,10 @@ try {
     }
     $results+=$value
   }
+  $brandSurfaces=Invoke-Cdp 'Runtime.evaluate' @{expression="(async()=>{const pause=ms=>new Promise(r=>setTimeout(r,ms)),host=document.createElement('div'),login=document.createElement('div');host.style.position='fixed';host.style.left='-10000px';login.innerHTML=renderPOSLogin();document.body.appendChild(host);host.append(login,renderPOSStoreSelector());for(let i=0;i<50&&[...host.querySelectorAll('.curdun-brand-logo')].some(x=>!x.naturalWidth);i++)await pause(100);const logos=[...host.querySelectorAll('.curdun-brand-logo')].map(x=>({className:x.className,loaded:Boolean(x.complete&&x.naturalWidth),width:Math.round(x.getBoundingClientRect().width),height:Math.round(x.getBoundingClientRect().height)}));host.remove();return logos})()";awaitPromise=$true;returnByValue=$true}
+  if($brandSurfaces.exceptionDetails){throw($brandSurfaces.exceptionDetails|ConvertTo-Json -Depth 12)}
+  $invalidBrandSurfaces=@($brandSurfaces.result.value|Where-Object{!$_.loaded-or$_.width-lt160})
+  if($brandSurfaces.result.value.Count-ne2-or$invalidBrandSurfaces.Count-gt0){throw "Curdun login/selector brand surfaces failed: $($brandSurfaces.result.value|ConvertTo-Json -Compress)"}
   $results|ConvertTo-Json -Depth 8
 }
 finally {

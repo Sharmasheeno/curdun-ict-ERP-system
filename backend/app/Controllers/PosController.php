@@ -28,6 +28,7 @@ class PosController extends BaseController
     public function checkout(Request $r): void { Response::created('Checkout completed.',$this->pos->checkout($r->getBody())); }
     public function collectDebt(Request $r,int $id): void { Response::success('Customer Account settlement recorded.',$this->pos->collectDebt($id,$r->getBody())); }
     public function customerLedger(Request $r,int $id): void { Response::success('Customer Account ledger retrieved.',$this->pos->customerLedger($id)); }
+    public function pricelists(Request $r): void { Response::success('Pricelists retrieved.',$this->pos->pricelists()); }
     public function closeShift(Request $r): void { Response::created('Shift reconciliation saved.',$this->pos->closeShift($r->getBody())); }
     public function currentSession(Request $r): void { Response::success('POS register session retrieved.',$this->pos->currentSession()); }
     public function openSession(Request $r): void { Response::created('POS register opened.',$this->pos->openSession($r->getBody())); }

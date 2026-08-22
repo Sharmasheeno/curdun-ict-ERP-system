@@ -1081,16 +1081,81 @@ class PosService
         try{
             $session=$this->currentSessionForConfig($companyId,(int)$config['id'],true);
             if(!$session||$session['state']!=='OPENED')throw new Exception('Open the POS register before validating an order.',409);
+
+            // -------- P9 — Resolve the ACTIVE pricelist for this order --------
+            //  1. Client-supplied pricelist_id: must be Available on this POS
+            //     AND allowed for the acting employee.
+            //  2. Otherwise: use customer's preferred pricelist if it is
+            //     Available on this POS.
+            //  3. Otherwise: fall back to the POS default pricelist.
+            //  4. Otherwise (no pricelists configured): NULL — use base prices.
+            $requestedPricelistId = isset($data['pricelist_id']) ? (int)$data['pricelist_id'] : 0;
+            $activePricelist = $this->resolvePricelistForOrder(
+                $companyId,
+                (int)$config['id'],
+                $requestedPricelistId,
+                $customerId,
+                $data['pricelist_id'] ?? null
+            );
+            $pricelistId = $activePricelist ? (int)$activePricelist['id'] : null;
+            $pricelistName = $activePricelist['name'] ?? null;
+
+            // Backwards-compat legacy flag: {wholesale:true} on a line switches
+            // that line to the Wholesale pricelist. New callers use pricelist_id.
+            $legacyWholesalePricelist = null;
+            if ($items) {
+                foreach ($items as $legacyLine) {
+                    if (!empty($legacyLine['wholesale'])) {
+                        $wl = $this->db->query(
+                            "SELECT pl.*
+                             FROM pos_pricelists pl
+                             JOIN pos_config_pricelists pcpl ON pcpl.pricelist_id = pl.id
+                             WHERE pl.company_id = :company AND pcpl.pos_config_id = :config
+                               AND LOWER(pl.name) = 'wholesale' AND pl.active = 1
+                             LIMIT 1",
+                            ['company' => $companyId, 'config' => $config['id']]
+                        )->fetch();
+                        if ($wl) $legacyWholesalePricelist = $wl;
+                        break;
+                    }
+                }
+            }
+
             $subtotal=0;$normalized=[];
             foreach($items as $item){
                 $productId=(int)($item['product_id']??$item['id']??0);$qty=(float)($item['quantity']??$item['qty']??0);
                 if($productId<=0||$qty<=0)throw new Exception('Invalid checkout item.',422);
                 $p=$this->db->query("SELECT * FROM products WHERE id=:id AND company_id=:company AND deleted_at IS NULL FOR UPDATE",['id'=>$productId,'company'=>$companyId])->fetch();
                 if(!$p)throw new Exception('A product was not found.',404);if((float)$p['current_stock']<$qty)throw new Exception("Insufficient stock for {$p['name']}.",409);
-                $wholesale=!empty($item['wholesale']);
-                $unit=$wholesale && $p['wholesale_price'] !== null ? (float)$p['wholesale_price'] : (float)$p['selling_price'];
-                $discount=max(0,min(100,(float)($item['discount_percent']??0)));$line=round($unit*$qty*(1-$discount/100),2);$subtotal+=$line;
-                $normalized[]=['product'=>$p,'quantity'=>$qty,'unit_price'=>$unit,'discount_percent'=>$discount,'subtotal'=>$line];
+
+                // P9 — server-side price resolution. NEVER trusts client
+                // `unit_price` (Rule #18 — a modified HTTP request cannot
+                // buy a $12 item for $1). Legacy wholesale flag routes
+                // through the Wholesale pricelist if it exists.
+                $linePricelist = (!empty($item['wholesale']) && $legacyWholesalePricelist)
+                    ? $legacyWholesalePricelist
+                    : $activePricelist;
+                $priceResult = $this->resolveUnitPrice(
+                    $p, $qty, $linePricelist, date('Y-m-d')
+                );
+                $unit = $priceResult['unit_price'];
+                $basePrice = $priceResult['base_price'];
+                $pricelistPrice = $priceResult['pricelist_price'];
+                $matchedItemId = $priceResult['pricelist_item_id'];
+
+                $discount=max(0,min(100,(float)($item['discount_percent']??0)));
+                $line=round($unit*$qty*(1-$discount/100),2);
+                $subtotal+=$line;
+                $normalized[]=[
+                    'product'          => $p,
+                    'quantity'         => $qty,
+                    'unit_price'       => $unit,
+                    'base_price'       => $basePrice,
+                    'pricelist_price'  => $pricelistPrice,
+                    'pricelist_item_id'=> $matchedItemId,
+                    'discount_percent' => $discount,
+                    'subtotal'         => $line,
+                ];
             }
             $taxRate=(float)$this->settingValue($companyId,'pos.tax_rate',5);$tax=0.0;foreach($normalized as &$line){$line['tax_rate']=$taxRate;$line['tax']=round($line['subtotal']*$taxRate/100,2);$line['total']=round($line['subtotal']+$line['tax'],2);$tax+=$line['tax'];}unset($line);
             $discount=round(array_sum(array_map(fn($line)=>$line['unit_price']*$line['quantity']-$line['subtotal'],$normalized)),2);$total=round($subtotal+$tax,2);
@@ -1159,11 +1224,14 @@ class PosService
                 }
             }
             $sequence=$this->nextSequence((int)$config['id']);$reference=$this->posReference($config,$sequence);$toInvoice=!empty($data['to_invoice'])||$hasDebt;
-            $this->db->query("INSERT INTO orders (company_id,customer_id,user_id,warehouse_id,pos_session_id,uuid,sequence_number,reference_number,status,pos_state,order_date,subtotal,tax_amount,discount_amount,total_amount,amount_paid,amount_return,to_invoice,notes) VALUES (:company,:customer,:user,:warehouse,:session,:uuid,:sequence,:reference,'COMPLETED','done',CURDATE(),:subtotal,:tax,:discount,:total,:paid,:returned,:invoice,:notes)",
-                ['company'=>$companyId,'customer'=>$customerId,'user'=>$user['id'],'warehouse'=>$data['warehouse_id']??null,'session'=>$session['id'],'uuid'=>$clientUuid,'sequence'=>$sequence,'reference'=>$reference,'subtotal'=>$subtotal,'tax'=>$tax,'discount'=>$discount,'total'=>$total,'paid'=>$tendered-$change,'returned'=>$change,'invoice'=>$toInvoice?1:0,'notes'=>$data['notes']??null]);
+            $this->db->query("INSERT INTO orders (company_id,customer_id,user_id,warehouse_id,pos_session_id,pricelist_id,pricelist_name,uuid,sequence_number,reference_number,status,pos_state,order_date,subtotal,tax_amount,discount_amount,total_amount,amount_paid,amount_return,to_invoice,notes) VALUES (:company,:customer,:user,:warehouse,:session,:pricelist_id,:pricelist_name,:uuid,:sequence,:reference,'COMPLETED','done',CURDATE(),:subtotal,:tax,:discount,:total,:paid,:returned,:invoice,:notes)",
+                ['company'=>$companyId,'customer'=>$customerId,'user'=>$user['id'],'warehouse'=>$data['warehouse_id']??null,'session'=>$session['id'],'pricelist_id'=>$pricelistId,'pricelist_name'=>$pricelistName,'uuid'=>$clientUuid,'sequence'=>$sequence,'reference'=>$reference,'subtotal'=>$subtotal,'tax'=>$tax,'discount'=>$discount,'total'=>$total,'paid'=>$tendered-$change,'returned'=>$change,'invoice'=>$toInvoice?1:0,'notes'=>$data['notes']??null]);
             $orderId=(int)$this->db->lastInsertId();
             foreach($normalized as $line){$p=$line['product'];$after=(float)$p['current_stock']-$line['quantity'];
-                $this->db->query("INSERT INTO order_items (order_id,line_uuid,product_id,quantity,unit_price,discount,discount_percent,tax_rate,tax_amount,total) VALUES (:order,:uuid,:product,:quantity,:price,:discount_amount,:discount,:rate,:tax,:total)",['order'=>$orderId,'uuid'=>$this->uuid(),'product'=>$p['id'],'quantity'=>$line['quantity'],'price'=>$line['unit_price'],'discount_amount'=>round($line['unit_price']*$line['quantity']-$line['subtotal'],2),'discount'=>$line['discount_percent'],'rate'=>$line['tax_rate'],'tax'=>$line['tax'],'total'=>$line['total']]);
+                // P9 — snapshot base_price + pricelist_price + pricelist_item_id
+                // per line so refund/receipt/report can render Rule #10-safe
+                // historical pricing regardless of later pricelist edits.
+                $this->db->query("INSERT INTO order_items (order_id,line_uuid,product_id,quantity,unit_price,base_price,pricelist_price,pricelist_item_id,discount,discount_percent,tax_rate,tax_amount,total) VALUES (:order,:uuid,:product,:quantity,:price,:base_price,:pricelist_price,:pricelist_item_id,:discount_amount,:discount,:rate,:tax,:total)",['order'=>$orderId,'uuid'=>$this->uuid(),'product'=>$p['id'],'quantity'=>$line['quantity'],'price'=>$line['unit_price'],'base_price'=>$line['base_price'],'pricelist_price'=>$line['pricelist_price'],'pricelist_item_id'=>$line['pricelist_item_id'],'discount_amount'=>round($line['unit_price']*$line['quantity']-$line['subtotal'],2),'discount'=>$line['discount_percent'],'rate'=>$line['tax_rate'],'tax'=>$line['tax'],'total'=>$line['total']]);
                 $this->db->query("UPDATE products SET current_stock=:stock WHERE id=:id",['stock'=>$after,'id'=>$p['id']]);
                 $this->db->query("INSERT INTO stock_movements (product_id,warehouse_id,user_id,reference_type,reference_id,type,quantity,quantity_before,quantity_after,notes) VALUES (:product,:warehouse,:user,'POS_ORDER',:reference,'SALE',:quantity,:before,:after,'Retail POS sale')",['product'=>$p['id'],'warehouse'=>$data['warehouse_id']??null,'user'=>$user['id'],'reference'=>$orderId,'quantity'=>-$line['quantity'],'before'=>$p['current_stock'],'after'=>$after]);
             }
@@ -1321,6 +1389,146 @@ class PosService
     private function uuid(): string
     {
         $bytes=random_bytes(16);$bytes[6]=chr((ord($bytes[6])&0x0f)|0x40);$bytes[8]=chr((ord($bytes[8])&0x3f)|0x80);$hex=bin2hex($bytes);return substr($hex,0,8).'-'.substr($hex,8,4).'-'.substr($hex,12,4).'-'.substr($hex,16,4).'-'.substr($hex,20);
+    }
+
+    // =========================================================================
+    // P9 — Pricing engine (Odoo 19 Flexible Pricelists)
+    // =========================================================================
+
+    /**
+     * Resolve which pricelist applies to an entire order. Priority:
+     *   1. Explicit client-supplied pricelist_id (only if Available on this
+     *      POS and, for a rejection-safe check, the browser is authorized
+     *      per Odoo Basic Rights to switch — enforced by the route + here).
+     *   2. Selected customer's preferred pricelist (customers.pricelist_id)
+     *      if it is Available on this POS.
+     *   3. POS default pricelist (pos_config_pricelists.is_default=1).
+     *   4. NULL — engine falls back to product.selling_price.
+     */
+    private function resolvePricelistForOrder(int $companyId, int $configId, int $requestedId, ?int $customerId, mixed $requestedRaw): ?array
+    {
+        // 1. Explicit request. If invalid or unassigned, reject — the browser
+        //    should not silently downgrade to a different pricelist.
+        if ($requestedId > 0) {
+            $row = $this->db->query(
+                "SELECT pl.*
+                 FROM pos_pricelists pl
+                 JOIN pos_config_pricelists pcpl ON pcpl.pricelist_id = pl.id
+                 WHERE pl.id = :id AND pl.company_id = :company AND pl.active = 1
+                   AND pcpl.pos_config_id = :config
+                 LIMIT 1",
+                ['id' => $requestedId, 'company' => $companyId, 'config' => $configId]
+            )->fetch();
+            if (!$row) throw new Exception('Requested pricelist is not available on this POS.', 422);
+            return $row;
+        }
+
+        // 2. Customer preferred pricelist.
+        if ($customerId) {
+            $row = $this->db->query(
+                "SELECT pl.*
+                 FROM customers c
+                 JOIN pos_pricelists pl        ON pl.id = c.pricelist_id
+                 JOIN pos_config_pricelists pcpl ON pcpl.pricelist_id = pl.id
+                 WHERE c.id = :cust AND c.company_id = :company AND pl.active = 1
+                   AND pcpl.pos_config_id = :config
+                 LIMIT 1",
+                ['cust' => $customerId, 'company' => $companyId, 'config' => $configId]
+            )->fetch();
+            if ($row) return $row;
+        }
+
+        // 3. POS default.
+        $row = $this->db->query(
+            "SELECT pl.*
+             FROM pos_config_pricelists pcpl
+             JOIN pos_pricelists pl ON pl.id = pcpl.pricelist_id
+             WHERE pcpl.pos_config_id = :config AND pcpl.is_default = 1 AND pl.active = 1
+             ORDER BY pcpl.`sequence`, pl.id
+             LIMIT 1",
+            ['config' => $configId]
+        )->fetch();
+        return $row ?: null;
+    }
+
+    /**
+     * Resolve the unit price for one order line under a given pricelist +
+     * date. Rule precedence (Odoo-documented, Rule #16 deterministic):
+     *   1. applies_to = 'product'  AND product_id  = $productId   (highest)
+     *   2. applies_to = 'category' AND category_id = product.category
+     *   3. applies_to = 'all'                                    (lowest)
+     * Within same specificity, ORDER BY `sequence` ASC then id. Only items
+     * whose min_quantity <= qty AND (start_date IS NULL OR <= date) AND
+     * (end_date IS NULL OR >= date) are considered.
+     *
+     * Result is {unit_price, base_price, pricelist_price, pricelist_item_id}
+     * so the checkout can snapshot every stage for Rule #10 historical
+     * integrity (base / pricelist / final visible on the receipt & reports).
+     */
+    private function resolveUnitPrice(array $product, float $qty, ?array $pricelist, string $date): array
+    {
+        $base = round((float)$product['selling_price'], 2);
+        if (!$pricelist) {
+            return ['unit_price' => $base, 'base_price' => $base, 'pricelist_price' => $base, 'pricelist_item_id' => null];
+        }
+        $item = $this->db->query(
+            "SELECT *,
+                CASE applies_to WHEN 'product' THEN 1 WHEN 'category' THEN 2 ELSE 3 END AS specificity
+             FROM pos_pricelist_items
+             WHERE pricelist_id = :pricelist
+               AND active = 1
+               AND min_quantity <= :qty
+               AND (start_date IS NULL OR start_date <= :date_start)
+               AND (end_date   IS NULL OR end_date   >= :date_end)
+               AND (
+                    (applies_to = 'product'  AND product_id  = :product)
+                 OR (applies_to = 'category' AND category_id = :category)
+                 OR (applies_to = 'all')
+               )
+             ORDER BY specificity ASC, `sequence` ASC, id ASC
+             LIMIT 1",
+            [
+                'pricelist'  => $pricelist['id'],
+                'qty'        => $qty,
+                'date_start' => $date,
+                'date_end'   => $date,
+                'product'    => $product['id'],
+                'category'   => $product['category_id'] ?? 0,
+            ]
+        )->fetch();
+
+        if (!$item) {
+            return ['unit_price' => $base, 'base_price' => $base, 'pricelist_price' => $base, 'pricelist_item_id' => null];
+        }
+        $pricelistPrice = $base;
+        if ($item['price_type'] === 'fixed' && $item['fixed_price'] !== null) {
+            $pricelistPrice = round((float)$item['fixed_price'], 2);
+        } elseif ($item['price_type'] === 'discount' && $item['discount_percent'] !== null) {
+            $pct = max(0.0, min(100.0, (float)$item['discount_percent']));
+            $pricelistPrice = round($base * (1 - $pct / 100), 2);
+        }
+        return [
+            'unit_price'         => $pricelistPrice,
+            'base_price'         => $base,
+            'pricelist_price'    => $pricelistPrice,
+            'pricelist_item_id'  => (int)$item['id'],
+        ];
+    }
+
+    // Public read endpoints for the frontend Checkout composer.
+    public function pricelists(): array
+    {
+        [$user, $companyId] = $this->context();
+        $config = $this->resolveConfig($companyId, isset($user['branch_id']) ? (int)$user['branch_id'] : null);
+        $rows = $this->db->query(
+            "SELECT pl.id, pl.name, pl.currency, pl.`sequence`, pcpl.is_default
+             FROM pos_config_pricelists pcpl
+             JOIN pos_pricelists pl ON pl.id = pcpl.pricelist_id
+             WHERE pcpl.pos_config_id = :config AND pl.active = 1
+             ORDER BY pcpl.is_default DESC, pcpl.`sequence`, pl.name",
+            ['config' => $config['id']]
+        )->fetchAll();
+        return ['config' => $config, 'pricelists' => $rows];
     }
 
     private function createInvoice(int $companyId,array $user,int $orderId,?int $customerId,array $lines,float $subtotal,float $tax,float $total,bool $debt,bool $creditNote,?float $debtAmount=null): array

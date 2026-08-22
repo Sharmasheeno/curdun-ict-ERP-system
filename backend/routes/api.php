@@ -93,6 +93,8 @@ $router->group('/api/v1', function($router) {
     // Customer Account ledger — MINIMAL cashiers can view (they need it when
     // helping a customer verify their balance); mutations remain gated.
     $router->get ('/pos/customers/{id}/ledger',          [PosController::class, 'customerLedger']);
+    // P9 — pricelists available on the current POS + default. Any level.
+    $router->get ('/pos/pricelists',                     [PosController::class, 'pricelists']);
 
     // Odoo BASIC — open register, refunds, cash movements.
     $router->post   ('/pos/sessions/open',                  [PosController::class, 'openSession'],    [$NEEDS_CASHIER(), $CAP('pos.register_open')]);

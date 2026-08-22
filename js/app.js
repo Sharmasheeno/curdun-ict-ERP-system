@@ -4260,12 +4260,10 @@ function renderPOSCategories() {
   const cats = [...new Set(POS_PRODUCTS.map(p => p.cat || 'General'))].sort();
   return `
     <div class="pharm-content">
-      <div style="display:flex;justify-content:flex-end;margin-bottom:16px">
-        <button class="btn btn-gold btn-sm" id="btn-add-category">+ New Category</button>
-      </div>
+      <div style="font-size:13px;color:var(--text-muted);margin-bottom:16px">Categories are derived from the authenticated product catalogue.</div>
       <div class="pos-table-wrap">
         <table class="pos-table">
-          <thead><tr><th>#</th><th>Category Name</th><th>Products</th><th>Status</th><th>Actions</th></tr></thead>
+          <thead><tr><th>#</th><th>Category Name</th><th>Products</th><th>Status</th></tr></thead>
           <tbody>
             ${cats.map((cat, i) => {
               const count = POS_PRODUCTS.filter(p => (p.cat||'General') === cat).length;
@@ -4274,10 +4272,6 @@ function renderPOSCategories() {
                 <td><strong>${esc(cat)}</strong></td>
                 <td>${count} product${count!==1?'s':''}</td>
                 <td><span class="pill pill-green">Active</span></td>
-                <td>
-                  <button class="btn btn-outline btn-sm" data-edit-cat="${esc(cat)}">Edit</button>
-                  <button class="btn btn-sm" style="color:#e53e3e;background:rgba(229,62,62,0.1)" data-delete-cat="${esc(cat)}">Delete</button>
-                </td>
               </tr>`;
             }).join('')}
           </tbody>
@@ -4291,7 +4285,7 @@ function renderPOSCombos() {
   return `
     <div class="pharm-topbar">
       <div class="pharm-tab-label">Combo Choices</div>
-      <button class="btn btn-gold btn-sm" id="btn-add-combo">+ New Combo</button>
+      <span class="pill">Not implemented</span>
     </div>
     <div class="pharm-content">
       ${combos.length === 0 ? `
@@ -4299,7 +4293,7 @@ function renderPOSCombos() {
           <div style="font-size:48px;margin-bottom:16px">🎁</div>
           <div style="font-size:18px;font-weight:700;margin-bottom:8px">No combos yet</div>
           <div style="font-size:14px;margin-bottom:20px">Create bundle deals — e.g. "Family Pack" or "Meal Deal"</div>
-          <button class="btn btn-gold" id="btn-add-combo-empty">+ Create first combo</button>
+          <div class="pill" style="display:inline-block">Promotion bundles are outside this release.</div>
         </div>
       ` : `
         <div class="pos-table-wrap">
@@ -7179,23 +7173,6 @@ function wirePOSEvents() {
   document.getElementById('btn-dashboard-stock-alerts')?.addEventListener('click', async () => {
     S.posBackofficeTab = 'reports-stock'; render();
     try { await posLoadStockAlerts(); } catch(error) { alert(error.message); }
-  });
-
-  // ---- Categories tab placeholder events ----
-  document.getElementById('btn-add-category')?.addEventListener('click', () => {
-    const name = prompt('New category name:');
-    if (name && name.trim()) {
-      // Optimistically add a placeholder product to register category
-      alert(`Category "${name.trim()}" will be available when you add products to it.`);
-    }
-  });
-
-  // ---- Combos tab placeholder events ----
-  document.getElementById('btn-add-combo')?.addEventListener('click', () => {
-    alert('Combo creation coming soon! You will be able to bundle products into meal deals and family packs.');
-  });
-  document.getElementById('btn-add-combo-empty')?.addEventListener('click', () => {
-    alert('Combo creation coming soon! You will be able to bundle products into meal deals and family packs.');
   });
 
 }

@@ -95,6 +95,8 @@ $router->group('/api/v1', function($router) {
     $router->get ('/pos/customers/{id}/ledger',          [PosController::class, 'customerLedger']);
     // P9 — pricelists available on the current POS + default. Any level.
     $router->get ('/pos/pricelists',                     [PosController::class, 'pricelists']);
+    // P10 - Loyalty snapshot (program + balance + rewards + ledger). Any level.
+    $router->get ('/pos/customers/{id}/loyalty',         [PosController::class, 'customerLoyalty']);
 
     // Odoo BASIC — open register, refunds, cash movements.
     $router->post   ('/pos/sessions/open',                  [PosController::class, 'openSession'],    [$NEEDS_CASHIER(), $CAP('pos.register_open')]);

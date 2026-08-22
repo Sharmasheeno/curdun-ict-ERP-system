@@ -1015,6 +1015,56 @@ class PosService
             if ($order['invoice_id']) {
                 $this->createInvoice($companyId,$user,$refundId,$order['customer_id']?(int)$order['customer_id']:null,$refundLines,$subtotal,$tax,$total,false,true);
             }
+
+            // P10 - Loyalty reversal. Reverse the points EARNED proportional
+            // to the refunded amount vs the original order total. Redeemed
+            // rewards are NOT restored automatically (Rule #8: define
+            // deterministic behaviour) - this can be extended later.
+            // STRICTLY separate from Deyn: no touch to customer.balance or
+            // pos_credit_ledger from this block.
+            $earnedOnOriginal = (float)($order['loyalty_points_earned'] ?? 0);
+            if ($earnedOnOriginal > 0.001 && $order['customer_id']) {
+                $originalTotal = (float)$order['total_amount'];
+                $ratio = $originalTotal > 0 ? min(1.0, abs((float)$total) / $originalTotal) : 0.0;
+                $reverse = round($earnedOnOriginal * $ratio, 2);
+                if ($reverse > 0.001) {
+                    $bal = (float)($this->db->query(
+                        "SELECT loyalty_points FROM customers WHERE id=:id AND company_id=:company FOR UPDATE",
+                        ['id'=>$order['customer_id'],'company'=>$companyId]
+                    )->fetchColumn() ?: 0);
+                    $bal = round($bal - $reverse, 2);
+                    // Find the LOYALTY_EARN row on the original order to get its program_id
+                    $earnRow = $this->db->query(
+                        "SELECT program_id FROM pos_loyalty_ledger WHERE order_id=:order AND type='LOYALTY_EARN' LIMIT 1",
+                        ['order'=>$id]
+                    )->fetch();
+                    $progId = $earnRow ? (int)$earnRow['program_id'] : null;
+                    if ($progId) {
+                        $this->db->query(
+                            "INSERT INTO pos_loyalty_ledger
+                                (company_id, customer_id, program_id, order_id, session_id, cashier_id, type, points, balance_after, notes)
+                             VALUES
+                                (:company, :customer, :program, :order, :session, :cashier, 'LOYALTY_REFUND_REVERSAL', :points, :balance, :notes)",
+                            [
+                                'company'  => $companyId,
+                                'customer' => $order['customer_id'],
+                                'program'  => $progId,
+                                'order'    => $refundId,
+                                'session'  => $session['id'],
+                                'cashier'  => $user['id'],
+                                'points'   => -abs($reverse),
+                                'balance'  => $bal,
+                                'notes'    => 'Refund reversal of points earned on order ' . $id,
+                            ]
+                        );
+                        $this->db->query(
+                            "UPDATE customers SET loyalty_points = :bal WHERE id = :id AND company_id = :company",
+                            ['bal' => $bal, 'id' => $order['customer_id'], 'company' => $companyId]
+                        );
+                    }
+                }
+            }
+
             $this->log($user,$companyId,'ORDER_REFUND',$refundId,[
                 'original_order_id' => $id,
                 'reference'         => $reference,
@@ -1196,6 +1246,55 @@ class PosService
                 $payments[]=['method'=>$payment,'amount'=>$amount,'tendered'=>$lineTendered,'line_change'=>$lineChange,'reference'=>$paymentLine['reference']??$data['payment_reference']??null];
             }
             if($hasDebt&&!$customerId)throw new Exception('A customer is required for credit sales.',422);
+
+            // -------- P10 - Loyalty redemption (order-level discount) -----
+            // Client supplies loyalty_reward_id + loyalty_program_id. Backend
+            // recalculates cost + discount from the CONFIGURED reward - never
+            // trusts a client-supplied points_cost or reward_value (Rule #11).
+            // Redemption reduces the order total BEFORE payment allocation
+            // so the payment lines must sum to the discounted total.
+            $loyaltyRedeem = null;
+            if (!empty($data['loyalty_reward_id']) && $customerId) {
+                if (!PosAccess::can('pos.loyalty_operate')) {
+                    throw new Exception('Your POS access level cannot apply loyalty rewards.', 403);
+                }
+                $reward = $this->db->query(
+                    "SELECT r.*, p.company_id AS program_company_id, p.name AS program_name
+                     FROM pos_loyalty_rewards r
+                     JOIN pos_loyalty_programs p ON p.id = r.program_id
+                     WHERE r.id = :id AND r.active = 1 AND p.active = 1
+                       AND p.company_id = :company
+                     LIMIT 1",
+                    ['id' => (int)$data['loyalty_reward_id'], 'company' => $companyId]
+                )->fetch();
+                if (!$reward) throw new Exception('Loyalty reward not available.', 422);
+                // Verify the customer owns enough points BEFORE any deduction
+                $balance = (float)($this->db->query(
+                    "SELECT loyalty_points FROM customers WHERE id=:id AND company_id=:company",
+                    ['id'=>$customerId,'company'=>$companyId]
+                )->fetchColumn() ?: 0);
+                $cost = round((float)$reward['points_cost'], 2);
+                if ($balance + 0.0001 < $cost) {
+                    throw new Exception('Customer does not have enough loyalty points to redeem this reward.', 422);
+                }
+                // Compute the discount amount (fixed, percent, or free product value)
+                $discountAmount = 0.0;
+                if ($reward['reward_type'] === 'discount_amount') {
+                    $discountAmount = round((float)$reward['discount_amount'], 2);
+                } elseif ($reward['reward_type'] === 'discount_percent') {
+                    $discountAmount = round($total * ((float)$reward['discount_percent'] / 100), 2);
+                }
+                // Never let the reward reduce the total below zero.
+                $discountAmount = min($discountAmount, $total);
+                $total = round($total - $discountAmount, 2);
+                $loyaltyRedeem = [
+                    'reward' => $reward,
+                    'cost'   => $cost,
+                    'discount_amount' => $discountAmount,
+                    'new_balance'     => round($balance - $cost, 2),
+                ];
+            }
+
             if(round($applied,2)+0.0001<$total)throw new Exception('The order is not fully paid.',422);
             if(round($applied,2)>$total+0.0001)throw new Exception('Payment amounts exceed the order total. Use the tendered field for cash overpayment, not the amount.',422);
             $tendered=$applied+$change; // for legacy fields in orders row
@@ -1224,8 +1323,33 @@ class PosService
                 }
             }
             $sequence=$this->nextSequence((int)$config['id']);$reference=$this->posReference($config,$sequence);$toInvoice=!empty($data['to_invoice'])||$hasDebt;
-            $this->db->query("INSERT INTO orders (company_id,customer_id,user_id,warehouse_id,pos_session_id,pricelist_id,pricelist_name,uuid,sequence_number,reference_number,status,pos_state,order_date,subtotal,tax_amount,discount_amount,total_amount,amount_paid,amount_return,to_invoice,notes) VALUES (:company,:customer,:user,:warehouse,:session,:pricelist_id,:pricelist_name,:uuid,:sequence,:reference,'COMPLETED','done',CURDATE(),:subtotal,:tax,:discount,:total,:paid,:returned,:invoice,:notes)",
-                ['company'=>$companyId,'customer'=>$customerId,'user'=>$user['id'],'warehouse'=>$data['warehouse_id']??null,'session'=>$session['id'],'pricelist_id'=>$pricelistId,'pricelist_name'=>$pricelistName,'uuid'=>$clientUuid,'sequence'=>$sequence,'reference'=>$reference,'subtotal'=>$subtotal,'tax'=>$tax,'discount'=>$discount,'total'=>$total,'paid'=>$tendered-$change,'returned'=>$change,'invoice'=>$toInvoice?1:0,'notes'=>$data['notes']??null]);
+            // P10 - Compute points earned (order-total based; program rules
+            // can override in a follow-up). Points ONLY awarded when there
+            // is a selected customer AND an active LOYALTY program.
+            $pointsEarned = 0.0;
+            $loyaltyProgram = null;
+            if ($customerId) {
+                $loyaltyProgram = $this->db->query(
+                    "SELECT * FROM pos_loyalty_programs
+                     WHERE company_id = :company AND active = 1 AND program_type = 'LOYALTY'
+                       AND (start_date IS NULL OR start_date <= CURDATE())
+                       AND (end_date   IS NULL OR end_date   >= CURDATE())
+                     ORDER BY id LIMIT 1",
+                    ['company' => $companyId]
+                )->fetch();
+                if ($loyaltyProgram) {
+                    $eligibleAmount = $total;
+                    if ($eligibleAmount >= (float)$loyaltyProgram['minimum_purchase']) {
+                        $pointsEarned = round($eligibleAmount * (float)$loyaltyProgram['points_per_currency'], 2);
+                    }
+                }
+            }
+            $redeemedPoints = $loyaltyRedeem ? $loyaltyRedeem['cost'] : 0.0;
+            $rewardId       = $loyaltyRedeem ? (int)$loyaltyRedeem['reward']['id'] : null;
+            $rewardDiscount = $loyaltyRedeem ? $loyaltyRedeem['discount_amount'] : 0.0;
+
+            $this->db->query("INSERT INTO orders (company_id,customer_id,user_id,warehouse_id,pos_session_id,pricelist_id,pricelist_name,loyalty_points_earned,loyalty_points_redeemed,loyalty_reward_id,loyalty_discount_amount,uuid,sequence_number,reference_number,status,pos_state,order_date,subtotal,tax_amount,discount_amount,total_amount,amount_paid,amount_return,to_invoice,notes) VALUES (:company,:customer,:user,:warehouse,:session,:pricelist_id,:pricelist_name,:pts_earned,:pts_redeemed,:reward_id,:reward_discount,:uuid,:sequence,:reference,'COMPLETED','done',CURDATE(),:subtotal,:tax,:discount,:total,:paid,:returned,:invoice,:notes)",
+                ['company'=>$companyId,'customer'=>$customerId,'user'=>$user['id'],'warehouse'=>$data['warehouse_id']??null,'session'=>$session['id'],'pricelist_id'=>$pricelistId,'pricelist_name'=>$pricelistName,'pts_earned'=>$pointsEarned,'pts_redeemed'=>$redeemedPoints,'reward_id'=>$rewardId,'reward_discount'=>$rewardDiscount,'uuid'=>$clientUuid,'sequence'=>$sequence,'reference'=>$reference,'subtotal'=>$subtotal,'tax'=>$tax,'discount'=>$discount,'total'=>$total,'paid'=>$tendered-$change,'returned'=>$change,'invoice'=>$toInvoice?1:0,'notes'=>$data['notes']??null]);
             $orderId=(int)$this->db->lastInsertId();
             foreach($normalized as $line){$p=$line['product'];$after=(float)$p['current_stock']-$line['quantity'];
                 // P9 — snapshot base_price + pricelist_price + pricelist_item_id
@@ -1272,7 +1396,69 @@ class PosService
                 );
                 $this->db->query("UPDATE customers SET balance=balance+:total WHERE id=:id AND company_id=:company",['total'=>$debtAmount,'id'=>$customerId,'company'=>$companyId]);
             }
-            $this->log($user,$companyId,'CHECKOUT',$orderId,['reference'=>$reference,'uuid'=>$clientUuid,'session_id'=>$session['id'],'total'=>$total,'payments'=>array_map(fn($p)=>['method'=>$p['method']['name'],'amount'=>$p['amount']],$payments),'change'=>$change]);$this->db->commit();
+            // P10 - Loyalty ledger writes. STRICTLY SEPARATE from Deyn:
+            //   - Redemption (customer spending points on this order): write
+            //     LOYALTY_REDEEM BEFORE the earn so balance_after chains
+            //     correctly. Decrements customer.loyalty_points.
+            //   - Earn (points awarded for the sale itself): write
+            //     LOYALTY_EARN. Increments customer.loyalty_points.
+            //   NEVER touches customer.balance or pos_credit_ledger.
+            if ($customerId && ($loyaltyRedeem || $pointsEarned > 0.001) && $loyaltyProgram) {
+                $runningBalance = (float)($this->db->query(
+                    "SELECT loyalty_points FROM customers WHERE id=:id AND company_id=:company FOR UPDATE",
+                    ['id'=>$customerId,'company'=>$companyId]
+                )->fetchColumn() ?: 0);
+                if ($loyaltyRedeem) {
+                    $runningBalance = round($runningBalance - $loyaltyRedeem['cost'], 2);
+                    $this->db->query(
+                        "INSERT INTO pos_loyalty_ledger
+                            (company_id, customer_id, program_id, order_id, session_id, cashier_id, reward_id, type, points, balance_after, notes)
+                         VALUES
+                            (:company, :customer, :program, :order, :session, :cashier, :reward, 'LOYALTY_REDEEM', :points, :balance, :notes)",
+                        [
+                            'company'  => $companyId,
+                            'customer' => $customerId,
+                            'program'  => $loyaltyRedeem['reward']['program_id'],
+                            'order'    => $orderId,
+                            'session'  => $session['id'],
+                            'cashier'  => $user['id'],
+                            'reward'   => $loyaltyRedeem['reward']['id'],
+                            'points'   => -abs($loyaltyRedeem['cost']),
+                            'balance'  => $runningBalance,
+                            'notes'    => 'Redeemed reward "' . $loyaltyRedeem['reward']['name'] . '" on order ' . $reference,
+                        ]
+                    );
+                }
+                if ($pointsEarned > 0.001) {
+                    $runningBalance = round($runningBalance + $pointsEarned, 2);
+                    $this->db->query(
+                        "INSERT INTO pos_loyalty_ledger
+                            (company_id, customer_id, program_id, order_id, session_id, cashier_id, type, points, balance_after, notes)
+                         VALUES
+                            (:company, :customer, :program, :order, :session, :cashier, 'LOYALTY_EARN', :points, :balance, :notes)",
+                        [
+                            'company'  => $companyId,
+                            'customer' => $customerId,
+                            'program'  => $loyaltyProgram['id'],
+                            'order'    => $orderId,
+                            'session'  => $session['id'],
+                            'cashier'  => $user['id'],
+                            'points'   => $pointsEarned,
+                            'balance'  => $runningBalance,
+                            'notes'    => 'Points earned on order ' . $reference,
+                        ]
+                    );
+                }
+                // customer.loyalty_points MUST equal SUM(ledger.points) for
+                // this customer -- update it in the same transaction as the
+                // ledger writes so the invariant never drifts.
+                $this->db->query(
+                    "UPDATE customers SET loyalty_points = :bal WHERE id = :id AND company_id = :company",
+                    ['bal' => $runningBalance, 'id' => $customerId, 'company' => $companyId]
+                );
+            }
+
+            $this->log($user,$companyId,'CHECKOUT',$orderId,['reference'=>$reference,'uuid'=>$clientUuid,'session_id'=>$session['id'],'total'=>$total,'payments'=>array_map(fn($p)=>['method'=>$p['method']['name'],'amount'=>$p['amount']],$payments),'change'=>$change,'loyalty_earned'=>$pointsEarned,'loyalty_redeemed'=>$redeemedPoints]);$this->db->commit();
         }catch(\Throwable $e){if($this->db->getConnection()->inTransaction())$this->db->rollback();throw $e;}
         $this->syncStockAlerts($companyId);
         $response = $this->checkoutResponse($orderId,$companyId,false);
@@ -1512,6 +1698,59 @@ class PosService
             'base_price'         => $base,
             'pricelist_price'    => $pricelistPrice,
             'pricelist_item_id'  => (int)$item['id'],
+        ];
+    }
+
+    // P10 - Loyalty snapshot for a customer. Returns program(s), the
+    // customer's current points balance, active rewards, and the ledger
+    // (newest first) with an invariant flag proving
+    // customer.loyalty_points == SUM(ledger.points).
+    public function customerLoyalty(int $customerId): array
+    {
+        [$user, $companyId] = $this->context();
+        $customer = $this->customer($customerId, $companyId);
+        $program = $this->db->query(
+            "SELECT * FROM pos_loyalty_programs
+             WHERE company_id = :company AND active = 1 AND program_type = 'LOYALTY'
+             ORDER BY id LIMIT 1",
+            ['company' => $companyId]
+        )->fetch();
+        $rewards = $program ? $this->db->query(
+            "SELECT id, name, reward_type, points_cost, discount_percent, discount_amount, reward_product_id, `sequence`
+             FROM pos_loyalty_rewards
+             WHERE program_id = :program AND active = 1
+             ORDER BY `sequence`, id",
+            ['program' => $program['id']]
+        )->fetchAll() : [];
+        $entries = $this->db->query(
+            "SELECT l.id, l.type, l.points, l.balance_after, l.notes, l.created_at,
+                    l.session_id, l.order_id, l.reward_id,
+                    u.name AS cashier_name, o.reference_number AS order_reference,
+                    r.name AS reward_name
+             FROM pos_loyalty_ledger l
+             LEFT JOIN users u ON u.id = l.cashier_id
+             LEFT JOIN orders o ON o.id = l.order_id
+             LEFT JOIN pos_loyalty_rewards r ON r.id = l.reward_id
+             WHERE l.company_id = :company AND l.customer_id = :customer
+             ORDER BY l.id DESC",
+            ['company' => $companyId, 'customer' => $customerId]
+        )->fetchAll();
+        $ledgerSum = 0.0;
+        foreach ($entries as $e) $ledgerSum += (float)$e['points'];
+        $ledgerSum = round($ledgerSum, 2);
+        $balance = round((float)$customer['loyalty_points'], 2);
+        return [
+            'customer'     => [
+                'id'             => (int)$customer['id'],
+                'name'           => $customer['name'],
+                'loyalty_points' => $balance,
+                'account_balance'=> round((float)$customer['balance'], 2),
+            ],
+            'program'      => $program,
+            'rewards'      => $rewards,
+            'entries'      => $entries,
+            'ledger_sum'   => $ledgerSum,
+            'invariant_ok' => abs($ledgerSum - $balance) < 0.01,
         ];
     }
 

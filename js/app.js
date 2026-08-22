@@ -241,6 +241,7 @@ const S = {
   posShowHeld: false,        // toggle held orders panel
   posPayments: [],
   posPendingOrderId: null,
+  posCheckoutUncertain: false,
 
   // POS — Admin login mode ('staff' = PIN grid, 'admin' = email/password, 'force-change' = new-password screen)
   posLoginMode: 'staff',
@@ -3306,6 +3307,7 @@ function posDeynLineAmount() {
 // amount; the user can adjust for over-tender. Non-cash lines have no
 // tender/change concept.
 function posAddPaymentLine(name, orderTotal) {
+  if (S.posCheckoutUncertain) return;
   S.posPendingOrderId = null;
   const type = posMethodType(name);
   const remaining = posPaymentLinesRemaining(orderTotal);
@@ -3317,12 +3319,14 @@ function posAddPaymentLine(name, orderTotal) {
 }
 
 function posRemovePaymentLine(idx) {
+  if (S.posCheckoutUncertain) return;
   S.posPendingOrderId = null;
   S.posPaymentLines = (S.posPaymentLines || []).filter((_, i) => i !== idx);
   posScheduleQuote();
 }
 
 function posUpdatePaymentLine(idx, patch) {
+  if (S.posCheckoutUncertain) return;
   S.posPendingOrderId = null;
   S.posPaymentLines = (S.posPaymentLines || []).map((line, i) => {
     if (i !== idx) return line;
@@ -3369,6 +3373,7 @@ function posResetPaymentLines() {
   const defaultPricelist = (S.posPricelists || []).find(p => Number(p.is_default) === 1);
   S.posSelectedPricelistId = defaultPricelist ? Number(defaultPricelist.id) : null;
   S.posCashTendered = '';
+  S.posCheckoutUncertain = false;
 }
 
 /**
@@ -4940,6 +4945,7 @@ function renderPOSCheckout() {
 
   return `
     ${S.posSession?.state==='OPENED' ? `<div class="cashier-shift-banner" style="margin-bottom:12px"><span>🟢 Register #${S.posSession.id} open · ${esc(S.posSession.config_name||S.posConfig?.name||'Main Register')}</span><span class="shift-duration-badge">Expected $${Number(S.posSessionSummary?.expected_cash||S.posSession.opening_cash||0).toFixed(2)}</span></div>` : `<div class="cashier-shift-banner cashier-shift-idle" style="margin-bottom:12px;display:flex;align-items:center"><span style="flex:1">🔒 Register closed — open it before validating an order</span><button class="btn btn-primary btn-sm" id="btn-checkout-open-register">Open register</button></div>`}
+    ${S.posCheckoutUncertain ? `<div class="pos-deyn-warning" style="margin-bottom:10px"><strong>We couldn't confirm the sale.</strong> Retry Validate to check the committed transaction. Cart, customer, pricing, reward and payments stay locked until the retry succeeds.</div>` : ''}
     <div class="pos-checkout-layout">
       <div class="pos-product-panel">
         <div class="pos-product-search-bar">
@@ -6930,6 +6936,7 @@ function wirePOSEvents() {
 
     document.querySelectorAll('[data-add-product]').forEach(btn => {
       btn.addEventListener('click', () => {
+        if (S.posCheckoutUncertain) return;
         S.posPendingOrderId = null;
         const id = parseInt(btn.dataset.addProduct);
         const prod = POS_PRODUCTS.find(p=>p.id===id);
@@ -6943,14 +6950,15 @@ function wirePOSEvents() {
     });
 
     document.querySelectorAll('.pos-wholesale-cb').forEach(cb => {
-      cb.addEventListener('change', () => { S.posPendingOrderId = null; S.posCart[parseInt(cb.dataset.cartIdx)].isWholesale = cb.checked; posScheduleQuote(); render(); });
+      cb.addEventListener('change', () => { if(S.posCheckoutUncertain)return; S.posPendingOrderId = null; S.posCart[parseInt(cb.dataset.cartIdx)].isWholesale = cb.checked; posScheduleQuote(); render(); });
     });
 
     document.querySelectorAll('[data-qty-plus]').forEach(btn => {
-      btn.addEventListener('click', () => { S.posPendingOrderId = null; S.posCart[parseInt(btn.dataset.qtyPlus)].qty++; posScheduleQuote(); render(); });
+      btn.addEventListener('click', () => { if(S.posCheckoutUncertain)return; S.posPendingOrderId = null; S.posCart[parseInt(btn.dataset.qtyPlus)].qty++; posScheduleQuote(); render(); });
     });
     document.querySelectorAll('[data-qty-minus]').forEach(btn => {
       btn.addEventListener('click', () => {
+        if (S.posCheckoutUncertain) return;
         S.posPendingOrderId = null;
         const i = parseInt(btn.dataset.qtyMinus);
         if (S.posCart[i].qty > 1) S.posCart[i].qty--;
@@ -6960,7 +6968,7 @@ function wirePOSEvents() {
       });
     });
     document.querySelectorAll('[data-remove-item]').forEach(btn => {
-      btn.addEventListener('click', () => { S.posPendingOrderId = null; S.posCart.splice(parseInt(btn.dataset.removeItem), 1); posScheduleQuote(); render(); });
+      btn.addEventListener('click', () => { if(S.posCheckoutUncertain)return; S.posPendingOrderId = null; S.posCart.splice(parseInt(btn.dataset.removeItem), 1); posScheduleQuote(); render(); });
     });
     document.querySelectorAll('[data-pos-cat]').forEach(btn => {
       btn.addEventListener('click', () => { S.posSearchTerm = btn.dataset.posCat==='All'?'':btn.dataset.posCat; render(); });
@@ -7015,6 +7023,7 @@ function wirePOSEvents() {
     // loyalty, preferred pricing, and Customer Account payment lines.
     const deynSel = document.getElementById('pos-deyn-customer');
     if (deynSel) deynSel.addEventListener('change', async () => {
+      if (S.posCheckoutUncertain) { render(); return; }
       S.posPendingOrderId = null;
       S.posSelectedRewardId = null;
       S.posRewardsOpen = false;
@@ -7032,6 +7041,7 @@ function wirePOSEvents() {
     // P14 - Pricelist selector (P9). Only enabled for pos.pricelist_select.
     const priceSel = document.getElementById('pos-pricelist-select');
     if (priceSel) priceSel.addEventListener('change', () => {
+      if (S.posCheckoutUncertain) { render(); return; }
       S.posPendingOrderId = null;
       S.posSelectedPricelistId = parseInt(priceSel.value) || null;
       S.posPricelistManual = true;
@@ -7044,6 +7054,7 @@ function wirePOSEvents() {
     });
     document.querySelectorAll('[data-loyalty-reward]').forEach(btn => {
       btn.addEventListener('click', () => {
+        if (S.posCheckoutUncertain) return;
         S.posPendingOrderId = null;
         const id = Number(btn.dataset.loyaltyReward);
         S.posSelectedRewardId = Number(S.posSelectedRewardId) === id ? null : id;
@@ -7092,7 +7103,7 @@ function wirePOSEvents() {
       });
     }
     const clearBtn = document.getElementById('btn-pos-clear');
-    if (clearBtn) clearBtn.addEventListener('click', () => { S.posCart=[]; posResetPaymentLines(); render(); });
+    if (clearBtn) clearBtn.addEventListener('click', () => { if(S.posCheckoutUncertain)return; S.posPendingOrderId=null;S.posCart=[];posResetPaymentLines();render(); });
   }
 
   if (S.posMobileMoneyModal) {
@@ -7242,6 +7253,7 @@ async function finalizeCharge() {
       loyaltyPointsEarned: Number(result.loyalty_points_earned ?? acceptedQuote?.loyalty?.points_earned ?? 0),
     };
     S.posReceiptVisible = true;
+    S.posCheckoutUncertain = false;
     S.posCart = [];
     posResetPaymentLines();
     S.posMobileMoneyModal = false;
@@ -7252,6 +7264,7 @@ async function finalizeCharge() {
       setTimeout(() => alert(`Credit warning: this customer's balance is now $${Number(w.projected_balance).toFixed(2)}, which is $${Number(w.overage).toFixed(2)} over their $${Number(w.credit_limit).toFixed(2)} limit.`), 50);
     }
   } catch (error) {
+    if (error.simulatedLostResponse) S.posCheckoutUncertain = true;
     S.posMobileMoneyModal = false;
     alert(error.message);
     render();

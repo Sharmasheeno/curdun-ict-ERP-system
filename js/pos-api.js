@@ -2,6 +2,31 @@
 
 const API_BASE = '/api/v1';
 
+// P14.7 development-only response-loss harness. It is inert unless the app
+// runs on localhost AND the URL explicitly contains
+//   ?pos_test_drop=CHECKOUT,REFUND,CASH_IN,CASH_OUT,CUSTOMER_ACCOUNT_PAYMENT
+// The real request and response complete first; the successful response is
+// then withheld from application code exactly once per action/key. Evidence
+// remains in sessionStorage for browser/DB assertions. No production request
+// is ever randomly intercepted.
+function posTestLossConfig() {
+  if (!['localhost','127.0.0.1'].includes(location.hostname)) return new Set();
+  const params=new URLSearchParams(location.search);
+  if (params.get('pos_test_reset')==='1' && !sessionStorage.getItem('pos_test_reset_done')) {
+    sessionStorage.removeItem('pos_idempotency_evidence');
+    sessionStorage.removeItem('pos_dropped_responses');
+    sessionStorage.setItem('pos_test_reset_done','1');
+  }
+  return new Set((params.get('pos_test_drop')||'').split(',').map(v=>v.trim().toUpperCase()).filter(Boolean));
+}
+function posRecordIdempotencyEvidence(action,key,data,dropped) {
+  if (!action || !key) return;
+  let rows=[];try{rows=JSON.parse(sessionStorage.getItem('pos_idempotency_evidence')||'[]');}catch(_){}
+  rows.push({action,key,entity_id:data?.id??null,reference:data?.reference_number??null,idempotent_replay:Boolean(data?.idempotent_replay),dropped:Boolean(dropped),at:new Date().toISOString()});
+  sessionStorage.setItem('pos_idempotency_evidence',JSON.stringify(rows));
+}
+function posIdempotencyEvidence(){try{return JSON.parse(sessionStorage.getItem('pos_idempotency_evidence')||'[]');}catch(_){return[];}}
+
 async function posApiFetch(path, opts = {}) {
   let response;
   try {
@@ -22,7 +47,20 @@ async function posApiFetch(path, opts = {}) {
     error.errors = payload.errors;
     throw error;
   }
-  return Object.prototype.hasOwnProperty.call(payload, 'data') ? payload.data : payload;
+  const data=Object.prototype.hasOwnProperty.call(payload,'data')?payload.data:payload;
+  const action=String(opts.financialAction||'').toUpperCase();
+  const key=opts.body?.idempotency_key||opts.body?.client_order_id||null;
+  const enabled=posTestLossConfig();
+  let dropped=[];try{dropped=JSON.parse(sessionStorage.getItem('pos_dropped_responses')||'[]');}catch(_){}
+  const marker=`${action}:${key}`;
+  const shouldDrop=action&&key&&(enabled.has(action)||enabled.has('ALL'))&&!dropped.includes(marker)&&!data?.idempotent_replay;
+  posRecordIdempotencyEvidence(action,key,data,shouldDrop);
+  if(shouldDrop){
+    dropped.push(marker);sessionStorage.setItem('pos_dropped_responses',JSON.stringify(dropped));
+    const error=new Error("We couldn't confirm the operation. Retry to check the committed transaction.");
+    error.simulatedLostResponse=true;error.financialAction=action;throw error;
+  }
+  return data;
 }
 
 function posRoleName(user) {
@@ -156,7 +194,7 @@ async function posSubmitRefund(orderId, payload, approvalId=null) {
   const slot = `refund:${orderId}:${JSON.stringify(payload.items || [])}`;
   const body = { ...payload, idempotency_key: _idemKey(slot) };
   const headers = approvalId ? { 'X-Manager-Approval-ID': String(approvalId) } : {};
-  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body, headers });
+  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body, headers, financialAction:'REFUND' });
   _clearIdemKey(slot);
   await refreshPOSSessionState();
   await posBootstrap();
@@ -303,7 +341,7 @@ async function posCompleteCheckout(cart, customerId, payments) {
   // remains authoritative and applies customer preference before POS default.
   if (S.posPricelistManual && S.posSelectedPricelistId) body.pricelist_id = S.posSelectedPricelistId;
   if (S.posSelectedRewardId) body.loyalty_reward_id = S.posSelectedRewardId;
-  const data = await posApiFetch('/pos/checkout', { method:'POST', body });
+  const data = await posApiFetch('/pos/checkout', { method:'POST', body, financialAction:'CHECKOUT' });
   const mapped = mapTransaction({ ...data, id:data.id, total_amount:data.total_amount, items_count:cart.reduce((n,item)=>n+item.qty,0), customer_name:POS_CUSTOMERS.find(item=>item.id===customerId)?.name, cashier_name:S.posActiveUser?.name });
   const existing = POS_TRANSACTIONS.findIndex(item => item._backendId === mapped._backendId);
   if (existing >= 0) POS_TRANSACTIONS[existing] = mapped; else POS_TRANSACTIONS.unshift(mapped);
@@ -326,7 +364,7 @@ function _clearIdemKey(slot) { if (S.posPendingKeys) delete S.posPendingKeys[slo
 async function posVoidTransaction(orderId, approvalId=null) {
   const key = _idemKey(`refund:${orderId}`);
   const headers = approvalId ? { 'X-Manager-Approval-ID': String(approvalId) } : {};
-  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body:{ idempotency_key:key, reason:'Full refund from POS' }, headers });
+  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body:{ idempotency_key:key, reason:'Full refund from POS' }, headers, financialAction:'REFUND' });
   _clearIdemKey(`refund:${orderId}`);
   await refreshPOSSessionState();
   await posBootstrap();
@@ -335,7 +373,7 @@ async function posVoidTransaction(orderId, approvalId=null) {
 async function posCollectDebt(id, amount, method='Cash', reference='') {
   const slot = `settlement:${id}:${amount}:${method}:${reference}`;
   const key = _idemKey(slot);
-  const row = await posApiFetch(`/pos/customers/${id}/collect-debt`, { method:'POST', body:{ idempotency_key:key, amount, payment_method:method, reference:reference||null }});
+  const row = await posApiFetch(`/pos/customers/${id}/collect-debt`, { method:'POST', body:{ idempotency_key:key, amount, payment_method:method, reference:reference||null }, financialAction:'CUSTOMER_ACCOUNT_PAYMENT' });
   _clearIdemKey(slot);
   const i = POS_CUSTOMERS.findIndex(item => item.id === Number(id));
   if (i >= 0) POS_CUSTOMERS[i] = mapCustomer(row);
@@ -358,7 +396,7 @@ async function posRecordCashMovement(type, amount, reason, approvalId=null) {
   const slot = `cash:${type}:${amount}:${reason}`;
   const key = _idemKey(slot);
   const headers = approvalId ? { 'X-Manager-Approval-ID': String(approvalId) } : {};
-  const row = await posApiFetch(`/pos/sessions/${S.posSession.id}/cash-movements`, { method:'POST', body:{ idempotency_key:key, type, amount, reason }, headers });
+  const row = await posApiFetch(`/pos/sessions/${S.posSession.id}/cash-movements`, { method:'POST', body:{ idempotency_key:key, type, amount, reason }, headers, financialAction:`CASH_${type}` });
   _clearIdemKey(slot);
   await refreshPOSSessionState();
   return row;

@@ -113,6 +113,20 @@ class ProductService
 
     public function getLowStock(?int $companyId = null): array
     {
-        return $this->productRepository->getLowStock($companyId);
+        $companyId = $companyId ?: (int)(\Core\Auth::user()['company_id'] ?? 0);
+        if ($companyId <= 0) return [];
+        return array_values(array_filter($this->inventoryService->getPosProducts($companyId, true),
+            fn(array $product): bool => $product['stock_status'] === InventoryService::LOW_STOCK));
+    }
+
+    public function getLowStockProducts(int $page = 1, int $limit = 20): array
+    {
+        $rows = $this->getLowStock();
+        $offset = max(0, ($page - 1) * $limit);
+        return [
+            'data' => array_slice($rows, $offset, $limit),
+            'pagination' => ['current_page' => $page, 'per_page' => $limit,
+                'total' => count($rows), 'last_page' => max(1, (int)ceil(count($rows) / max(1, $limit)))],
+        ];
     }
 }

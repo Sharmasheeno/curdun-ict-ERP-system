@@ -74,10 +74,13 @@ function posRoleName(user) {
 
 function mapProduct(product) {
   return {
-    id: Number(product.id), name: product.name, cat: product.category_name || 'General',
+    id: Number(product.id), companyId: Number(product.company_id), name: product.name, cat: product.category_name || 'General',
     price: Number(product.selling_price || 0),
     stock: Number(product.current_stock || 0), barcode: product.barcode || product.sku || '', sku: product.sku || '',
     minimumStock: Number(product.minimum_stock || 0), status: product.status || 'active',
+    stockStatus: product.stock_status || 'NORMAL', needed: Number(product.needed || 0),
+    costValue: Number(product.cost_value || 0), retailValue: Number(product.retail_value || 0),
+    inventoryContext: product.inventory_context || null,
   };
 }
 

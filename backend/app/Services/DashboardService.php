@@ -7,7 +7,8 @@ use Core\Database;
 class DashboardService
 {
     public function __construct(
-        private Database $db
+        private Database $db,
+        private InventoryService $inventory
     ) {}
 
     public function getSummary(?int $companyId = null): array
@@ -65,10 +66,13 @@ class DashboardService
 
     public function getLowStockProducts(?int $companyId = null, int $limit = 10): array
     {
-        $query = "SELECT name, sku, current_stock, minimum_stock FROM products WHERE current_stock <= minimum_stock AND deleted_at IS NULL LIMIT ?";
-        $stmt = $this->db->prepare($query);
-        $stmt->execute([$limit]);
-        return $stmt->fetchAll();
+        if (!$companyId) {
+            $companyId = (int)(\Core\Auth::user()['company_id'] ?? 0);
+        }
+        if ($companyId <= 0) return [];
+        $rows = array_filter($this->inventory->getPosProducts($companyId, true),
+            fn(array $product): bool => $product['stock_status'] === InventoryService::LOW_STOCK);
+        return array_slice(array_values($rows), 0, max(0, $limit));
     }
 
     public function getRecentOrders(?int $companyId = null, int $limit = 10): array

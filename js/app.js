@@ -321,27 +321,16 @@ function initials(name) {
  * Every screen — KPI cards, product table, checkout tile, notifications —
  * must call these helpers so numbers can never contradict each other.
  *
- * A product is:
- *   OUT of stock  when stock <= 0
- *   LOW  in stock when stock > 0 AND stock <= minimum_stock (default min = 5)
- *   OK   otherwise
- *
- * The backend uses `current_stock <= minimum_stock` in
- * ProductRepository::getLowStockProducts and DashboardService — matches.
+ * Inventory status is returned by the backend InventoryService. These helpers
+ * only map that status for presentation; they do not recalculate thresholds.
  */
-function posStockThreshold(product) {
-  const raw = product?.minimumStock ?? product?.minimum_stock ?? 5;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : 5;
-}
 function posIsOutOfStock(product) {
   if (product?.status && product.status !== 'active') return false;
-  return Number(product?.stock ?? product?.current_stock ?? 0) <= 0;
+  return (product?.stockStatus ?? product?.stock_status) === 'OUT_OF_STOCK';
 }
 function posIsLowStock(product) {
   if (product?.status && product.status !== 'active') return false;
-  const stock = Number(product?.stock ?? product?.current_stock ?? 0);
-  return stock > 0 && stock <= posStockThreshold(product);
+  return (product?.stockStatus ?? product?.stock_status) === 'LOW_STOCK';
 }
 function posStockStatus(product) {
   if (posIsOutOfStock(product)) return 'OUT_OF_STOCK';
@@ -5362,7 +5351,7 @@ function renderPOSProducts() {
       <div class="kpi-card light"><div class="kpi-eyebrow">Categories</div><div class="kpi-value">${cats.length}</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Low stock</div><div class="kpi-value trend-warn">${posCountLowStock()}</div><div class="kpi-trend">In stock at or below minimum</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Out of stock</div><div class="kpi-value trend-warn">${posCountOutOfStock()}</div><div class="kpi-trend">Current stock is zero</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Total value</div><div class="kpi-value">$${POS_PRODUCTS.reduce((s,p)=>s+p.price*p.stock,0).toFixed(0)}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Inventory cost value</div><div class="kpi-value">${posMoney(POS_PRODUCTS.reduce((sum,p)=>sum+p.costValue,0))}</div><div class="kpi-trend">At authoritative purchase cost</div></div>
     </div>
     <div class="data-section">
       <div class="section-header-bar">
@@ -6370,7 +6359,7 @@ function posReportConfig(section, data) {
     },
     inventory: {
       title:'Inventory', rows:data.inventory || [],
-      columns:[['sku','SKU'],['name','Product'],['category','Category'],['current_stock','Stock'],['minimum_stock','Minimum'],['purchase_price','Cost',posMoney],['selling_price','Selling Price',posMoney],['retail_value','Stock Value',posMoney],['stock_status','Status']],
+      columns:[['sku','SKU'],['name','Product'],['category_name','Category'],['current_stock','Stock'],['minimum_stock','Minimum'],['purchase_price','Unit Cost',posMoney],['selling_price','Selling Price',posMoney],['cost_value','Inventory Cost Value',posMoney],['retail_value','Projected Retail Value',posMoney],['stock_status','Status']],
     },
     customers: {
       title:'Customers & Debt', rows:data.customers || [],
@@ -6414,7 +6403,7 @@ function renderPOSReports() {
         <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Gross sales</div><div class="kpi-value">${posMoney(summary.gross_sales)}</div><div class="kpi-trend" style="color:#EFEAFB">${Number(summary.completed_orders||0)} completed orders</div></div>
         <div class="kpi-card light"><div class="kpi-eyebrow">Average ticket</div><div class="kpi-value">${posMoney(summary.average_ticket)}</div><div class="kpi-trend">Tax ${posMoney(summary.tax_collected)}</div></div>
         <div class="kpi-card light"><div class="kpi-eyebrow">Outstanding debt</div><div class="kpi-value">${posMoney(summary.outstanding_debt)}</div><div class="kpi-trend">All current customers</div></div>
-        <div class="kpi-card light"><div class="kpi-eyebrow">Inventory value</div><div class="kpi-value">${posMoney(summary.inventory_retail_value)}</div><div class="kpi-trend ${Number(summary.out_of_stock_products)>0?'trend-down':''}">${Number(summary.low_stock_products||0)} low · ${Number(summary.out_of_stock_products||0)} out</div></div>
+        <div class="kpi-card light"><div class="kpi-eyebrow">Inventory cost value</div><div class="kpi-value">${posMoney(summary.inventory_cost_value)}</div><div class="kpi-trend ${Number(summary.out_of_stock_products)>0?'trend-down':''}">${Number(summary.low_stock_products||0)} low · ${Number(summary.out_of_stock_products||0)} out · projected retail ${posMoney(summary.inventory_retail_value)}</div></div>
       </div>
       <div class="data-section pos-report-table">
         <div class="section-header-bar" style="gap:8px;flex-wrap:wrap">
@@ -6459,7 +6448,7 @@ function renderPOSNotifications() {
           <thead><tr><th>Product</th><th>SKU / Barcode</th><th>Current Stock</th><th>Minimum</th><th>Needed</th><th>Severity</th><th>Detected</th><th class="col-right">Actions</th></tr></thead>
           <tbody>
             ${alerts.map(alert=>{
-              const needed=Math.max(0,Number(alert.minimum_stock||0)-Number(alert.current_stock||0)+1);
+              const needed=Number(alert.needed||0);
               const isOut=alert.severity==='out';
               return `<tr style="${Number(alert.unread)?'background:#FFFDF3':''}">
                 <td><div style="font-weight:800">${esc(alert.product_name)}</div>${Number(alert.unread)?'<span class="pill pill-gold" style="margin-top:4px">New</span>':''}</td>
@@ -6480,7 +6469,7 @@ function renderPOSNotifications() {
       </div>
       <div class="pos-stock-alert-mobile-list">
         ${alerts.map(alert=>{
-          const needed=Math.max(0,Number(alert.minimum_stock||0)-Number(alert.current_stock||0)+1);
+          const needed=Number(alert.needed||0);
           const isOut=alert.severity==='out';
           return `<article class="pos-stock-alert-mobile-card">
             <div class="pos-stock-alert-mobile-head">

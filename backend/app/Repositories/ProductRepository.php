@@ -55,17 +55,6 @@ class ProductRepository extends BaseRepository
         return $this->db->query("SELECT * FROM products WHERE barcode = :barcode", ['barcode' => $barcode])->fetch();
     }
 
-    public function getLowStockProducts(?int $companyId = null): array
-    {
-        $sql = "SELECT p.*, c.name as category_name 
-                FROM products p 
-                LEFT JOIN categories c ON p.category_id = c.id 
-                WHERE p.current_stock <= p.minimum_stock 
-                ORDER BY (p.current_stock - p.minimum_stock) ASC";
-                
-        return $this->db->query($sql)->fetchAll();
-    }
-
     public function updateStock(int $productId, float $newQuantity): bool
     {
         return (bool) $this->db->query(

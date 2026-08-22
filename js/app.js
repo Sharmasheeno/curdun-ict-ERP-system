@@ -190,8 +190,12 @@ const S = {
   posPricelists: [],
   posSelectedPricelistId: null,
   posPricelistManual: false,
-  // Loyalty snapshot for the currently selected Deyn customer (P10 endpoint).
+  // Loyalty snapshot for the currently selected order customer (P10 endpoint).
   posCustomerLoyalty: null,
+  posQuote: null,
+  posQuoteLoading: false,
+  posQuoteError: null,
+  posSelectedRewardId: null,
 
   // POS — management reports and stock notifications
   posReportFrom: new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10),
@@ -3296,11 +3300,13 @@ function posAddPaymentLine(name, orderTotal) {
   const line = { method_name: name, method_type: type, amount };
   if (type === 'cash') line.tendered = amount;
   S.posPaymentLines = [...(S.posPaymentLines || []), line];
+  posScheduleQuote();
 }
 
 function posRemovePaymentLine(idx) {
   S.posPendingOrderId = null;
   S.posPaymentLines = (S.posPaymentLines || []).filter((_, i) => i !== idx);
+  posScheduleQuote();
 }
 
 function posUpdatePaymentLine(idx, patch) {
@@ -3315,6 +3321,7 @@ function posUpdatePaymentLine(idx, patch) {
     }
     return next;
   });
+  posScheduleQuote();
 }
 
 // Full allocation check used by the Validate button. Never trust this on
@@ -3341,6 +3348,9 @@ function posResetPaymentLines() {
   S.posPaymentLines = [];
   S.posDebtCustomerId = null;
   S.posCustomerLoyalty = null;
+  S.posQuote = null;
+  S.posQuoteError = null;
+  S.posSelectedRewardId = null;
   S.posPricelistManual = false;
   const defaultPricelist = (S.posPricelists || []).find(p => Number(p.is_default) === 1);
   S.posSelectedPricelistId = defaultPricelist ? Number(defaultPricelist.id) : null;
@@ -4862,14 +4872,15 @@ function renderPOSDash() {
 
 function renderPOSCheckout() {
   const cart = S.posCart;
-  const subtotal = cart.reduce((s,item)=>{ const p = item.isWholesale ? item.wholesalePrice : item.price; return s + p * item.qty; }, 0);
-  const taxRate = Number(S.storeSettings.taxRate || 0);
-  const tax = subtotal * taxRate / 100;
-  const total = Number((subtotal + tax).toFixed(2));
+  const quote = S.posQuote;
+  const quotedLines = new Map((quote?.lines || []).map(line => [Number(line.product_id), line]));
+  const subtotal = quote ? Number(quote.subtotal || 0) : cart.reduce((s,item)=>s+item.price*item.qty,0);
+  const taxRate = quote ? Number(quote.tax_rate || 0) : Number(S.storeSettings.taxRate || 0);
+  const tax = quote ? Number(quote.tax || 0) : subtotal * taxRate / 100;
+  const total = quote ? Number(quote.total || 0) : Number((subtotal + tax).toFixed(2));
   const term = (S.posSearchTerm||'').toLowerCase();
   const filtered = term ? POS_PRODUCTS.filter(p=>p.name.toLowerCase().includes(term)||p.barcode.includes(term)||p.cat.toLowerCase().includes(term)) : POS_PRODUCTS;
   const catEmoji = {Groceries:'\ud83d\uded2',Beverages:'\ud83e\udd64',Household:'\ud83c\udfe0','Personal Care':'\ud83e\uddf4',Snacks:'\ud83c\udf6a',Bakery:'\ud83c\udf5e',Fresh:'\ud83e\udd6c'};
-  const canViewMargin = posCan('viewMargin');
 
   if (S.posReceiptVisible && S.posLastReceipt) return renderPOSReceipt();
 
@@ -4886,6 +4897,7 @@ function renderPOSCheckout() {
   const validation = posPaymentLinesValid(total);
   const canValidate = cart.length > 0
     && S.posSession?.state === 'OPENED'
+    && !!quote && !S.posQuoteLoading && !S.posQuoteError
     && validation.ok;
 
   return `
@@ -4906,7 +4918,7 @@ function renderPOSCheckout() {
               <div class="pos-tile-emoji">${catEmoji[p.cat]||'\ud83d\udce6'}</div>
               <div class="pos-tile-name">${esc(p.name)}</div>
               <div class="pos-tile-price">$${p.price.toFixed(2)}</div>
-              ${canViewMargin && p.wholesalePrice ? `<div class="pos-tile-wholesale">Cost: $${p.wholesalePrice.toFixed(2)}</div>` : `<div class="pos-tile-stock-inline">${p.stock} in stock</div>`}
+              <div class="pos-tile-stock-inline">${p.stock} in stock</div>
               <div class="pos-tile-stock">${p.stock} stock</div>
             </button>
           `).join('')}
@@ -4951,18 +4963,12 @@ function renderPOSCheckout() {
               <div style="font-size:13px;color:rgba(255,255,255,0.4);margin-top:8px">Cart is empty</div>
               <div style="font-size:11px;color:rgba(255,255,255,0.25)">Tap a product to add it</div>
             </div>
-          ` : cart.map((item,i)=>{ const effPrice=item.isWholesale?item.wholesalePrice:item.price; const rowTotal=effPrice*item.qty; return `
+          ` : cart.map((item,i)=>{ const quoted=quotedLines.get(Number(item.id)); const effPrice=Number(quoted?.final_unit_price ?? item.price); const rowTotal=Number(quoted?.line_subtotal ?? effPrice*item.qty); return `
             <div class="pos-cart-row">
               <div class="pos-cart-item-info">
                 <div class="pos-cart-item-name">${esc(item.name)}</div>
-                <div class="pos-cart-item-price">$${effPrice.toFixed(2)}</div>
+                <div class="pos-cart-item-price">$${effPrice.toFixed(2)}${quoted?.applied_rule ? ` · qty ${Number(quoted.applied_rule.min_quantity)}+ rule` : ''}</div>
               </div>
-              ${canViewMargin ? `
-              <div class="pos-wholesale-toggle">
-                <span class="pos-wt-label ${!item.isWholesale?'active':''}">Retail</span>
-                <label class="pos-wt-switch"><input type="checkbox" class="pos-wholesale-cb" data-cart-idx="${i}" ${item.isWholesale?'checked':''}><span class="pos-wt-track"></span></label>
-                <span class="pos-wt-label ${item.isWholesale?'active':''}">Wholesale</span>
-              </div>` : ''}
               <div class="pos-cart-qty">
                 <button class="pos-qty-btn" data-qty-minus="${i}">\u2212</button>
                 <span class="pos-qty-val">${item.qty}</span>
@@ -4992,7 +4998,7 @@ function renderPOSCheckout() {
           ${!posCan('pos.pricelist_select') ? '<span style="font-size:10px;color:rgba(255,255,255,0.5)">MIN — read-only</span>' : ''}
         </div>` : ''}
 
-        <!-- P14 - Loyalty pill (P10). Shows when a Deyn/customer is selected. -->
+        <!-- P14 - Loyalty pill (P10). Shows when an order customer is selected. -->
         ${S.posCustomerLoyalty && S.posCustomerLoyalty.customer ? `
         <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:linear-gradient(90deg,rgba(245,196,17,0.15),rgba(245,196,17,0.05));border:1px solid rgba(245,196,17,0.3);border-radius:6px;margin-bottom:8px">
           <span style="font-size:14px">🎁</span>
@@ -5002,10 +5008,15 @@ function renderPOSCheckout() {
         </div>` : ''}
 
         <div class="pos-cart-summary">
+          ${S.posQuoteLoading ? '<div style="color:#F5C411;font-size:11px;padding-bottom:5px">Updating server price…</div>' : ''}
+          ${S.posQuoteError ? `<div style="color:#EF4444;font-size:11px;padding-bottom:5px">${esc(S.posQuoteError)}</div>` : ''}
           <div class="pos-summary-row"><span>Subtotal</span><span>$${subtotal.toFixed(2)}</span></div>
+          ${Number(quote?.discounts?.loyalty||0)>0 ? `<div class="pos-summary-row"><span>Loyalty reward</span><span>−$${Number(quote.discounts.loyalty).toFixed(2)}</span></div>` : ''}
           ${taxRate > 0 ? `<div class="pos-summary-row"><span>Tax (${taxRate}%)</span><span>$${tax.toFixed(2)}</span></div>` : ''}
           <div class="pos-summary-row pos-summary-total"><span>TOTAL</span><span>$${total.toFixed(2)}</span></div>
         </div>
+
+        ${(quote?.warnings || []).map(w => `<div class="${w.severity==='error'?'pos-deyn-warning':'pos-deyn-warning'}" style="margin-bottom:6px">⚠ ${esc(w.message)}</div>`).join('')}
 
         <div class="pos-payment-methods">
           <!-- Odoo-shaped split-payment composer (P3 Stage B). Total / Paid / Remaining
@@ -6748,16 +6759,17 @@ function wirePOSEvents() {
         const existing = S.posCart.find(item=>item.id===id);
         if (existing) { existing.qty++; }
         else { S.posCart.push({ id:prod.id, name:prod.name, price:prod.price, wholesalePrice:prod.wholesalePrice, qty:1, isWholesale:false }); }
+        posScheduleQuote();
         render();
       });
     });
 
     document.querySelectorAll('.pos-wholesale-cb').forEach(cb => {
-      cb.addEventListener('change', () => { S.posPendingOrderId = null; S.posCart[parseInt(cb.dataset.cartIdx)].isWholesale = cb.checked; render(); });
+      cb.addEventListener('change', () => { S.posPendingOrderId = null; S.posCart[parseInt(cb.dataset.cartIdx)].isWholesale = cb.checked; posScheduleQuote(); render(); });
     });
 
     document.querySelectorAll('[data-qty-plus]').forEach(btn => {
-      btn.addEventListener('click', () => { S.posPendingOrderId = null; S.posCart[parseInt(btn.dataset.qtyPlus)].qty++; render(); });
+      btn.addEventListener('click', () => { S.posPendingOrderId = null; S.posCart[parseInt(btn.dataset.qtyPlus)].qty++; posScheduleQuote(); render(); });
     });
     document.querySelectorAll('[data-qty-minus]').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -6765,11 +6777,12 @@ function wirePOSEvents() {
         const i = parseInt(btn.dataset.qtyMinus);
         if (S.posCart[i].qty > 1) S.posCart[i].qty--;
         else S.posCart.splice(i, 1);
+        posScheduleQuote();
         render();
       });
     });
     document.querySelectorAll('[data-remove-item]').forEach(btn => {
-      btn.addEventListener('click', () => { S.posPendingOrderId = null; S.posCart.splice(parseInt(btn.dataset.removeItem), 1); render(); });
+      btn.addEventListener('click', () => { S.posPendingOrderId = null; S.posCart.splice(parseInt(btn.dataset.removeItem), 1); posScheduleQuote(); render(); });
     });
     document.querySelectorAll('[data-pos-cat]').forEach(btn => {
       btn.addEventListener('click', () => { S.posSearchTerm = btn.dataset.posCat==='All'?'':btn.dataset.posCat; render(); });
@@ -6777,9 +6790,7 @@ function wirePOSEvents() {
     // ---- Odoo-style split-payment composer wiring (P3 Stage B) ----
     // Compute total for helpers that need it.
     const _payTotal = (() => {
-      const _sub = S.posCart.reduce((s,item)=>{ const p = item.isWholesale?item.wholesalePrice:item.price; return s + p*item.qty; }, 0);
-      const _tax = _sub * Number(S.storeSettings.taxRate||0) / 100;
-      return Number((_sub + _tax).toFixed(2));
+      return S.posQuote ? Number(S.posQuote.total || 0) : 0;
     })();
     // Add-line buttons — push a new line for the given method with amount
     // defaulted to the remaining unallocated.
@@ -6822,8 +6833,8 @@ function wirePOSEvents() {
         render();
       });
     });
-    // Deyn customer selector (order-level — one customer per order regardless
-    // of how many Deyn lines exist).
+    // Order-level customer selector. The same customer is used for optional
+    // loyalty, preferred pricing, and Customer Account payment lines.
     const deynSel = document.getElementById('pos-deyn-customer');
     if (deynSel) deynSel.addEventListener('change', async () => {
       S.posPendingOrderId = null;
@@ -6835,6 +6846,7 @@ function wirePOSEvents() {
       // P14 - refresh loyalty pill for the newly-picked customer.
       if (S.posDebtCustomerId) { try { await posLoadCustomerLoyalty(S.posDebtCustomerId); } catch (_) {} }
       else S.posCustomerLoyalty = null;
+      posScheduleQuote(0);
       render();
     });
     // P14 - Pricelist selector (P9). Only enabled for pos.pricelist_select.
@@ -6843,6 +6855,7 @@ function wirePOSEvents() {
       S.posPendingOrderId = null;
       S.posSelectedPricelistId = parseInt(priceSel.value) || null;
       S.posPricelistManual = true;
+      posScheduleQuote(0);
       render();
     });
 
@@ -6865,6 +6878,7 @@ function wirePOSEvents() {
         S.posDebtCustomerId = held.customer || null;
         S.posPaymentLines = Array.isArray(held.payment_lines) ? [...held.payment_lines] : [];
         S.posCashTendered = '';
+        posScheduleQuote(0);
         S.posHeldOrders.splice(idx, 1); S.posShowHeld = false; render();
       });
     });
@@ -6995,9 +7009,9 @@ async function finalizeCharge() {
     render(); return;
   }
   const cart = S.posCart.map(item => ({ ...item }));
-  const subtotal = S.posCart.reduce((s,item)=>{ const p=item.isWholesale?item.wholesalePrice:item.price; return s+p*item.qty; }, 0);
-  const tax = subtotal * (Number(S.storeSettings.taxRate || 0) / 100);
-  const total = Number((subtotal + tax).toFixed(2));
+  const subtotal = Number(S.posQuote?.subtotal || 0);
+  const tax = Number(S.posQuote?.tax || 0);
+  const total = Number(S.posQuote?.total || 0);
   // Front-side validation gate (backend re-validates every line).
   const check = posPaymentLinesValid(total);
   if (!check.ok) { alert(check.reason); render(); return; }

@@ -80,13 +80,58 @@ async function posLoadPricelists() {
   } catch (_) { S.posPricelists = []; return []; }
 }
 
-// P14 - Load loyalty snapshot for the selected Deyn customer (P10 endpoint).
+// P14 - Load loyalty snapshot for the selected order customer (P10 endpoint).
 async function posLoadCustomerLoyalty(customerId) {
   if (!customerId) { S.posCustomerLoyalty = null; return null; }
   try {
     S.posCustomerLoyalty = await posApiFetch(`/pos/customers/${customerId}/loyalty`);
     return S.posCustomerLoyalty;
   } catch (_) { S.posCustomerLoyalty = null; return null; }
+}
+
+// P14.2 — authoritative live cart quote. A monotonically increasing request
+// number prevents a slow response for qty 9 from overwriting the newer qty 10
+// response. The endpoint accepts no client price fields.
+let _posQuoteTimer = null;
+let _posQuoteRequest = 0;
+function posScheduleQuote(delay = 120) {
+  clearTimeout(_posQuoteTimer);
+  S.posQuoteLoading = true;
+  S.posQuoteError = null;
+  const requestNo = ++_posQuoteRequest;
+  _posQuoteTimer = setTimeout(async () => {
+    const body = {
+      customer_id: S.posDebtCustomerId || null,
+      items: (S.posCart || []).map(item => ({
+        product_id: item.id,
+        quantity: item.qty,
+        discount_percent: Number(item.discountPercent || 0),
+      })),
+      payments: (S.posPaymentLines || []).map(line => ({
+        method: line.method_name,
+        method_type: line.method_type,
+        amount: Number(line.amount || 0),
+      })),
+    };
+    if (S.posPricelistManual && S.posSelectedPricelistId) body.pricelist_id = S.posSelectedPricelistId;
+    if (S.posSelectedRewardId) body.loyalty_reward_id = S.posSelectedRewardId;
+    try {
+      const quote = await posApiFetch('/pos/quote', { method:'POST', body });
+      if (requestNo !== _posQuoteRequest) return;
+      S.posQuote = quote;
+      S.posQuoteError = null;
+      if (!S.posPricelistManual && quote.pricelist?.id) S.posSelectedPricelistId = Number(quote.pricelist.id);
+    } catch (error) {
+      if (requestNo !== _posQuoteRequest) return;
+      S.posQuote = null;
+      S.posQuoteError = error.message;
+    } finally {
+      if (requestNo === _posQuoteRequest) {
+        S.posQuoteLoading = false;
+        if (typeof render === 'function') render();
+      }
+    }
+  }, delay);
 }
 
 async function posLoadRefundable(orderId) {
@@ -159,6 +204,7 @@ async function posBootstrap() {
     // P14 - fetch pricelists alongside bootstrap so the Checkout composer can
     // render the selector without a second wait.
     try { await posLoadPricelists(); } catch (_) {}
+    if ((S.posCart || []).length) posScheduleQuote(0);
     return data;
   }
   finally { S._posLoading.bootstrap = false; if (typeof render === 'function') render(); }
@@ -238,7 +284,7 @@ async function posCompleteCheckout(cart, customerId, payments) {
     client_order_id: S.posPendingOrderId,
     customer_id: customerId || null,
     payments: lines,
-    items: cart.map(item => ({ product_id:item.id, quantity:item.qty, wholesale:Boolean(item.isWholesale), discount_percent:Number(item.discountPercent||0) })),
+    items: cart.map(item => ({ product_id:item.id, quantity:item.qty, discount_percent:Number(item.discountPercent||0) })),
   };
   // P14 - Pass the selected pricelist (P9 backend). Null means "use POS default".
   // Only an explicit cashier choice is sent. In automatic mode the backend

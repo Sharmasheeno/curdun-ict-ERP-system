@@ -87,6 +87,9 @@ $router->group('/api/v1', function($router) {
     //
     // Odoo MINIMAL — selling, receive payments, validate orders.
     $router->post('/pos/checkout',                       [PosController::class, 'checkout'],       [$NEEDS_CASHIER(), $CAP('pos.sell','pos.order_validate')]);
+    // Side-effect-free, server-authoritative cart pricing. It intentionally
+    // uses the same pricing helpers as checkout and never accepts client prices.
+    $router->post('/pos/quote',                          [PosController::class, 'quote'],          [$NEEDS_CASHIER(), $CAP('pos.sell')]);
     // Debt collection is a payment on the customer account; Odoo binds this
     // to BASIC (customer account operations).
     $router->post('/pos/customers/{id}/collect-debt',    [PosController::class, 'collectDebt'],    [$NEEDS_CASHIER(), $CAP('pos.payment_receive')]);

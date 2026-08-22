@@ -1189,6 +1189,9 @@ class PosService
             //  3. Otherwise: fall back to the POS default pricelist.
             //  4. Otherwise (no pricelists configured): NULL — use base prices.
             $requestedPricelistId = isset($data['pricelist_id']) ? (int)$data['pricelist_id'] : 0;
+            if ($requestedPricelistId > 0 && !PosAccess::can('pos.pricelist_select')) {
+                throw new Exception('Your POS access level cannot manually select a pricelist.', 403);
+            }
             $activePricelist = $this->resolvePricelistForOrder(
                 $companyId,
                 (int)$config['id'],
@@ -1546,6 +1549,163 @@ class PosService
         if (!empty($creditWarning)) $response['credit_warning'] = $creditWarning;
         $this->idemComplete($companyId, 'CHECKOUT', $clientUuid, $response);
         return $response;
+    }
+
+    /**
+     * P14.2 — side-effect-free authoritative cart quotation.
+     *
+     * The browser sends identity and quantities only. Product prices,
+     * pricelist rules, discounts, loyalty and warnings are all recomputed
+     * from tenant-scoped database state. No stock rows are mutated or locked.
+     */
+    public function quote(array $data): array
+    {
+        [$user, $companyId] = $this->context();
+        $items = $data['items'] ?? [];
+        if (!is_array($items)) throw new Exception('Quote items must be an array.', 422);
+
+        $customerId = !empty($data['customer_id']) ? (int)$data['customer_id'] : null;
+        $customer = $customerId ? $this->customer($customerId, $companyId) : null;
+        $config = $this->resolveConfig($companyId, isset($user['branch_id']) ? (int)$user['branch_id'] : null);
+        $requestedPricelistId = isset($data['pricelist_id']) ? (int)$data['pricelist_id'] : 0;
+        if ($requestedPricelistId > 0 && !PosAccess::can('pos.pricelist_select')) {
+            throw new Exception('Your POS access level cannot manually select a pricelist.', 403);
+        }
+        $pricelist = $this->resolvePricelistForOrder(
+            $companyId, (int)$config['id'], $requestedPricelistId, $customerId,
+            $data['pricelist_id'] ?? null
+        );
+
+        $lines = [];
+        $subtotal = 0.0;
+        $manualDiscountTotal = 0.0;
+        $warnings = [];
+        foreach ($items as $item) {
+            $productId = (int)($item['product_id'] ?? $item['id'] ?? 0);
+            $qty = (float)($item['quantity'] ?? $item['qty'] ?? 0);
+            if ($productId <= 0 || $qty <= 0) throw new Exception('Invalid quote item.', 422);
+            $product = $this->db->query(
+                "SELECT * FROM products WHERE id=:id AND company_id=:company AND deleted_at IS NULL",
+                ['id'=>$productId, 'company'=>$companyId]
+            )->fetch();
+            if (!$product) throw new Exception('A product was not found.', 404);
+
+            $price = $this->resolveUnitPrice($product, $qty, $pricelist, date('Y-m-d'));
+            $manualPct = max(0.0, min(100.0, (float)($item['discount_percent'] ?? 0)));
+            $beforeManual = round($price['unit_price'] * $qty, 2);
+            $manualAmount = round($beforeManual * $manualPct / 100, 2);
+            $lineSubtotal = round($beforeManual - $manualAmount, 2);
+            $subtotal += $lineSubtotal;
+            $manualDiscountTotal += $manualAmount;
+            if ((float)$product['current_stock'] < $qty) {
+                $warnings[] = [
+                    'code'=>'INSUFFICIENT_STOCK', 'severity'=>'error',
+                    'product_id'=>$productId,
+                    'message'=>"Insufficient stock for {$product['name']}.",
+                ];
+            }
+            $lines[] = [
+                'product_id'       => $productId,
+                'product_name'     => $product['name'],
+                'qty'              => $qty,
+                'base_price'       => $price['base_price'],
+                'pricelist_price'  => $price['pricelist_price'],
+                'applied_rule'     => $price['applied_rule'] ?? null,
+                'loyalty_discount' => 0.0,
+                'manual_discount'  => $manualAmount,
+                'manual_discount_percent' => $manualPct,
+                'final_unit_price' => $price['unit_price'],
+                'line_subtotal'    => $lineSubtotal,
+                'available_stock'  => (float)$product['current_stock'],
+            ];
+        }
+
+        $subtotal = round($subtotal, 2);
+        $taxRate = (float)$this->settingValue($companyId, 'pos.tax_rate', 5);
+        $tax = round($subtotal * $taxRate / 100, 2);
+        $beforeReward = round($subtotal + $tax, 2);
+
+        $program = null;
+        $eligibleRewards = [];
+        $currentPoints = $customer ? round((float)($customer['loyalty_points'] ?? 0), 2) : 0.0;
+        if ($customer) {
+            $program = $this->db->query(
+                "SELECT * FROM pos_loyalty_programs
+                 WHERE company_id=:company AND active=1 AND program_type='LOYALTY'
+                   AND (start_date IS NULL OR start_date<=CURDATE())
+                   AND (end_date IS NULL OR end_date>=CURDATE())
+                 ORDER BY id LIMIT 1",
+                ['company'=>$companyId]
+            )->fetch() ?: null;
+            if ($program) {
+                $rewards = $this->db->query(
+                    "SELECT id,name,reward_type,points_cost,discount_percent,discount_amount,reward_product_id,`sequence`
+                     FROM pos_loyalty_rewards WHERE program_id=:program AND active=1
+                     ORDER BY `sequence`,id",
+                    ['program'=>$program['id']]
+                )->fetchAll();
+                $eligibleRewards = array_values(array_filter($rewards, fn($r) => (float)$r['points_cost'] <= $currentPoints + 0.0001));
+            }
+        }
+
+        $reward = null;
+        $loyaltyDiscount = 0.0;
+        $redeemedPoints = 0.0;
+        if (!empty($data['loyalty_reward_id'])) {
+            if (!$customer) throw new Exception('Select a customer before applying a loyalty reward.', 422);
+            if (!PosAccess::can('pos.loyalty_operate')) throw new Exception('Your POS access level cannot apply loyalty rewards.', 403);
+            foreach ($eligibleRewards as $candidate) {
+                if ((int)$candidate['id'] === (int)$data['loyalty_reward_id']) { $reward = $candidate; break; }
+            }
+            if (!$reward) throw new Exception('Loyalty reward is not currently eligible.', 422);
+            $redeemedPoints = round((float)$reward['points_cost'], 2);
+            if ($reward['reward_type'] === 'discount_amount') $loyaltyDiscount = round((float)$reward['discount_amount'], 2);
+            elseif ($reward['reward_type'] === 'discount_percent') $loyaltyDiscount = round($beforeReward * (float)$reward['discount_percent'] / 100, 2);
+            $loyaltyDiscount = min($loyaltyDiscount, $beforeReward);
+        }
+        $total = round($beforeReward - $loyaltyDiscount, 2);
+        $pointsEarned = ($program && $total >= (float)$program['minimum_purchase'])
+            ? round($total * (float)$program['points_per_currency'], 2) : 0.0;
+
+        $debtAmount = 0.0;
+        foreach (($data['payments'] ?? []) as $payment) {
+            if (empty($payment['method'])) continue;
+            $method = $this->paymentMethod((string)$payment['method']);
+            $this->assertPaymentEnabled($companyId, $method['name'], (int)$config['id']);
+            if ($method['type'] === 'credit' || !empty($method['identify_customer'])) {
+                $debtAmount += max(0, (float)($payment['amount'] ?? 0));
+            }
+        }
+        if ($customer && $debtAmount > 0) {
+            $projected = round((float)$customer['balance'] + $debtAmount, 2);
+            $limit = round((float)$customer['credit_limit'], 2);
+            if ($limit > 0 && $projected > $limit) $warnings[] = [
+                'code'=>'CREDIT_LIMIT', 'severity'=>'warning', 'mode'=>'warn',
+                'current_balance'=>round((float)$customer['balance'],2), 'new_credit'=>round($debtAmount,2),
+                'projected_balance'=>$projected, 'credit_limit'=>$limit,
+                'message'=>'This sale exceeds the customer credit limit.',
+            ];
+        }
+
+        return [
+            'customer'=>$customer ? ['id'=>(int)$customer['id'],'name'=>$customer['name']] : null,
+            'pricelist'=>$pricelist ? ['id'=>(int)$pricelist['id'],'name'=>$pricelist['name']] : null,
+            'lines'=>$lines,
+            'subtotal'=>$subtotal,
+            'tax_rate'=>$taxRate,
+            'tax'=>$tax,
+            'discounts'=>['manual'=>round($manualDiscountTotal,2),'loyalty'=>$loyaltyDiscount,'total'=>round($manualDiscountTotal+$loyaltyDiscount,2)],
+            'total'=>$total,
+            'loyalty'=>[
+                'current_points'=>$currentPoints,
+                'eligible_rewards'=>$eligibleRewards,
+                'selected_reward'=>$reward,
+                'redeemed_points'=>$redeemedPoints,
+                'points_earned'=>$pointsEarned,
+                'projected_points'=>round($currentPoints-$redeemedPoints+$pointsEarned,2),
+            ],
+            'warnings'=>$warnings,
+        ];
     }
 
     /**
@@ -1960,7 +2120,7 @@ class PosService
     {
         $base = round((float)$product['selling_price'], 2);
         if (!$pricelist) {
-            return ['unit_price' => $base, 'base_price' => $base, 'pricelist_price' => $base, 'pricelist_item_id' => null];
+            return ['unit_price' => $base, 'base_price' => $base, 'pricelist_price' => $base, 'pricelist_item_id' => null, 'applied_rule' => null];
         }
         $item = $this->db->query(
             "SELECT *,
@@ -1989,7 +2149,7 @@ class PosService
         )->fetch();
 
         if (!$item) {
-            return ['unit_price' => $base, 'base_price' => $base, 'pricelist_price' => $base, 'pricelist_item_id' => null];
+            return ['unit_price' => $base, 'base_price' => $base, 'pricelist_price' => $base, 'pricelist_item_id' => null, 'applied_rule' => null];
         }
         $pricelistPrice = $base;
         if ($item['price_type'] === 'fixed' && $item['fixed_price'] !== null) {
@@ -2003,6 +2163,12 @@ class PosService
             'base_price'         => $base,
             'pricelist_price'    => $pricelistPrice,
             'pricelist_item_id'  => (int)$item['id'],
+            'applied_rule'       => [
+                'id'            => (int)$item['id'],
+                'applies_to'    => $item['applies_to'],
+                'price_type'    => $item['price_type'],
+                'min_quantity'  => (float)$item['min_quantity'],
+            ],
         ];
     }
 

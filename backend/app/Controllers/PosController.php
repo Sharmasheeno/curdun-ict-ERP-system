@@ -26,6 +26,7 @@ class PosController extends BaseController
     public function refundOrder(Request $r,int $id): void { Response::created('Refund completed.',$this->pos->refundOrder($id,$r->getBody())); }
     public function refundable(Request $r,int $id): void { Response::success('Refundable summary retrieved.',$this->pos->refundable($id)); }
     public function checkout(Request $r): void { Response::created('Checkout completed.',$this->pos->checkout($r->getBody())); }
+    public function quote(Request $r): void { Response::success('POS cart quoted.',$this->pos->quote($r->getBody())); }
     public function collectDebt(Request $r,int $id): void { Response::success('Customer Account settlement recorded.',$this->pos->collectDebt($id,$r->getBody())); }
     public function customerLedger(Request $r,int $id): void { Response::success('Customer Account ledger retrieved.',$this->pos->customerLedger($id)); }
     public function pricelists(Request $r): void { Response::success('Pricelists retrieved.',$this->pos->pricelists()); }

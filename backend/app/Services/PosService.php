@@ -228,7 +228,11 @@ class PosService
 
     public function stockAlerts(): array
     {
-        [$user,$companyId]=$this->context(true);return $this->stockAlertsData($companyId,(int)$user['id']);
+        // P11 Rule #52 — Stock alerts must be readable by every level so the
+        // cross-screen "one canonical rule" invariant holds (Dashboard,
+        // Products, Alerts, Reports all agree). Odoo 19 puts POS reports at
+        // MINIMAL; the same principle applies here to a read-only alert list.
+        [$user,$companyId]=$this->context();return $this->stockAlertsData($companyId,(int)$user['id']);
     }
 
     public function markStockAlertRead(int $id): void
@@ -1171,6 +1175,27 @@ class PosService
                 }
             }
 
+            // P11 Rule #10 — AGGREGATE per-product quantity across all lines
+            // BEFORE the row-lock loop, so two lines of qty 3 on a stock=5
+            // product get rejected up front instead of silently over-selling.
+            $aggregatedQty = [];
+            foreach ($items as $it) {
+                $pid = (int)($it['product_id'] ?? $it['id'] ?? 0);
+                $q   = (float)($it['quantity'] ?? $it['qty'] ?? 0);
+                if ($pid <= 0 || $q <= 0) throw new Exception('Invalid checkout item.', 422);
+                $aggregatedQty[$pid] = ($aggregatedQty[$pid] ?? 0) + $q;
+            }
+            foreach ($aggregatedQty as $pid => $totalQty) {
+                $probe = $this->db->query(
+                    "SELECT name, current_stock FROM products
+                     WHERE id = :id AND company_id = :company AND deleted_at IS NULL",
+                    ['id' => $pid, 'company' => $companyId]
+                )->fetch();
+                if (!$probe) throw new Exception('A product was not found.', 404);
+                if ((float)$probe['current_stock'] < $totalQty) {
+                    throw new Exception("Insufficient stock for {$probe['name']}.", 409);
+                }
+            }
             $subtotal=0;$normalized=[];
             foreach($items as $item){
                 $productId=(int)($item['product_id']??$item['id']??0);$qty=(float)($item['quantity']??$item['qty']??0);
@@ -1356,8 +1381,14 @@ class PosService
                 // per line so refund/receipt/report can render Rule #10-safe
                 // historical pricing regardless of later pricelist edits.
                 $this->db->query("INSERT INTO order_items (order_id,line_uuid,product_id,quantity,unit_price,base_price,pricelist_price,pricelist_item_id,discount,discount_percent,tax_rate,tax_amount,total) VALUES (:order,:uuid,:product,:quantity,:price,:base_price,:pricelist_price,:pricelist_item_id,:discount_amount,:discount,:rate,:tax,:total)",['order'=>$orderId,'uuid'=>$this->uuid(),'product'=>$p['id'],'quantity'=>$line['quantity'],'price'=>$line['unit_price'],'base_price'=>$line['base_price'],'pricelist_price'=>$line['pricelist_price'],'pricelist_item_id'=>$line['pricelist_item_id'],'discount_amount'=>round($line['unit_price']*$line['quantity']-$line['subtotal'],2),'discount'=>$line['discount_percent'],'rate'=>$line['tax_rate'],'tax'=>$line['tax'],'total'=>$line['total']]);
-                $this->db->query("UPDATE products SET current_stock=:stock WHERE id=:id",['stock'=>$after,'id'=>$p['id']]);
-                $this->db->query("INSERT INTO stock_movements (product_id,warehouse_id,user_id,reference_type,reference_id,type,quantity,quantity_before,quantity_after,notes) VALUES (:product,:warehouse,:user,'POS_ORDER',:reference,'SALE',:quantity,:before,:after,'Retail POS sale')",['product'=>$p['id'],'warehouse'=>$data['warehouse_id']??null,'user'=>$user['id'],'reference'=>$orderId,'quantity'=>-$line['quantity'],'before'=>$p['current_stock'],'after'=>$after]);
+                // P11 Rule #10 — Use a RELATIVE UPDATE so two lines of the
+                // same product decrement from the live DB value, not from a
+                // stale $p['current_stock'] captured earlier. Then re-read
+                // the actual after-value for the stock_movements row.
+                $this->db->query("UPDATE products SET current_stock = current_stock - :qty WHERE id=:id",['qty'=>$line['quantity'],'id'=>$p['id']]);
+                $liveAfter = (float)$this->db->query("SELECT current_stock FROM products WHERE id=:id",['id'=>$p['id']])->fetchColumn();
+                $liveBefore = $liveAfter + (float)$line['quantity'];
+                $this->db->query("INSERT INTO stock_movements (product_id,warehouse_id,user_id,reference_type,reference_id,type,quantity,quantity_before,quantity_after,notes) VALUES (:product,:warehouse,:user,'POS_ORDER',:reference,'SALE',:quantity,:before,:after,'Retail POS sale')",['product'=>$p['id'],'warehouse'=>$data['warehouse_id']??null,'user'=>$user['id'],'reference'=>$orderId,'quantity'=>-$line['quantity'],'before'=>$liveBefore,'after'=>$liveAfter]);
             }
             foreach($payments as $paymentLine){
                 $payment=$paymentLine['method'];

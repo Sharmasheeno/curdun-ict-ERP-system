@@ -6384,6 +6384,8 @@ function wirePOSLoginEvents() {
   document.getElementById('btn-exit-pos-station')?.addEventListener('click',()=>{S.view='login';S.posAuthError='';render();});
   // --- Staff mode: card selection ---
   document.querySelectorAll('[data-login-id]').forEach(btn => {
+    if (btn.dataset.loginWired === '1') return;
+    btn.dataset.loginWired = '1';
     btn.addEventListener('click', () => {
       S._loginSelectedId = parseInt(btn.dataset.loginId);
       S.posLoginPin = '';
@@ -6470,6 +6472,8 @@ function wirePOSLoginEvents() {
 
   // --- Numpad (staff mode) ---
   document.querySelectorAll('.numpad-key:not(.numpad-key-empty)').forEach(btn => {
+    if (btn.dataset.pinWired === '1') return;
+    btn.dataset.pinWired = '1';
     btn.addEventListener('click', async () => {
       const k = btn.dataset.key;
       if (k === '\u232b') {

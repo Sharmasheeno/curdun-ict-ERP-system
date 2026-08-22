@@ -3993,6 +3993,8 @@ function renderPOSTopNav() {
   const canOpenSettings = posCan('settings')     === true;
   const canReports      = posCan('viewMargin')   === true; // reports leak margin — same gate
 
+  const canControlRegister = isOpen ? posCan('closeRegister') : posCan('openRegister');
+
   const navItem = (key, label, hasChild) => {
     const menuTabs = { orders:['orders','sessions','payments','customers'], products:['products','categories','combos'], reporting:['reports-orders','reports-sales','reports-session','reports-stock'], configuration:['config-settings','config-payments','config-staff','config-currencies','config-audit'] };
     const active = menuTabs[key]?.includes(tab) || tab === key;
@@ -4048,9 +4050,10 @@ function renderPOSTopNav() {
     <div class="pos-topnav-right">
       ${notifCount > 0 ? `<button class="pos-topnav-notif" data-nav-direct="reports-stock" title="Stock alerts">${notifCount}</button>` : ''}
       <span class="pill ${isOpen?'pill-green':'pill-red'}" style="font-size:11px">${isOpen?'● Register open':'● Register closed'}</span>
-      <button class="btn btn-gold btn-sm" id="btn-open-session" style="font-size:12px;padding:7px 14px">
+      ${canControlRegister ? `<button class="btn btn-gold btn-sm" id="btn-open-session" style="font-size:12px;padding:7px 14px">
         ${isOpen ? 'Close Register' : 'Open Register →'}
       </button>
+      ` : ''}
       <div class="pos-topnav-user" id="btn-topnav-user">
         <div class="avatar" style="width:28px;height:28px;font-size:11px;background:#7A5FB8;color:#fff">${initials(u?.name||'')}</div>
         <span style="font-size:13px">${esc(u?.name||'')}</span>
@@ -4938,7 +4941,7 @@ function renderPOSCheckout() {
     && validation.ok;
 
   return `
-    ${S.posSession?.state==='OPENED' ? `<div class="cashier-shift-banner" style="margin-bottom:12px"><span>🟢 Register #${S.posSession.id} open · ${esc(S.posSession.config_name||S.posConfig?.name||'Main Register')}</span><span class="shift-duration-badge">Expected $${Number(S.posSessionSummary?.expected_cash||S.posSession.opening_cash||0).toFixed(2)}</span></div>` : `<div class="cashier-shift-banner cashier-shift-idle" style="margin-bottom:12px;display:flex;align-items:center"><span style="flex:1">🔒 Register closed — open it before validating an order</span><button class="btn btn-primary btn-sm" id="btn-checkout-open-register">Open register</button></div>`}
+    ${S.posSession?.state==='OPENED' ? `<div class="cashier-shift-banner" style="margin-bottom:12px"><span>🟢 Register #${S.posSession.id} open · ${esc(S.posSession.config_name||S.posConfig?.name||'Main Register')}</span><span class="shift-duration-badge">Expected $${Number(S.posSessionSummary?.expected_cash||S.posSession.opening_cash||0).toFixed(2)}</span></div>` : `<div class="cashier-shift-banner cashier-shift-idle" style="margin-bottom:12px;display:flex;align-items:center"><span style="flex:1">🔒 Register closed — ${posCan('openRegister')?'open it before validating an order':'a Senior Cashier or higher must open it'}</span>${posCan('openRegister')?'<button class="btn btn-primary btn-sm" id="btn-checkout-open-register">Open register</button>':''}</div>`}
     ${S.posCheckoutUncertain ? `<div class="pos-deyn-warning" style="margin-bottom:10px"><strong>We couldn't confirm the sale.</strong> Retry Validate to check the committed transaction. Cart, customer, pricing, reward and payments stay locked until the retry succeeds.</div>` : ''}
     <div class="pos-checkout-layout">
       <div class="pos-product-panel">

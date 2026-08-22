@@ -2121,5 +2121,61 @@ class PosService
         $this->log($user,$companyId,'SETTINGS_UPDATE',null,$data);return $this->settingsData($companyId);
     }
     private function settingValue(int $companyId,string $key,mixed $default): mixed{$row=$this->db->query("SELECT value FROM settings WHERE company_id=:company AND `key`=:key",['company'=>$companyId,'key'=>$key])->fetch();return $row?$row['value']:$default;}
-    private function log(array $user,int $companyId,string $action,?int $recordId,array $values): void{$this->audit->create(['user_id'=>$user['id'],'company_id'=>$companyId,'module'=>'POS','action'=>$action,'record_id'=>$recordId,'new_values'=>$values,'created_at'=>date('Y-m-d H:i:s')]);}
+    /**
+     * P12 - Canonical POS audit writer. Preserves DUAL IDENTITY (Rule #18):
+     *   account_user   the browser/ERP account (Ahmed the Admin)
+     *   pos_cashier    the employee PINned in (Nimco)
+     * user_id on the row stays stamped with the ACTING party (cashier when
+     * present, account otherwise) so existing queries keep working, but the
+     * new_values metadata now always carries both identities and a canonical
+     * action alongside any legacy shape.
+     *
+     * Sensitive values (PINs, tokens, passwords, session cookies) MUST NOT
+     * appear in $values. Callers are responsible for filtering; this method
+     * additionally strips a small set of known-sensitive keys defensively.
+     */
+    private function log(array $user, int $companyId, string $action, ?int $recordId, array $values): void
+    {
+        $accountUser = \Core\Auth::user();
+        $cashier     = \Core\Auth::posCashier();
+        $meta = $values;
+        // Defensive sanitization - never leak these into audit metadata.
+        foreach (['pin', 'password', 'token', 'approval_token', 'session_cookie', 'auth_token', 'secret', 'api_key'] as $k) {
+            if (array_key_exists($k, $meta)) unset($meta[$k]);
+        }
+        $meta['actor'] = [
+            'account_user_id'   => $accountUser ? (int)$accountUser['id'] : null,
+            'account_user_name' => $accountUser['name'] ?? null,
+            'pos_cashier_id'    => $cashier ? (int)$cashier['id'] : null,
+            'pos_cashier_name'  => $cashier['name'] ?? null,
+        ];
+        // Canonical action names for the P12 vocabulary. Historical action tag
+        // (whatever the caller passed) stays for backward-compat queries.
+        static $canonical = [
+            'CHECKOUT'      => 'ORDER_VALIDATE',
+            'SESSION_OPEN'  => 'REGISTER_OPEN',
+            'SESSION_CLOSE' => 'REGISTER_CLOSE',
+            'CASH_IN'       => 'CASH_IN',
+            'CASH_OUT'      => 'CASH_OUT',
+            'ORDER_REFUND'  => 'ORDER_REFUND',
+            'PRODUCT_CREATE'=> 'PRODUCT_CREATE',
+            'PRODUCT_UPDATE'=> 'PRODUCT_UPDATE',
+            'PRODUCT_DELETE'=> 'PRODUCT_ARCHIVE',
+            'CUSTOMER_CREATE'=> 'CUSTOMER_CREATE',
+            'CUSTOMER_UPDATE'=> 'CUSTOMER_UPDATE',
+            'CUSTOMER_DELETE'=> 'CUSTOMER_ARCHIVE',
+            'CUSTOMER_ACCOUNT_PAYMENT' => 'CUSTOMER_ACCOUNT_PAYMENT',
+            'SETTINGS_UPDATE'=> 'POS_SETTINGS_UPDATE',
+        ];
+        $meta['canonical_action'] = $canonical[$action] ?? $action;
+        $this->audit->create([
+            'user_id'    => $user['id'],
+            'company_id' => $companyId,
+            'module'     => 'POS',
+            'action'     => $action,
+            'record_id'  => $recordId,
+            'new_values' => $meta,
+            'created_at' => date('Y-m-d H:i:s'),
+        ]);
+    }
 }

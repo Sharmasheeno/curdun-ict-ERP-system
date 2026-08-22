@@ -208,12 +208,25 @@ class AuthService
         }
         $this->session->set('auth_method', 'pin');
 
+        // P12 - PIN_LOGIN captures BOTH identities (Rule #18). The row's
+        // user_id stamps the cashier that logged in; new_values carries the
+        // account owner alongside so the audit table shows Ahmed the Admin
+        // owned the browser session when Nimco PINned in.
+        $accountForAudit = $existingUser ?? null;
         $this->auditLogRepository->create([
             'user_id'    => $matched['id'],
             'module'     => 'AUTH',
             'action'     => 'PIN_LOGIN',
             'ip_address' => $ip,
             'user_agent' => $userAgent,
+            'new_values' => json_encode([
+                'canonical_action'   => 'PIN_LOGIN',
+                'account_user_id'    => $accountForAudit['id']   ?? null,
+                'account_user_name'  => $accountForAudit['name'] ?? null,
+                'pos_cashier_id'     => (int)$matched['id'],
+                'pos_cashier_name'   => $matched['name'] ?? null,
+                'branch_id'          => $branchId,
+            ]),
             'created_at' => date('Y-m-d H:i:s'),
         ]);
 
@@ -331,7 +344,8 @@ class AuthService
                 'requested_by_id' => $cashier['id'] ?? null,
                 'requested_by'    => $cashier['name'] ?? null,
                 'reason'          => $reason,
-                'token_prefix'    => substr($token, 0, 8),  // last 56 chars kept secret
+                // P12 Rule #14 - never leak any part of the raw token.
+                // approval_id below is the safe reference.
                 'expires_at'      => $expires,
             ]),
             'created_at' => date('Y-m-d H:i:s'),
@@ -428,11 +442,21 @@ class AuthService
      */
     public function auditCashierLock(int $cashierId, string $ip): void
     {
+        // P12 - Canonical action is POS_LOCK; legacy CASHIER_LOCK stays on
+        // the row for backwards-compat query paths.
+        $account = $this->session->get('user');
         $this->auditLogRepository->create([
             'user_id'    => $cashierId,
             'module'     => 'POS',
             'action'     => 'CASHIER_LOCK',
             'ip_address' => $ip,
+            'new_values' => json_encode([
+                'canonical_action'   => 'POS_LOCK',
+                'account_user_id'    => $account['id']   ?? null,
+                'account_user_name'  => $account['name'] ?? null,
+                'pos_cashier_id'     => $cashierId,
+                'pos_cashier_name'   => $this->session->get('pos_cashier')['name'] ?? null,
+            ]),
             'created_at' => date('Y-m-d H:i:s'),
         ]);
     }

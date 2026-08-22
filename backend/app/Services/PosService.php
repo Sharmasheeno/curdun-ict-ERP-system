@@ -392,9 +392,12 @@ class PosService
     private function customersData(int $companyId): array
     {
         return $this->db->query(
-            "SELECT c.id,c.company_id,c.customer_code,c.name,c.phone,c.email,c.address,c.credit_limit,c.balance,c.status,c.notes,c.created_at,
+            "SELECT c.id,c.company_id,c.customer_code,c.name,c.phone,c.email,c.address,c.credit_limit,c.balance,
+                    c.loyalty_points,c.pricelist_id,pl.name pricelist_name,c.status,c.notes,c.created_at,
                     COUNT(DISTINCT o.id) total_orders,MAX(o.order_date) last_visit
-             FROM customers c LEFT JOIN orders o ON o.customer_id=c.id AND o.status='COMPLETED'
+             FROM customers c
+             LEFT JOIN pos_pricelists pl ON pl.id=c.pricelist_id AND pl.company_id=c.company_id AND pl.active=1
+             LEFT JOIN orders o ON o.customer_id=c.id AND o.status='COMPLETED'
              WHERE c.company_id=:company AND c.deleted_at IS NULL GROUP BY c.id ORDER BY c.name",
             ['company'=>$companyId]
         )->fetchAll();

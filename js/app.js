@@ -185,6 +185,13 @@ const S = {
 
   // POS — debt (Buugga Deynta)
   posDebtCustomerId: null,
+  // P14 — pricelists (P9 backend) exposed in the checkout composer.
+  // Loaded via posLoadPricelists() on bootstrap; nullable = use POS default.
+  posPricelists: [],
+  posSelectedPricelistId: null,
+  posPricelistManual: false,
+  // Loyalty snapshot for the currently selected Deyn customer (P10 endpoint).
+  posCustomerLoyalty: null,
 
   // POS — management reports and stock notifications
   posReportFrom: new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10),
@@ -3282,6 +3289,7 @@ function posDeynLineAmount() {
 // amount; the user can adjust for over-tender. Non-cash lines have no
 // tender/change concept.
 function posAddPaymentLine(name, orderTotal) {
+  S.posPendingOrderId = null;
   const type = posMethodType(name);
   const remaining = posPaymentLinesRemaining(orderTotal);
   const amount = remaining > 0 ? remaining : orderTotal;
@@ -3291,10 +3299,12 @@ function posAddPaymentLine(name, orderTotal) {
 }
 
 function posRemovePaymentLine(idx) {
+  S.posPendingOrderId = null;
   S.posPaymentLines = (S.posPaymentLines || []).filter((_, i) => i !== idx);
 }
 
 function posUpdatePaymentLine(idx, patch) {
+  S.posPendingOrderId = null;
   S.posPaymentLines = (S.posPaymentLines || []).map((line, i) => {
     if (i !== idx) return line;
     const next = { ...line, ...patch };
@@ -3330,6 +3340,10 @@ function posPaymentLinesValid(orderTotal) {
 function posResetPaymentLines() {
   S.posPaymentLines = [];
   S.posDebtCustomerId = null;
+  S.posCustomerLoyalty = null;
+  S.posPricelistManual = false;
+  const defaultPricelist = (S.posPricelists || []).find(p => Number(p.is_default) === 1);
+  S.posSelectedPricelistId = defaultPricelist ? Number(defaultPricelist.id) : null;
   S.posCashTendered = '';
 }
 
@@ -4960,6 +4974,33 @@ function renderPOSCheckout() {
           `}).join('')}
         </div>
 
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:rgba(255,255,255,0.04);border-radius:6px;margin-bottom:8px">
+          <label for="pos-deyn-customer" style="font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:800;color:#F5C411">Customer</label>
+          <select id="pos-deyn-customer" class="form-select" style="background:rgba(0,0,0,0.35);color:#FFF;border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:4px 8px;font-size:12px;flex:1">
+            <option value="">Walk-in customer</option>
+            ${POS_CUSTOMERS.map(c => `<option value="${c.id}" ${S.posDebtCustomerId===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}
+          </select>
+        </div>
+
+        <!-- P14 - Pricelist selector (P9). BASIC/ADVANCED may switch. -->
+        ${(S.posPricelists && S.posPricelists.length > 0) ? `
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:rgba(255,255,255,0.04);border-radius:6px;margin-bottom:8px">
+          <span style="font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:800;color:#F5C411">Pricelist</span>
+          <select id="pos-pricelist-select" class="form-select" ${posCan('pos.pricelist_select') ? '' : 'disabled'} style="background:rgba(0,0,0,0.35);color:#FFF;border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:4px 8px;font-size:12px;flex:1">
+            ${S.posPricelists.map(pl => `<option value="${pl.id}" ${Number(pl.id)===Number(S.posSelectedPricelistId)?'selected':''}>${esc(pl.name)}${Number(pl.is_default)===1?' (default)':''}</option>`).join('')}
+          </select>
+          ${!posCan('pos.pricelist_select') ? '<span style="font-size:10px;color:rgba(255,255,255,0.5)">MIN — read-only</span>' : ''}
+        </div>` : ''}
+
+        <!-- P14 - Loyalty pill (P10). Shows when a Deyn/customer is selected. -->
+        ${S.posCustomerLoyalty && S.posCustomerLoyalty.customer ? `
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:linear-gradient(90deg,rgba(245,196,17,0.15),rgba(245,196,17,0.05));border:1px solid rgba(245,196,17,0.3);border-radius:6px;margin-bottom:8px">
+          <span style="font-size:14px">🎁</span>
+          <span style="font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:800;color:#F5C411">Loyalty</span>
+          <span style="color:#FFF;font-size:13px;font-weight:800">${Number(S.posCustomerLoyalty.customer.loyalty_points || 0).toFixed(0)} pts</span>
+          ${(() => { const eligible=(S.posCustomerLoyalty.rewards||[]).filter(r=>Number(r.points_cost)<=Number(S.posCustomerLoyalty.customer.loyalty_points||0)); return eligible.length ? `<span style="font-size:11px;color:rgba(255,255,255,0.6);margin-left:auto">${eligible.length} reward${eligible.length===1?'':'s'} available</span>` : ''; })()}
+        </div>` : ''}
+
         <div class="pos-cart-summary">
           <div class="pos-summary-row"><span>Subtotal</span><span>$${subtotal.toFixed(2)}</span></div>
           ${taxRate > 0 ? `<div class="pos-summary-row"><span>Tax (${taxRate}%)</span><span>$${tax.toFixed(2)}</span></div>` : ''}
@@ -5014,11 +5055,8 @@ function renderPOSCheckout() {
                 <strong>Deyn — Customer Account</strong>
                 <span>Only the Deyn line amount ($${deynAmount.toFixed(2)}) will be booked against the customer's account.</span>
               </div>
-              <label class="pos-pay-section-label">Customer (Buugga Deynta)</label>
-              <select id="pos-deyn-customer" class="pos-deyn-select">
-                <option value="">— Select customer —</option>
-                ${POS_CUSTOMERS.map(c => `<option value="${c.id}" ${S.posDebtCustomerId===c.id?'selected':''}>${esc(c.name)} — Balance: $${Number(c.debtBalance||0).toFixed(2)} / Limit: $${Number(c.creditLimit||0).toFixed(2)}</option>`).join('')}
-              </select>
+              <div class="pos-pay-section-label">Selected customer</div>
+              <div style="font-size:12px;color:#FFF">${debtCustomer ? `${esc(debtCustomer.name)} — Balance: $${Number(debtCustomer.debtBalance||0).toFixed(2)} / Limit: $${Number(debtCustomer.creditLimit||0).toFixed(2)}` : 'Select a customer above.'}</div>
               ${debtCustomer ? `
                 <div class="${overLimit?'pos-deyn-warning':'pos-deyn-ok'}" style="margin-top:6px">
                   ${overLimit ? '⚠' : '✓'} ${esc(debtCustomer.name)} · Balance after this sale: $${projectedBalance.toFixed(2)} / limit $${Number(debtCustomer.creditLimit||0).toFixed(2)}
@@ -6703,6 +6741,7 @@ function wirePOSEvents() {
 
     document.querySelectorAll('[data-add-product]').forEach(btn => {
       btn.addEventListener('click', () => {
+        S.posPendingOrderId = null;
         const id = parseInt(btn.dataset.addProduct);
         const prod = POS_PRODUCTS.find(p=>p.id===id);
         if (!prod) return;
@@ -6714,14 +6753,15 @@ function wirePOSEvents() {
     });
 
     document.querySelectorAll('.pos-wholesale-cb').forEach(cb => {
-      cb.addEventListener('change', () => { S.posCart[parseInt(cb.dataset.cartIdx)].isWholesale = cb.checked; render(); });
+      cb.addEventListener('change', () => { S.posPendingOrderId = null; S.posCart[parseInt(cb.dataset.cartIdx)].isWholesale = cb.checked; render(); });
     });
 
     document.querySelectorAll('[data-qty-plus]').forEach(btn => {
-      btn.addEventListener('click', () => { S.posCart[parseInt(btn.dataset.qtyPlus)].qty++; render(); });
+      btn.addEventListener('click', () => { S.posPendingOrderId = null; S.posCart[parseInt(btn.dataset.qtyPlus)].qty++; render(); });
     });
     document.querySelectorAll('[data-qty-minus]').forEach(btn => {
       btn.addEventListener('click', () => {
+        S.posPendingOrderId = null;
         const i = parseInt(btn.dataset.qtyMinus);
         if (S.posCart[i].qty > 1) S.posCart[i].qty--;
         else S.posCart.splice(i, 1);
@@ -6729,7 +6769,7 @@ function wirePOSEvents() {
       });
     });
     document.querySelectorAll('[data-remove-item]').forEach(btn => {
-      btn.addEventListener('click', () => { S.posCart.splice(parseInt(btn.dataset.removeItem), 1); render(); });
+      btn.addEventListener('click', () => { S.posPendingOrderId = null; S.posCart.splice(parseInt(btn.dataset.removeItem), 1); render(); });
     });
     document.querySelectorAll('[data-pos-cat]').forEach(btn => {
       btn.addEventListener('click', () => { S.posSearchTerm = btn.dataset.posCat==='All'?'':btn.dataset.posCat; render(); });
@@ -6785,7 +6825,26 @@ function wirePOSEvents() {
     // Deyn customer selector (order-level — one customer per order regardless
     // of how many Deyn lines exist).
     const deynSel = document.getElementById('pos-deyn-customer');
-    if (deynSel) deynSel.addEventListener('change', () => { S.posDebtCustomerId=parseInt(deynSel.value)||null; render(); });
+    if (deynSel) deynSel.addEventListener('change', async () => {
+      S.posPendingOrderId = null;
+      S.posDebtCustomerId = parseInt(deynSel.value) || null;
+      const customer = POS_CUSTOMERS.find(c => c.id === S.posDebtCustomerId);
+      const defaultPricelist = (S.posPricelists || []).find(p => Number(p.is_default) === 1);
+      S.posPricelistManual = false;
+      S.posSelectedPricelistId = customer?.pricelistId || (defaultPricelist ? Number(defaultPricelist.id) : null);
+      // P14 - refresh loyalty pill for the newly-picked customer.
+      if (S.posDebtCustomerId) { try { await posLoadCustomerLoyalty(S.posDebtCustomerId); } catch (_) {} }
+      else S.posCustomerLoyalty = null;
+      render();
+    });
+    // P14 - Pricelist selector (P9). Only enabled for pos.pricelist_select.
+    const priceSel = document.getElementById('pos-pricelist-select');
+    if (priceSel) priceSel.addEventListener('change', () => {
+      S.posPendingOrderId = null;
+      S.posSelectedPricelistId = parseInt(priceSel.value) || null;
+      S.posPricelistManual = true;
+      render();
+    });
 
     // ---- Hold / Resume / Discard ----
     document.getElementById('btn-hold-order')?.addEventListener('click', () => {

@@ -45,6 +45,8 @@ function mapCustomer(customer) {
     id: Number(customer.id), name: customer.name, phone: customer.phone || '', points: Number(customer.loyalty_points || 0),
     visits: Number(customer.total_orders || 0), lastVisit: customer.last_visit || '—', tier: customer.tier || 'Bronze',
     creditLimit: Number(customer.credit_limit || 0), debtBalance: Number(customer.balance || 0), email: customer.email || '',
+    pricelistId: customer.pricelist_id ? Number(customer.pricelist_id) : null,
+    pricelistName: customer.pricelist_name || null,
   };
 }
 
@@ -65,12 +67,41 @@ function mapTransaction(order) {
 
 // P6 — Fetch the refundable-shape (original lines + refundable qty + prior
 // refunds + original payments) for the Odoo-style refund modal.
+// P14 - Load pricelists available on the active POS (P9 endpoint).
+async function posLoadPricelists() {
+  try {
+    const data = await posApiFetch('/pos/pricelists');
+    S.posPricelists = data.pricelists || [];
+    if (!S.posSelectedPricelistId) {
+      const def = S.posPricelists.find(p => Number(p.is_default) === 1);
+      S.posSelectedPricelistId = def ? def.id : null;
+    }
+    return S.posPricelists;
+  } catch (_) { S.posPricelists = []; return []; }
+}
+
+// P14 - Load loyalty snapshot for the selected Deyn customer (P10 endpoint).
+async function posLoadCustomerLoyalty(customerId) {
+  if (!customerId) { S.posCustomerLoyalty = null; return null; }
+  try {
+    S.posCustomerLoyalty = await posApiFetch(`/pos/customers/${customerId}/loyalty`);
+    return S.posCustomerLoyalty;
+  } catch (_) { S.posCustomerLoyalty = null; return null; }
+}
+
 async function posLoadRefundable(orderId) {
   return posApiFetch(`/pos/orders/${orderId}/refundable`);
 }
 // Post the refund with a payments[] split.
 async function posSubmitRefund(orderId, payload) {
-  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body:payload });
+  // P14 - preserve the refund idempotency key across retries so a lost
+  // response never creates a duplicate refund. Key is scoped by the target
+  // order + the client-composed items[] hash so a different quantity picker
+  // legitimately gets a different UUID (and thus a new refund).
+  const slot = `refund:${orderId}:${JSON.stringify(payload.items || [])}`;
+  const body = { ...payload, idempotency_key: _idemKey(slot) };
+  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body });
+  _clearIdemKey(slot);
   await refreshPOSSessionState();
   await posBootstrap();
   return row;
@@ -122,7 +153,14 @@ function posApplyBootstrap(data) {
 
 async function posBootstrap() {
   S._posLoading = { bootstrap:true };
-  try { const data = await posApiFetch('/pos/bootstrap'); posApplyBootstrap(data); return data; }
+  try {
+    const data = await posApiFetch('/pos/bootstrap');
+    posApplyBootstrap(data);
+    // P14 - fetch pricelists alongside bootstrap so the Checkout composer can
+    // render the selector without a second wait.
+    try { await posLoadPricelists(); } catch (_) {}
+    return data;
+  }
   finally { S._posLoading.bootstrap = false; if (typeof render === 'function') render(); }
 }
 
@@ -196,25 +234,52 @@ async function posCompleteCheckout(cart, customerId, payments) {
     if (S.mobileTxId) line.reference = S.mobileTxId;
     lines = [line];
   }
-  const data = await posApiFetch('/pos/checkout', { method:'POST', body:{
+  const body = {
     client_order_id: S.posPendingOrderId,
     customer_id: customerId || null,
     payments: lines,
     items: cart.map(item => ({ product_id:item.id, quantity:item.qty, wholesale:Boolean(item.isWholesale), discount_percent:Number(item.discountPercent||0) })),
-  }});
+  };
+  // P14 - Pass the selected pricelist (P9 backend). Null means "use POS default".
+  // Only an explicit cashier choice is sent. In automatic mode the backend
+  // remains authoritative and applies customer preference before POS default.
+  if (S.posPricelistManual && S.posSelectedPricelistId) body.pricelist_id = S.posSelectedPricelistId;
+  const data = await posApiFetch('/pos/checkout', { method:'POST', body });
   const mapped = mapTransaction({ ...data, id:data.id, total_amount:data.total_amount, items_count:cart.reduce((n,item)=>n+item.qty,0), customer_name:POS_CUSTOMERS.find(item=>item.id===customerId)?.name, cashier_name:S.posActiveUser?.name });
   const existing = POS_TRANSACTIONS.findIndex(item => item._backendId === mapped._backendId);
   if (existing >= 0) POS_TRANSACTIONS[existing] = mapped; else POS_TRANSACTIONS.unshift(mapped);
   S.posPendingOrderId = null;
   return data;
 }
+// P14 — Frontend idempotency helper (Rule #13). Keys live in S.posPendingKeys
+// keyed by an operation-specific slot so the SAME key survives fetch errors,
+// timeouts, and retries; a new key is only minted after authoritative success.
+function _idemKey(slot) {
+  S.posPendingKeys = S.posPendingKeys || {};
+  if (!S.posPendingKeys[slot]) {
+    S.posPendingKeys[slot] = (globalThis.crypto?.randomUUID?.()
+      || `${Date.now()}-0000-4000-8000-${Math.random().toString(16).slice(2).padEnd(12,'0').slice(0,12)}`);
+  }
+  return S.posPendingKeys[slot];
+}
+function _clearIdemKey(slot) { if (S.posPendingKeys) delete S.posPendingKeys[slot]; }
+
 async function posVoidTransaction(orderId) {
-  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body:{ reason:'Full refund from POS' }});
+  const key = _idemKey(`refund:${orderId}`);
+  const row = await posApiFetch(`/pos/orders/${orderId}/refund`, { method:'POST', body:{ idempotency_key:key, reason:'Full refund from POS' }});
+  _clearIdemKey(`refund:${orderId}`);
   await refreshPOSSessionState();
   await posBootstrap();
   return row;
 }
-async function posCollectDebt(id,amount) { const row=await posApiFetch(`/pos/customers/${id}/collect-debt`,{method:'POST',body:{amount,payment_method:'Cash'}});const i=POS_CUSTOMERS.findIndex(item=>item.id===Number(id));if(i>=0)POS_CUSTOMERS[i]=mapCustomer(row);return row; }
+async function posCollectDebt(id, amount, method='Cash') {
+  const key = _idemKey(`settlement:${id}:${amount}:${method}`);
+  const row = await posApiFetch(`/pos/customers/${id}/collect-debt`, { method:'POST', body:{ idempotency_key:key, amount, payment_method:method }});
+  _clearIdemKey(`settlement:${id}:${amount}:${method}`);
+  const i = POS_CUSTOMERS.findIndex(item => item.id === Number(id));
+  if (i >= 0) POS_CUSTOMERS[i] = mapCustomer(row);
+  return row;
+}
 async function posOpenSession(openingCash=0, note=null) {
   // Fire-and-refresh: post the open, then let refreshPOSSessionState() be
   // the source of truth for every downstream screen (Rule #16). Never
@@ -226,9 +291,12 @@ async function posOpenSession(openingCash=0, note=null) {
   await refreshPOSSessionState();
   return S.posSession;
 }
-async function posRecordCashMovement(type,amount,reason) {
+async function posRecordCashMovement(type, amount, reason) {
   if (!S.posSession?.id) throw new Error('Open the register first.');
-  const row = await posApiFetch(`/pos/sessions/${S.posSession.id}/cash-movements`, { method:'POST', body:{ type, amount, reason }});
+  const slot = `cash:${type}:${amount}:${reason}`;
+  const key = _idemKey(slot);
+  const row = await posApiFetch(`/pos/sessions/${S.posSession.id}/cash-movements`, { method:'POST', body:{ idempotency_key:key, type, amount, reason }});
+  _clearIdemKey(slot);
   await refreshPOSSessionState();
   return row;
 }

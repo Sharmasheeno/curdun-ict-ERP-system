@@ -6936,6 +6936,8 @@ function wirePOSEvents() {
     if (searchInput) { searchInput.addEventListener('input', e => { S.posSearchTerm = e.target.value; render(); }); searchInput.focus(); }
 
     document.querySelectorAll('[data-add-product]').forEach(btn => {
+      if (btn.dataset.posWired === '1') return;
+      btn.dataset.posWired = '1';
       btn.addEventListener('click', () => {
         if (S.posCheckoutUncertain) return;
         S.posPendingOrderId = null;
@@ -6955,9 +6957,13 @@ function wirePOSEvents() {
     });
 
     document.querySelectorAll('[data-qty-plus]').forEach(btn => {
+      if (btn.dataset.posWired === '1') return;
+      btn.dataset.posWired = '1';
       btn.addEventListener('click', () => { if(S.posCheckoutUncertain)return; S.posPendingOrderId = null; S.posCart[parseInt(btn.dataset.qtyPlus)].qty++; posScheduleQuote(); render(); });
     });
     document.querySelectorAll('[data-qty-minus]').forEach(btn => {
+      if (btn.dataset.posWired === '1') return;
+      btn.dataset.posWired = '1';
       btn.addEventListener('click', () => {
         if (S.posCheckoutUncertain) return;
         S.posPendingOrderId = null;
@@ -6969,6 +6975,8 @@ function wirePOSEvents() {
       });
     });
     document.querySelectorAll('[data-remove-item]').forEach(btn => {
+      if (btn.dataset.posWired === '1') return;
+      btn.dataset.posWired = '1';
       btn.addEventListener('click', () => { if(S.posCheckoutUncertain)return; S.posPendingOrderId = null; S.posCart.splice(parseInt(btn.dataset.removeItem), 1); posScheduleQuote(); render(); });
     });
     document.querySelectorAll('[data-pos-cat]').forEach(btn => {
@@ -7023,7 +7031,7 @@ function wirePOSEvents() {
     // Order-level customer selector. The same customer is used for optional
     // loyalty, preferred pricing, and Customer Account payment lines.
     const deynSel = document.getElementById('pos-deyn-customer');
-    if (deynSel) deynSel.addEventListener('change', async () => {
+    if (deynSel && deynSel.dataset.posWired !== '1') { deynSel.dataset.posWired = '1'; deynSel.addEventListener('change', async () => {
       if (S.posCheckoutUncertain) { render(); return; }
       S.posPendingOrderId = null;
       S.posSelectedRewardId = null;
@@ -7038,17 +7046,17 @@ function wirePOSEvents() {
       else S.posCustomerLoyalty = null;
       posScheduleQuote(0);
       render();
-    });
+    }); }
     // P14 - Pricelist selector (P9). Only enabled for pos.pricelist_select.
     const priceSel = document.getElementById('pos-pricelist-select');
-    if (priceSel) priceSel.addEventListener('change', () => {
+    if (priceSel && priceSel.dataset.posWired !== '1') { priceSel.dataset.posWired = '1'; priceSel.addEventListener('change', () => {
       if (S.posCheckoutUncertain) { render(); return; }
       S.posPendingOrderId = null;
       S.posSelectedPricelistId = parseInt(priceSel.value) || null;
       S.posPricelistManual = true;
       posScheduleQuote(0);
       render();
-    });
+    }); }
     document.getElementById('btn-pos-rewards')?.addEventListener('click', () => {
       S.posRewardsOpen = !S.posRewardsOpen;
       render();

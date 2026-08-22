@@ -302,6 +302,7 @@ class AuthService
         // Prefer the ACTIVE POS cashier as requester (dual-identity), so
         // an Admin browser session doesn't get credited for a cashier's
         // approval request.
+        $accountForAudit = $this->session->get('user');
         $cashier = $this->session->get('pos_cashier') ?: $this->session->get('user');
         $token   = bin2hex(random_bytes(32));   // 64 hex chars
         $expires = date('Y-m-d H:i:s', time() + 300);   // 5 minutes
@@ -334,7 +335,7 @@ class AuthService
             'user_id'    => $cashier['id'] ?? null,
             'company_id' => $companyId,
             'module'     => 'POS',
-            'action'     => 'MANAGER_APPROVAL',
+            'action'     => 'MANAGER_APPROVAL_GRANTED',
             'record_id'  => $manager['id'],
             'ip_address' => $ip,
             'new_values' => json_encode([
@@ -417,6 +418,9 @@ class AuthService
             ['token' => $token]
         )->fetch();
         if (!$row) throw new Exception('Manager approval token is not valid.', 403);
+        if (isset($constraints['company_id']) && (int)$row['company_id'] !== (int)$constraints['company_id']) {
+            throw new Exception('Manager approval belongs to a different company.', 403);
+        }
         if ($row['status'] !== 'PENDING') {
             throw new Exception('Manager approval was already used or revoked.', 403);
         }
@@ -444,18 +448,51 @@ class AuthService
             && abs(round((float)$constraints['amount'], 2) - round((float)$row['amount'], 2)) > 0.01) {
             throw new Exception('Manager approval is for a different amount.', 403);
         }
+        if (!empty($row['session_id']) && isset($constraints['session_id'])
+            && (int)$row['session_id'] !== (int)$constraints['session_id']) {
+            throw new Exception('Manager approval is for a different POS session.', 403);
+        }
         // The approval must have been requested by the current cashier.
         $cashier = $this->session->get('pos_cashier') ?: $this->session->get('user');
         if ((int)$row['requested_by'] !== (int)($cashier['id'] ?? 0)) {
             throw new Exception('Manager approval was requested by a different cashier.', 403);
         }
 
-        $db->query(
+        $updated = $db->query(
             "UPDATE pos_manager_approvals
              SET status='USED', used_at=NOW(), used_ip=:ip
              WHERE id=:id AND status='PENDING'",
             ['ip' => $ip, 'id' => $row['id']]
         );
+        if ($updated->rowCount() !== 1) {
+            throw new Exception('Manager approval was already used or revoked.', 403);
+        }
+        $account = $this->session->get('user');
+        $this->auditLogRepository->create([
+            'user_id' => $cashier['id'] ?? null,
+            'company_id' => $row['company_id'] ?? null,
+            'module' => 'POS',
+            'action' => 'MANAGER_APPROVAL_USED',
+            'record_id' => (int)$row['id'],
+            'ip_address' => $ip,
+            'new_values' => json_encode([
+                'approval_id' => (int)$row['id'],
+                'approved_action' => $row['action'],
+                'target' => ['type'=>$row['target_type'],'id'=>$row['target_id']?(int)$row['target_id']:null],
+                'amount' => $row['amount']!==null?(float)$row['amount']:null,
+                'session_id' => $row['session_id']?(int)$row['session_id']:null,
+                'approved_by_id' => (int)$row['approved_by'],
+                'requested_by_id' => (int)$row['requested_by'],
+                'actor' => [
+                    'account_user_id' => $account['id'] ?? null,
+                    'account_user_name' => $account['name'] ?? null,
+                    'pos_cashier_id' => $cashier['id'] ?? null,
+                    'pos_cashier_name' => $cashier['name'] ?? null,
+                ],
+                'result' => 'SUCCESS',
+            ]),
+            'created_at' => date('Y-m-d H:i:s'),
+        ]);
         return [
             'approval_id' => (int)$row['id'],
             'approved_by' => (int)$row['approved_by'],

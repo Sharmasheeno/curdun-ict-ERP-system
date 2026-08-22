@@ -246,6 +246,7 @@ function posApplyBootstrap(data) {
     S.storeSettings.cashControl = Boolean(data.settings.cash_control ?? S.storeSettings.cashControl);
     S.storeSettings.openingControl = Boolean(data.settings.opening_control ?? S.storeSettings.openingControl);
     S.storeSettings.maximumDifference = Number(data.settings.maximum_difference ?? S.storeSettings.maximumDifference);
+    S.storeSettings.extraSecurity = { ...(S.storeSettings.extraSecurity || {}), ...(data.settings.extra_security || {}) };
     S.storeSettings.payments = data.settings.payments || S.storeSettings.payments;
     S.posPaymentMethodsMeta = data.settings.payment_methods || [];
     const branch = S.posBranches.find(item => Number(item.id) === Number(data.settings.default_branch_id)) || S.posBranches[0];
@@ -414,7 +415,7 @@ async function posCloseShift(cashierId, countedCash, approveDifference=false, ap
   await refreshPOSSessionState();
   return result;
 }
-async function posSaveSettings(settings) { return posApiFetch('/pos/settings',{method:'PUT',body:{store_name:settings.storeName,tax_rate:settings.taxRate,receipt_header:settings.receiptHeader,receipt_footer:settings.receiptFooter,receipt_barcode:settings.showBarcodeOnReceipt,cash_control:settings.cashControl,opening_control:settings.openingControl,maximum_difference:settings.maximumDifference,payments:settings.payments,default_branch_id:settings.defaultBranchId||null}}); }
+async function posSaveSettings(settings) { return posApiFetch('/pos/settings',{method:'PUT',body:{store_name:settings.storeName,tax_rate:settings.taxRate,receipt_header:settings.receiptHeader,receipt_footer:settings.receiptFooter,receipt_barcode:settings.showBarcodeOnReceipt,cash_control:settings.cashControl,opening_control:settings.openingControl,maximum_difference:settings.maximumDifference,payments:settings.payments,extra_security:settings.extraSecurity,default_branch_id:settings.defaultBranchId||null}}); }
 
 async function posLoadReports(from = S.posReportFrom, to = S.posReportTo) {
   S.posReportLoading = true;

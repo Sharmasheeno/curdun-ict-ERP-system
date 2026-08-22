@@ -32,7 +32,7 @@ class PosService
      *                 pair ['discount_above_pct'=>10.0] meaning: require
      *                 approval if $context['discount_pct'] > threshold.
      */
-    private function enforceExtraSecurity(int $companyId, string $action, array $context, string|array $settingKey): void
+    private function enforceExtraSecurity(int $companyId, string $action, array $context, string|array $settingKey): ?array
     {
         $settings = $this->settingsData($companyId);
         $extra = (array)($settings['extra_security'] ?? []);
@@ -51,18 +51,19 @@ class PosService
                 if ($actual > (float)$configured) { $required = true; break; }
             }
         }
-        if (!$required) return;
+        if (!$required) return null;
 
         $approvalId = isset($_SERVER['HTTP_X_MANAGER_APPROVAL_ID'])
             ? (int)$_SERVER['HTTP_X_MANAGER_APPROVAL_ID'] : null;
         $ip = $_SERVER['REMOTE_ADDR'] ?? '';
-        $constraints = ['action' => $action];
+        $constraints = ['action' => $action, 'company_id' => $companyId];
         if (isset($context['target_type'])) $constraints['target_type'] = (string)$context['target_type'];
         if (isset($context['target_id'])) $constraints['target_id'] = (int)$context['target_id'];
         if (isset($context['amount']))    $constraints['amount']    = (float)$context['amount'];
+        if (isset($context['session_id'])) $constraints['session_id'] = (int)$context['session_id'];
         // The browser only carries a safe row id. The secret token is looked
         // up and consumed inside AuthService and never exposed to JavaScript.
-        $this->auth->consumeApprovalId($approvalId, $constraints, $ip);
+        return $this->auth->consumeApprovalId($approvalId, $constraints, $ip);
     }
 
     /**
@@ -752,11 +753,12 @@ class PosService
             // Optional Curdun Extra Security (Rule #9): cash OUT can require an
             // approval token when the tenant enables the extra_security.cash_out
             // toggle. Cash IN never does — Odoo treats it as a routine deposit.
+            $approval = null;
             if ($type === 'OUT') {
-                $this->enforceExtraSecurity($companyId,'cash-out',['target_type'=>'pos_session','target_id'=>$sessionId,'amount'=>$amount],'cash_out');
+                $approval = $this->enforceExtraSecurity($companyId,'cash-out',['target_type'=>'pos_session','target_id'=>$sessionId,'amount'=>$amount,'session_id'=>$sessionId],'cash_out');
             }
             $this->db->query("INSERT INTO pos_cash_movements (company_id,session_id,user_id,movement_type,subtype,amount,reason) VALUES (:company,:session,:user,:type,'MANUAL',:amount,:reason)",['company'=>$companyId,'session'=>$sessionId,'user'=>$user['id'],'type'=>$type,'amount'=>$amount,'reason'=>$reason]);
-            $id=(int)$this->db->lastInsertId();$this->log($user,$companyId,'CASH_'.$type,$id,['session_id'=>$sessionId,'amount'=>$amount,'reason'=>$reason]);
+            $id=(int)$this->db->lastInsertId();$this->log($user,$companyId,'CASH_'.$type,$id,['session_id'=>$sessionId,'amount'=>$amount,'reason'=>$reason,'approval_id'=>$approval['approval_id']??null,'authorized_by'=>$approval['approved_by']??null]);
             $response = ['id'=>$id,'session_id'=>$sessionId,'type'=>$type,'amount'=>$amount,'reason'=>$reason,'created_at'=>date('c')];
             $this->idemComplete($companyId, $action, $idemKey, $response);
             return $response;
@@ -941,7 +943,7 @@ class PosService
             // Approval is scoped to the backend-calculated refund amount,
             // never the browser's payment preview. Changing lines/quantity
             // after approval therefore fails the amount constraint.
-            $this->enforceExtraSecurity($companyId,'refund',['target_type'=>'order','target_id'=>$id,'amount'=>abs($total)],'refund');
+            $approval = $this->enforceExtraSecurity($companyId,'refund',['target_type'=>'order','target_id'=>$id,'amount'=>abs($total),'session_id'=>(int)$session['id']],'refund');
             $sequence=$this->nextSequence((int)$config['id']);$reference=$this->posReference($config,$sequence,'REF');$uuid=$this->uuid();
             $this->db->query("INSERT INTO orders (company_id,customer_id,user_id,warehouse_id,pos_session_id,uuid,sequence_number,reference_number,status,pos_state,order_date,subtotal,tax_amount,discount_amount,total_amount,amount_paid,refunded_order_id,notes) VALUES (:company,:customer,:user,:warehouse,:session,:uuid,:sequence,:reference,'COMPLETED','done',CURDATE(),:subtotal,:tax,0,:total,:paid,:original,:notes)",
                 ['company'=>$companyId,'customer'=>$order['customer_id'],'user'=>$user['id'],'warehouse'=>$order['warehouse_id'],'session'=>$session['id'],'uuid'=>$uuid,'sequence'=>$sequence,'reference'=>$reference,'subtotal'=>$subtotal,'tax'=>$tax,'total'=>$total,'paid'=>$total,'original'=>$id,'notes'=>$data['reason']??'POS refund']);
@@ -1109,6 +1111,8 @@ class PosService
                 'original_order_id' => $id,
                 'reference'         => $reference,
                 'total'             => $total,
+                'approval_id'       => $approval['approval_id']??null,
+                'authorized_by'     => $approval['approved_by']??null,
                 'payments'          => array_map(fn($l)=>['method'=>$l['method']['name'],'amount'=>$l['amount']], $refundPaymentLines),
             ]);
             $this->db->commit();
@@ -2457,7 +2461,7 @@ class PosService
         $this->enforceExtraSecurity(
             $companyId,
             'close-variance',
-            ['target_type'=>'pos_session','target_id'=>(int)$session['id'],'amount'=>abs($variance),'_threshold_value'=>abs($variance)],
+            ['target_type'=>'pos_session','target_id'=>(int)$session['id'],'amount'=>abs($variance),'session_id'=>(int)$session['id'],'_threshold_value'=>abs($variance)],
             ['variance_above'=>(float)($this->settingsData($companyId)['extra_security']['variance_above']??0)]
         );
         $this->db->beginTransaction();try{

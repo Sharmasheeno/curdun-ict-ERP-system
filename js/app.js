@@ -114,6 +114,7 @@ const S = {
     cashControl: true,
     openingControl: true,
     maximumDifference: 20,
+    extraSecurity: { refund:false, cash_out:false },
     payments:        { Cash: true, 'EVC Plus': true, eDahab: true, ZAAD: true, Sahal: true, Deyn: true },
   },
   _settingsSaved: false,      // ephemeral flag for "Saved!" toast
@@ -3382,7 +3383,12 @@ function posResetPaymentLines() {
  *   Store Manager or Admin in POS_STAFF), calls onApproved({ manager }).
  *   Cancels silently on close/×.
  */
+let POS_APPROVAL_CONTINUATION = null;
 function requireManagerApproval(action, options, onApproved) {
+  // Keep the continuation outside the render-state object as well. Repeated
+  // modal renders (wrong PIN, validation errors) must never discard the exact
+  // original operation that is waiting to be retried.
+  POS_APPROVAL_CONTINUATION = onApproved;
   S.posRegisterModal = {
     mode: 'manager-approval',
     action,
@@ -3706,6 +3712,8 @@ function renderRegisterModal() {
         <div class="avatar" style="width:44px;height:44px;background:var(--gold);color:var(--purple-800);font-size:14px;font-weight:900">!</div>
         <div>
           <div style="font-weight:800;font-size:14px">${esc(m.label)}</div>
+          <div style="font-size:12px;color:var(--text-secondary)">Action: <strong>${esc(m.action)}</strong></div>
+          ${m.targetType&&m.targetId?`<div style="font-size:12px;color:var(--text-secondary)">${esc(m.targetType==='order'?'Original Order':'Target')}: <strong>#${Number(m.targetId)}</strong></div>`:''}
           ${m.amount!==null?`<div style="font-size:12px;color:var(--text-secondary)">Amount: <strong>$${Number(m.amount).toFixed(2)}</strong></div>`:''}
           <div style="font-size:12px;color:var(--text-secondary);margin-top:2px">
             Requested by <strong>${esc(cashierName)}</strong>. A Store Manager or Admin PIN is needed to approve.
@@ -3758,7 +3766,7 @@ function wireRegisterModal() {
   // Close on backdrop / cancel / × / Done
   document.querySelectorAll('[data-rc-close]').forEach(el => {
     el.addEventListener('click', (e) => {
-      if (e.target === el) { S.posRegisterModal = null; render(); }
+      if (e.target === el) { if (S.posRegisterModal?.mode==='manager-approval') POS_APPROVAL_CONTINUATION=null; S.posRegisterModal = null; render(); }
     });
   });
 
@@ -3834,6 +3842,7 @@ function wireRegisterModal() {
   // Manager PIN approval — server-side check against Manager+ users.
   // The cashier's session stays intact; we only record the approval.
   document.getElementById('rc-mgr-submit')?.addEventListener('click', async () => {
+    const approvedAction = m.onApproved || POS_APPROVAL_CONTINUATION;
     const pin = (document.getElementById('rc-mgr-pin')?.value || '').trim();
     const reason = (document.getElementById('rc-mgr-reason')?.value || '').trim();
     if (!/^\d{4}$/.test(pin)) { m.error = 'Enter the 4-digit manager PIN.'; render(); return; }
@@ -3843,10 +3852,26 @@ function wireRegisterModal() {
       const result = await posVerifyManagerPin(pin, m.action || 'unknown', reason, S.posActiveUser?.branchId || null, {
         targetType:m.targetType,targetId:m.targetId,amount:m.amount,sessionId:m.sessionId,
       });
-      const cb = m.onApproved;
+      const approvalId = result.approval?.approval_id;
+      if (m.action === 'refund' && S.posRefundModal?.data) {
+        const refundState = S.posRefundModal;
+        const items = refundState.lines.filter(line=>Number(line.refund_qty)>0).map(line=>({order_item_id:Number(line.item.id),quantity:Number(line.refund_qty)}));
+        const payments = refundState.payments.map(payment=>({method:payment.method,amount:Number(payment.amount)}));
+        const originalOrder = refundState.data.order;
+        const refund = await posSubmitRefund(refundState.orderId,{items,payments,reason:'POS refund via Odoo-style workflow'},approvalId);
+        S.posRefundModal=null;
+        S.posLastReceipt={id:refund.reference_number,date:new Date(refund.created_at||Date.now()).toLocaleString(),items:[],subtotal:0,tax:0,total:Number(refund.total_amount||0),payment_lines:refund.payment_lines||[],method:refund.payment_method||'Refund',amountPaid:0,change:0,isRefund:true,originalOrder};
+        S.posReceiptVisible=true;
+        S.posRegisterModal=null;POS_APPROVAL_CONTINUATION=null;render();return;
+      }
+      if (m.action === 'cash-out') {
+        await posRecordCashMovement('OUT',Number(m.amount),m.reason||reason,approvalId);
+        S.posRegisterModal=null;POS_APPROVAL_CONTINUATION=null;render();return;
+      }
       S.posRegisterModal = null;
+      POS_APPROVAL_CONTINUATION = null;
       render();
-      try { cb?.({ approvalId:result.approval?.approval_id, approved_by:result.approved_by, reason }); } catch (e) { alert(e.message || String(e)); }
+      try { await approvedAction?.({ approvalId, approved_by:result.approved_by, reason }); } catch (e) { alert(e.message || String(e)); }
     } catch (err) {
       m.busy = false;
       m.error = err.message || 'That PIN does not match any Store Manager or Admin.';
@@ -6182,6 +6207,16 @@ function renderPOSSettings() {
       </div>
 
       <div class="card" style="padding:24px;margin-bottom:16px">
+        <h3 style="font-size:16px;font-weight:800;margin-bottom:4px">Curdun Extra Security</h3>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:16px">Optional manager approval overlays. BASIC rights remain unchanged when these controls are off.</div>
+        <div class="flex-col gap-14">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)"><span><strong>Require approval for Refund</strong><small style="display:block;color:var(--text-muted);margin-top:3px">A manager approves the exact order, amount, cashier, and session.</small></span><label class="toggle"><input type="checkbox" id="ss-security-refund" ${s.extraSecurity?.refund?'checked':''}/><span class="toggle-slider"></span></label></div>
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)"><span><strong>Require approval for Cash Out</strong><small style="display:block;color:var(--text-muted);margin-top:3px">Cash In remains a normal BASIC operation.</small></span><label class="toggle"><input type="checkbox" id="ss-security-cash-out" ${s.extraSecurity?.cash_out?'checked':''}/><span class="toggle-slider"></span></label></div>
+          <button class="btn btn-primary btn-sm" id="btn-save-extra-security" style="align-self:flex-start">Save extra security</button>
+        </div>
+      </div>
+
+      <div class="card" style="padding:24px;margin-bottom:16px">
         <h3 style="font-size:16px;font-weight:800;margin-bottom:16px">Receipt Settings</h3>
         <div class="flex-col gap-14">
           <div class="form-group">
@@ -6897,6 +6932,14 @@ function wirePOSEvents() {
       try { await posSaveSettings(S.storeSettings); }
       catch (error) { cb.checked = !cb.checked; S.storeSettings.payments[cb.dataset.paymentToggle] = cb.checked; alert(error.message); }
     });
+  });
+  document.getElementById('btn-save-extra-security')?.addEventListener('click', async () => {
+    S.storeSettings.extraSecurity = {
+      ...S.storeSettings.extraSecurity,
+      refund: Boolean(document.getElementById('ss-security-refund')?.checked),
+      cash_out: Boolean(document.getElementById('ss-security-cash-out')?.checked),
+    };
+    try { await posSaveSettings(S.storeSettings);await posBootstrap();S._settingsSaved=true;render();setTimeout(()=>{S._settingsSaved=false;render();},2500); } catch(error){alert(error.message);}
   });
 
   document.querySelectorAll('.pos-audit-filter').forEach(input => {

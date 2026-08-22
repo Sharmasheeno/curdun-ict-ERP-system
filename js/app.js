@@ -3692,17 +3692,18 @@ function renderRegisterModal() {
         <div class="txn-detail-row"><span>Register</span><strong>${esc(configName)}</strong></div>
         <div class="txn-detail-row"><span>Cashier</span><strong>${esc(cashierName)}</strong></div>
       </div>
+      ${m.uncertain?`<div class="pos-deyn-warning" style="margin-bottom:12px"><strong>Cash movement may have completed.</strong> Retry to confirm the original movement. Amount and reason stay locked.</div>`:''}
       <label class="form-label">Amount (USD)</label>
       <input class="form-input mono" id="rc-cash-amount" type="number" min="0.01" step="0.01"
-             value="${m.amount || ''}" placeholder="0.00" autofocus/>
+             value="${m.amount || ''}" placeholder="0.00" ${m.uncertain?'disabled':''} autofocus/>
       <label class="form-label" style="margin-top:12px">Reason</label>
-      <input class="form-input" id="rc-cash-reason" placeholder="${m.mode==='cash-in'?'e.g. Additional change money':'e.g. Store supplies'}" value="${esc(m.reason || '')}"/>
+      <input class="form-input" id="rc-cash-reason" placeholder="${m.mode==='cash-in'?'e.g. Additional change money':'e.g. Store supplies'}" value="${esc(m.reason || '')}" ${m.uncertain?'disabled':''}/>
       <div style="font-size:11px;color:var(--text-muted);margin-top:4px">This becomes part of the register's session ledger and shows on Closing Control.</div>
       ${err}
     `;
     footer = `
-      <button class="btn btn-ghost" data-rc-close>Cancel</button>
-      <button class="btn btn-primary" id="rc-cash-submit" ${m.busy?'disabled':''}>${m.busy?'Recording…':'Record'}</button>
+      <button class="btn btn-ghost" data-rc-close ${m.uncertain?'disabled':''}>Cancel</button>
+      <button class="btn btn-primary" id="rc-cash-submit" ${m.busy?'disabled':''}>${m.busy?'Recording…':(m.uncertain?'Retry movement':'Record')}</button>
     `;
   } else if (m.mode === 'manager-approval') {
     // Manager PIN overlay — a cashier tried an action that needs approval.
@@ -3885,7 +3886,7 @@ function wireRegisterModal() {
     const reason = (document.getElementById('rc-cash-reason').value || '').trim();
     if (!Number.isFinite(amount) || amount <= 0) { m.error = 'Enter an amount greater than zero.'; render(); return; }
     if (!reason) { m.error = 'A reason is required for cash movements (audit trail).'; render(); return; }
-    m.busy = true; m.error = ''; render();
+    m.amount=amount; m.reason=reason; m.busy = true; m.error = ''; render();
     try {
       await posRecordCashMovement(m.mode === 'cash-in' ? 'IN' : 'OUT', amount, reason);
       S.posRegisterModal = null;
@@ -3901,7 +3902,7 @@ function wireRegisterModal() {
         });
         return;
       }
-      m.busy = false; m.error = err.message || 'Could not record the movement.';
+      m.busy = false; m.uncertain=Boolean(err.simulatedLostResponse); m.error = err.message || 'Could not record the movement.';
       render();
     }
   });
@@ -5396,15 +5397,16 @@ function renderPOSCustomerAccountModal() {
         </div>
         ${state.settleOpen ? `<div style="padding:14px;border:1px solid var(--border);border-radius:10px;margin-bottom:14px;background:var(--gray-50)">
           <h4 style="margin:0 0 10px;color:var(--purple-800)">Customer Account Payment</h4>
+          ${state.uncertain?`<div class="pos-deyn-warning" style="margin-bottom:10px"><strong>Payment may have completed.</strong> Retry to confirm the original settlement. Amount and method stay locked.</div>`:''}
           <div class="crud-grid-2">
             <div class="form-group"><label class="form-label">Outstanding</label><input class="form-input" disabled value="$${Number(c.balance).toFixed(2)}"/></div>
-            <div class="form-group"><label class="form-label">Amount</label><input class="form-input" id="account-payment-amount" type="number" min="0.01" step="0.01" max="${Number(c.balance).toFixed(2)}" value="${esc(state.amount||'')}"/></div>
-            <div class="form-group"><label class="form-label">Payment Method</label><select class="form-select" id="account-payment-method">${methods.map(method=>`<option ${method.name===selectedMethod?'selected':''}>${esc(method.name)}</option>`).join('')}</select></div>
+            <div class="form-group"><label class="form-label">Amount</label><input class="form-input" id="account-payment-amount" type="number" min="0.01" step="0.01" max="${Number(c.balance).toFixed(2)}" value="${esc(state.amount||'')}" ${state.uncertain?'disabled':''}/></div>
+            <div class="form-group"><label class="form-label">Payment Method</label><select class="form-select" id="account-payment-method" ${state.uncertain?'disabled':''}>${methods.map(method=>`<option ${method.name===selectedMethod?'selected':''}>${esc(method.name)}</option>`).join('')}</select></div>
             ${selectedMeta?.type==='mobile' ? `<div class="form-group"><label class="form-label">Reference</label><input class="form-input" id="account-payment-reference" value="${esc(state.reference||'')}" placeholder="Transaction reference"/></div>` : ''}
           </div>
           <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">This will be recorded as <strong>Customer Account Payment — ${esc(selectedMethod)}</strong>${selectedMeta?.type==='cash'?', and included in the register drawer as a settlement.':'.'}</div>
           ${state.submitError?`<div class="crud-error">${esc(state.submitError)}</div>`:''}
-          <div style="display:flex;gap:8px"><button class="btn btn-primary" id="btn-account-payment-submit" ${!methods.length||state.submitting?'disabled':''}>${state.submitting?'Recording…':'Record payment'}</button><button class="btn btn-outline" id="btn-account-payment-cancel">Cancel</button></div>
+          <div style="display:flex;gap:8px"><button class="btn btn-primary" id="btn-account-payment-submit" ${!methods.length||state.submitting?'disabled':''}>${state.submitting?'Recording…':(state.uncertain?'Retry payment':'Record payment')}</button><button class="btn btn-outline" id="btn-account-payment-cancel" ${state.uncertain?'disabled':''}>Cancel</button></div>
         </div>` : `<button class="btn btn-primary btn-sm" id="btn-account-payment-open" ${Number(c.balance)<=0?'disabled':''} style="margin-bottom:12px">Record Customer Account Payment</button>`}
         <div class="overflow-x-auto"><table class="data-table" style="min-width:850px"><thead><tr><th>Date</th><th>Type</th><th>Reference</th><th>Payment Method</th><th>Employee</th><th>Amount</th><th>Running Balance</th></tr></thead><tbody>
           ${entries.length?entries.map(row=>`<tr><td>${esc(row.created_at||'—')}</td><td>${esc(typeLabels[row.type]||row.type)}</td><td>${esc(row.order_reference||row.reference||'—')}</td><td>${esc(row.payment_method||'—')}</td><td>${esc(row.cashier_name||'—')}</td><td style="font-weight:800;color:${Number(row.amount)<0?'#15803D':'#B45309'}">${Number(row.amount)<0?'−':'+'}$${Math.abs(Number(row.amount)).toFixed(2)}</td><td style="font-weight:800">$${Number(row.running_balance).toFixed(2)}</td></tr>`).join(''):'<tr><td colspan="7" style="text-align:center;color:var(--text-muted)">No Customer Account activity yet.</td></tr>'}
@@ -5779,6 +5781,7 @@ function renderPOSRefundModal() {
             </div>
           </div>
 
+          ${S.posRefundModal.uncertain?`<div class="pos-deyn-warning" style="margin-bottom:12px"><strong>Refund may have completed.</strong> Retry to confirm the original refund. Quantities and payment allocation stay locked.</div>`:''}
           <!-- REFUND PAYMENT COMPOSER (mirror of the checkout composer) -->
           <div class="data-section" style="margin-bottom:14px">
             <div class="section-header-bar"><h3 class="chart-title">Refund method</h3></div>
@@ -5807,8 +5810,8 @@ function renderPOSRefundModal() {
           ${!validate.ok ? `<div style="color:#F59E0B;font-size:12px;margin-top:8px;text-align:center">${esc(validate.reason)}</div>` : ''}
         </div>
         <div class="crud-modal-footer">
-          <button class="btn btn-danger" id="btn-refund-submit" ${validate.ok?'':'disabled'}>Validate refund</button>
-          <button class="btn btn-outline" id="btn-refund-close">Cancel</button>
+          <button class="btn btn-danger" id="btn-refund-submit" ${validate.ok?'':'disabled'}>${S.posRefundModal.uncertain?'Retry refund':'Validate refund'}</button>
+          <button class="btn btn-outline" id="btn-refund-close" ${S.posRefundModal.uncertain?'disabled':''}>Cancel</button>
         </div>
       </div>
     </div>`;
@@ -5838,7 +5841,7 @@ async function openRefundModal(orderId) {
 }
 
 function posAddRefundMethod(btn) {
-  if (btn.disabled || !S.posRefundModal) return;
+  if (btn.disabled || !S.posRefundModal || S.posRefundModal.uncertain) return;
   const name = btn.dataset.addMethod;
   const totalPrecise = S.posRefundModal.lines.reduce((sum, line) => {
     const originalQty = Number(line.item.original_qty || 0);
@@ -5860,6 +5863,7 @@ function wireRefundModal() {
     if (inp.dataset.posWired === '1') return;
     inp.dataset.posWired = '1';
     inp.addEventListener('input', () => {
+      if(S.posRefundModal.uncertain){render();return;}
       const i = parseInt(inp.dataset.lineIdx);
       const v = Math.max(0, Number(inp.value) || 0);
       const max = Number(S.posRefundModal.lines[i].item.refundable_qty || 0);
@@ -5869,6 +5873,7 @@ function wireRefundModal() {
   });
   document.querySelectorAll('.pos-refund-pay-amount').forEach(inp => {
     inp.addEventListener('input', () => {
+      if(S.posRefundModal.uncertain){render();return;}
       const i = parseInt(inp.dataset.payIdx);
       S.posRefundModal.payments[i].amount = Math.max(0, Number(inp.value) || 0);
       render();
@@ -5876,6 +5881,7 @@ function wireRefundModal() {
   });
   document.querySelectorAll('.pos-refund-pay-remove').forEach(btn => {
     btn.addEventListener('click', () => {
+      if(S.posRefundModal.uncertain)return;
       const i = parseInt(btn.dataset.payIdx);
       S.posRefundModal.payments.splice(i, 1);
       render();
@@ -5924,6 +5930,7 @@ function wireRefundModal() {
         return;
       }
       alert(e.message || 'Refund failed.');
+      if(e.simulatedLostResponse){S.posRefundModal.uncertain=true;S.posRefundModal.error=e.message;render();return;}
       submit.disabled = false; submit.textContent = 'Validate refund';
     }
   }); }
@@ -6877,8 +6884,8 @@ function wirePOSEvents() {
   });
   document.getElementById('btn-account-close')?.addEventListener('click', () => { S.posCustomerAccount=null; render(); });
   document.getElementById('btn-account-payment-open')?.addEventListener('click', () => { S.posCustomerAccount={...S.posCustomerAccount,settleOpen:true}; render(); });
-  document.getElementById('btn-account-payment-cancel')?.addEventListener('click', () => { S.posCustomerAccount={...S.posCustomerAccount,settleOpen:false,submitError:''}; render(); });
-  document.getElementById('account-payment-method')?.addEventListener('change', event => { S.posCustomerAccount={...S.posCustomerAccount,method:event.target.value,reference:''}; render(); });
+  document.getElementById('btn-account-payment-cancel')?.addEventListener('click', () => { if(S.posCustomerAccount?.uncertain)return;S.posCustomerAccount={...S.posCustomerAccount,settleOpen:false,submitError:''}; render(); });
+  document.getElementById('account-payment-method')?.addEventListener('change', event => { if(S.posCustomerAccount?.uncertain){render();return;}S.posCustomerAccount={...S.posCustomerAccount,method:event.target.value,reference:''}; render(); });
   document.getElementById('btn-account-payment-submit')?.addEventListener('click', async () => {
     const state=S.posCustomerAccount; if(!state?.data||state.submitting)return;
     const amount=Number(document.getElementById('account-payment-amount')?.value||0);
@@ -6890,8 +6897,8 @@ function wirePOSEvents() {
       await posCollectDebt(state.customerId,amount,method,reference);
       await posBootstrap();
       const data=await posLoadCustomerLedger(state.customerId);
-      S.posCustomerAccount={...S.posCustomerAccount,data,loading:false,settleOpen:false,submitting:false,amount:'',reference:''};
-    } catch(error) { S.posCustomerAccount={...S.posCustomerAccount,submitting:false,submitError:error.message}; }
+      S.posCustomerAccount={...S.posCustomerAccount,data,loading:false,settleOpen:false,submitting:false,uncertain:false,amount:'',reference:''};
+    } catch(error) { S.posCustomerAccount={...S.posCustomerAccount,submitting:false,uncertain:Boolean(error.simulatedLostResponse),submitError:error.message}; }
     render();
   });
 
@@ -7056,7 +7063,7 @@ function wirePOSEvents() {
       if (btn.dataset.posWired === '1') return;
       btn.dataset.posWired = '1';
       btn.addEventListener('click', () => {
-        if (btn.disabled) return;
+        if (btn.disabled || S.posCheckoutUncertain) return;
         posAddPaymentLine(btn.dataset.addMethod, _payTotal);
         render();
       });
@@ -7064,6 +7071,7 @@ function wirePOSEvents() {
     // Per-line amount editing (any type).
     document.querySelectorAll('.pos-pay-line-amount').forEach(inp => {
       inp.addEventListener('input', () => {
+        if(S.posCheckoutUncertain){render();return;}
         const idx = parseInt(inp.dataset.lineIdx);
         const v = parseFloat(inp.value);
         posUpdatePaymentLine(idx, { amount: Number.isFinite(v) ? Math.max(0, v) : 0 });
@@ -7073,6 +7081,7 @@ function wirePOSEvents() {
     // Cash line — tendered input.
     document.querySelectorAll('.pos-pay-line-tendered').forEach(inp => {
       inp.addEventListener('input', () => {
+        if(S.posCheckoutUncertain){render();return;}
         const idx = parseInt(inp.dataset.lineIdx);
         const v = parseFloat(inp.value);
         posUpdatePaymentLine(idx, { tendered: Number.isFinite(v) ? Math.max(0, v) : 0 });
@@ -7082,6 +7091,7 @@ function wirePOSEvents() {
     // Mobile line — reference (transaction id).
     document.querySelectorAll('.pos-pay-line-reference').forEach(inp => {
       inp.addEventListener('input', () => {
+        if(S.posCheckoutUncertain){render();return;}
         const idx = parseInt(inp.dataset.lineIdx);
         posUpdatePaymentLine(idx, { reference: inp.value });
       });
@@ -7089,6 +7099,7 @@ function wirePOSEvents() {
     // Remove line.
     document.querySelectorAll('.pos-pay-line-remove').forEach(btn => {
       btn.addEventListener('click', () => {
+        if(S.posCheckoutUncertain)return;
         posRemovePaymentLine(parseInt(btn.dataset.lineIdx));
         render();
       });
@@ -7124,6 +7135,7 @@ function wirePOSEvents() {
     }); }
     const rewardsToggle = document.getElementById('btn-pos-rewards');
     if (rewardsToggle && rewardsToggle.dataset.posWired !== '1') { rewardsToggle.dataset.posWired = '1'; rewardsToggle.addEventListener('click', () => {
+      if(S.posCheckoutUncertain)return;
       S.posRewardsOpen = !S.posRewardsOpen;
       render();
     }); }
@@ -7142,7 +7154,7 @@ function wirePOSEvents() {
 
     // ---- Hold / Resume / Discard ----
     document.getElementById('btn-hold-order')?.addEventListener('click', () => {
-      if (!S.posCart.length) return;
+      if (!S.posCart.length || S.posCheckoutUncertain) return;
       if (!S.posHeldOrders) S.posHeldOrders = [];
       S.posHeldOrders.push({ id: Date.now(), cashier: S.posActiveUser?.name||'?', items: [...S.posCart], customer: S.posDebtCustomerId, payment_lines: [...(S.posPaymentLines||[])], ts: Date.now() });
       S.posCart = []; posResetPaymentLines(); S.posReceiptVisible = false; S.posShowHeld = false;

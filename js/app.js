@@ -3672,8 +3672,9 @@ function renderRegisterModal() {
     // Closing Control with full variance breakdown
     title = 'Closing Control';
     const opening = Number(session.opening_cash || 0);
-    const cashSales   = Number(summary.cash_sales || summary.payment_methods?.find?.(p=>/cash/i.test(p.method))?.total || 0);
-    const cashRefunds = Number(summary.cash_refunds || 0);
+    const cashMethod  = summary.payment_methods?.find?.(p => p.method_type === 'cash' || /cash/i.test(p.method_name || ''));
+    const cashSales   = Number(summary.cash_sales ?? cashMethod?.gross ?? cashMethod?.amount ?? 0);
+    const cashRefunds = Math.abs(Number(summary.cash_refunds ?? cashMethod?.refunded ?? 0));
     const cashIn      = Number(summary.cash_movements?.in  || 0);
     const cashOut     = Number(summary.cash_movements?.out || 0);
     const expected    = Number(summary.expected_cash ?? (opening + cashSales - cashRefunds + cashIn - cashOut));
@@ -3834,6 +3835,7 @@ function wireRegisterModal() {
   // Close Register
   document.getElementById('rc-close-submit')?.addEventListener('click', async () => {
     const counted = Number(document.getElementById('rc-close-counted').value);
+    const note = (document.getElementById('rc-close-note')?.value || '').trim();
     if (!Number.isFinite(counted) || counted < 0) { m.error = 'Enter a valid counted cash amount.'; render(); return; }
 
     // Recompute variance guard here — the backend still owns the real check.
@@ -3846,7 +3848,7 @@ function wireRegisterModal() {
     try {
       let result;
       try {
-        result = await posCloseShift(Number(S.posSession?.opened_by || S.posActiveUser?.id), counted, approve);
+        result = await posCloseShift(Number(S.posSession?.opened_by || S.posActiveUser?.id), counted, approve, null, note);
       } catch (err) {
         if (err.status===403 && /approval/i.test(err.message)) {
           requireManagerApproval('close-variance', {
@@ -3854,7 +3856,7 @@ function wireRegisterModal() {
             targetType:'pos_session', targetId:Number(S.posSession?.id), sessionId:Number(S.posSession?.id),
           }, async ({approvalId}) => {
             try {
-              const approved=await posCloseShift(Number(S.posSession?.opened_by||S.posActiveUser?.id),counted,true,approvalId);
+              const approved=await posCloseShift(Number(S.posSession?.opened_by||S.posActiveUser?.id),counted,true,approvalId,note);
               S.posRegisterModal={mode:'closed-summary',result:approved}; await posBootstrap(); render();
             } catch(error){ showPOSNotice(error.message||'Approved register close failed.','Register close failed'); }
           });
@@ -4048,7 +4050,8 @@ function renderPOSTopNav() {
   const canEditProducts = posCan('editProducts') === true;
   const canManageStaff  = posCan('manageStaff')  === true;
   const canOpenSettings = posCan('settings')     === true;
-  const canReports      = posCan('viewMargin')   === true; // reports leak margin — same gate
+  const canReports      = posCan('viewMargin')   === true; // margin-bearing sales details
+  const canSessionReport = posCan('pos.reports_view') === true;
 
   const canControlRegister = isOpen ? posCan('closeRegister') : posCan('openRegister');
 
@@ -4071,7 +4074,7 @@ function renderPOSTopNav() {
           ` : key === 'reporting' ? `
             <button class="pos-dd-item" data-bo-tab="reports-orders">Orders</button>
             ${canReports ? `<button class="pos-dd-item" data-bo-tab="reports-sales">Sales Details</button>` : ''}
-            ${canReports ? `<button class="pos-dd-item" data-bo-tab="reports-session">Session Report</button>` : ''}
+            ${canSessionReport ? `<button class="pos-dd-item" data-bo-tab="reports-session">Session Report</button>` : ''}
             <button class="pos-dd-item" data-bo-tab="reports-stock">Stock Report</button>
           ` : `
             ${canOpenSettings ? `<button class="pos-dd-item" data-bo-tab="config-settings">Settings</button>` : ''}

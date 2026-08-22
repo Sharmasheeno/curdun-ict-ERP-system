@@ -393,9 +393,15 @@ async function posRecordCashMovement(type, amount, reason, approvalId=null) {
   await refreshPOSSessionState();
   return row;
 }
-async function posCloseShift(cashierId, countedCash, approveDifference=false, approvalId=null) {
+async function posCloseShift(cashierId, countedCash, approveDifference=false, approvalId=null, notes='') {
   const headers = approvalId ? { 'X-Manager-Approval-ID': String(approvalId) } : {};
-  const result = await posApiFetch('/pos/shifts/close', { method:'POST', body:{ cashier_id:cashierId, counted_cash:countedCash, approve_difference:approveDifference }, headers });
+  const result = await posApiFetch('/pos/shifts/close', { method:'POST', body:{
+    cashier_id:cashierId,
+    session_id:Number(S.posSession?.id),
+    counted_cash:countedCash,
+    approve_difference:approveDifference,
+    notes:String(notes || '').trim() || null,
+  }, headers });
   await refreshPOSSessionState();
   return result;
 }

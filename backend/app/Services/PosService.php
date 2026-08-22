@@ -130,7 +130,9 @@ class PosService
             'staff'=>$canManageStaff ? $this->platform->users(['company_id'=>$companyId]) : [$user],
             'branches'=>$this->platform->branches($companyId),
             'settings'=>$this->settingsData($companyId),
-            'stock_alerts'=>$canManageStaff ? $this->stockAlertsData($companyId,(int)$user['id']) : [],
+            // Inventory condition is readable at every POS level. Notification
+            // read-state remains personal, but never controls condition rows.
+            'stock_alerts'=>$this->stockAlertsData($companyId,(int)$user['id']),
             'pos_config'=>$config,
             'current_session'=>$currentSession,
             'current_session_summary'=>$currentSession ? $this->sessionSummary((int)$currentSession['id']) : null,
@@ -143,6 +145,21 @@ class PosService
     public function products(): array { [, $companyId]=$this->context(); return $this->productsData($companyId); }
     public function customers(): array { [, $companyId]=$this->context(); return $this->customersData($companyId); }
     public function transactions(): array { [, $companyId]=$this->context(); return $this->transactionsData($companyId); }
+
+    /** Canonical inventory-condition SQL used by every POS stock view. */
+    private function stockConditionSql(string $alias=''): array
+    {
+        $prefix=$alias!=='' ? $alias.'.' : '';
+        $stock=$prefix.'current_stock';$minimum=$prefix.'minimum_stock';
+        $out="{$stock}<=0";
+        $low="{$stock}>0 AND {$stock}<={$minimum}";
+        return [
+            'out'=>$out,
+            'low'=>$low,
+            'normal'=>"{$stock}>{$minimum}",
+            'case'=>"CASE WHEN {$out} THEN 'OUT_OF_STOCK' WHEN {$low} THEN 'LOW_STOCK' ELSE 'NORMAL' END",
+        ];
+    }
     // Odoo 19: MINIMAL cashiers get orders overview and POS reports. Sessions
     // and payment-lines listings are read-only support views for those; kept
     // at the plain-context level. Back-office admin gates (staff / settings /
@@ -176,6 +193,7 @@ class PosService
         // reports. We do NOT hold reports back to Advanced. Route-level gate
         // stays open too (no capability required); MINIMAL cashiers can view.
         [, $companyId]=$this->context();[$from,$to]=$this->reportRange($filters);
+        $stock=$this->stockConditionSql();$productStock=$this->stockConditionSql('p');
         $range=['company'=>$companyId,'from'=>$from,'to'=>$to];
         $summary=$this->db->query(
             "SELECT COALESCE(SUM(CASE WHEN status='COMPLETED' AND total_amount>0 THEN total_amount ELSE 0 END),0) gross_sales,
@@ -187,8 +205,8 @@ class PosService
              FROM orders WHERE company_id=:company AND order_date BETWEEN :from AND :to",$range)->fetch();
         $summary['outstanding_debt']=(float)($this->db->query("SELECT COALESCE(SUM(balance),0) FROM customers WHERE company_id=:company AND deleted_at IS NULL",['company'=>$companyId])->fetchColumn()?:0);
         $summary['inventory_retail_value']=(float)($this->db->query("SELECT COALESCE(SUM(current_stock*selling_price),0) FROM products WHERE company_id=:company AND deleted_at IS NULL",['company'=>$companyId])->fetchColumn()?:0);
-        $summary['low_stock_products']=(int)$this->db->query("SELECT COUNT(*) FROM products WHERE company_id=:company AND deleted_at IS NULL AND current_stock<=minimum_stock",['company'=>$companyId])->fetchColumn();
-        $summary['out_of_stock_products']=(int)$this->db->query("SELECT COUNT(*) FROM products WHERE company_id=:company AND deleted_at IS NULL AND current_stock<=0",['company'=>$companyId])->fetchColumn();
+        $summary['low_stock_products']=(int)$this->db->query("SELECT COUNT(*) FROM products WHERE company_id=:company AND deleted_at IS NULL AND status='active' AND ({$stock['low']})",['company'=>$companyId])->fetchColumn();
+        $summary['out_of_stock_products']=(int)$this->db->query("SELECT COUNT(*) FROM products WHERE company_id=:company AND deleted_at IS NULL AND status='active' AND ({$stock['out']})",['company'=>$companyId])->fetchColumn();
         return [
             'range'=>['from'=>$from,'to'=>$to],
             'summary'=>$summary,
@@ -200,7 +218,7 @@ class PosService
                 ) methods GROUP BY payment_method ORDER BY amount DESC",['company'=>$companyId,'from'=>$from,'to'=>$to,'legacy_company'=>$companyId,'legacy_from'=>$from,'legacy_to'=>$to])->fetchAll(),
             'top_products'=>$this->db->query("SELECT p.id,p.sku,p.name,COALESCE(c.name,'General') category,ROUND(SUM(oi.quantity),3) quantity_sold,ROUND(SUM(oi.total),2) sales FROM order_items oi JOIN orders o ON o.id=oi.order_id JOIN products p ON p.id=oi.product_id LEFT JOIN categories c ON c.id=p.category_id WHERE o.company_id=:company AND o.status='COMPLETED' AND o.order_date BETWEEN :from AND :to GROUP BY p.id,p.sku,p.name,c.name ORDER BY quantity_sold DESC LIMIT 100",$range)->fetchAll(),
             'orders'=>$this->db->query("SELECT o.reference_number,o.order_date,o.created_at,o.status,o.pos_state,o.refunded_order_id,u.name cashier,COALESCE(c.name,'Walk-in') customer,COUNT(DISTINCT oi.id) items,o.subtotal,o.tax_amount,o.total_amount,COALESCE(GROUP_CONCAT(DISTINCT pp.method_name ORDER BY pp.id SEPARATOR ' + '),MAX(pm.name),'Deyn') payment_method FROM orders o JOIN users u ON u.id=o.user_id LEFT JOIN customers c ON c.id=o.customer_id LEFT JOIN order_items oi ON oi.order_id=o.id LEFT JOIN invoices i ON i.id=o.invoice_id LEFT JOIN payments pay ON pay.invoice_id=i.id AND pay.status IN ('COMPLETED','REFUNDED') LEFT JOIN payment_methods pm ON pm.id=pay.payment_method_id LEFT JOIN pos_payments pp ON pp.order_id=o.id AND pp.status='COMPLETED' WHERE o.company_id=:company AND o.order_date BETWEEN :from AND :to GROUP BY o.id,o.reference_number,o.order_date,o.created_at,o.status,o.pos_state,o.refunded_order_id,u.name,c.name,o.subtotal,o.tax_amount,o.total_amount ORDER BY o.created_at DESC LIMIT 1000",$range)->fetchAll(),
-            'inventory'=>$this->db->query("SELECT p.sku,p.barcode,p.name,COALESCE(c.name,'General') category,p.current_stock,p.minimum_stock,p.purchase_price,p.selling_price,ROUND(p.current_stock*p.selling_price,2) retail_value,CASE WHEN p.current_stock<=0 THEN 'Out of Stock' WHEN p.current_stock<=p.minimum_stock THEN 'Low Stock' ELSE 'Normal' END stock_status FROM products p LEFT JOIN categories c ON c.id=p.category_id WHERE p.company_id=:company AND p.deleted_at IS NULL ORDER BY p.name",['company'=>$companyId])->fetchAll(),
+            'inventory'=>$this->db->query("SELECT p.sku,p.barcode,p.name,COALESCE(c.name,'General') category,p.current_stock,p.minimum_stock,p.purchase_price,p.selling_price,ROUND(p.current_stock*p.selling_price,2) retail_value,{$productStock['case']} stock_status FROM products p LEFT JOIN categories c ON c.id=p.category_id WHERE p.company_id=:company AND p.deleted_at IS NULL AND p.status='active' ORDER BY p.name",['company'=>$companyId])->fetchAll(),
             'customers'=>$this->db->query("SELECT customer_code,name,phone,email,credit_limit,balance,status,created_at FROM customers WHERE company_id=:company AND deleted_at IS NULL ORDER BY balance DESC,name",['company'=>$companyId])->fetchAll(),
             'staff'=>$this->db->query("SELECT u.name,u.email,u.status,COALESCE(b.name,'Unassigned') branch,
                     GROUP_CONCAT(DISTINCT r.display_name) roles,COALESCE(MAX(performance.completed_orders),0) completed_orders,
@@ -255,13 +273,29 @@ class PosService
     private function stockAlertsData(int $companyId,int $userId): array
     {
         $this->syncStockAlerts($companyId);
-        return $this->db->query("SELECT a.id,a.product_id,a.severity,a.current_stock,a.minimum_stock,a.detected_at,a.last_seen_at,p.name product_name,p.sku,p.barcode,(r.user_id IS NULL) unread FROM pos_stock_alerts a JOIN products p ON p.id=a.product_id LEFT JOIN pos_stock_alert_reads r ON r.alert_id=a.id AND r.user_id=:user WHERE a.company_id=:company AND a.status='open' ORDER BY (a.severity='out') DESC,a.detected_at DESC",['user'=>$userId,'company'=>$companyId])->fetchAll();
+        $stock=$this->stockConditionSql('p');
+        // Drive the report from live inventory, not from notification rows.
+        // An alert may be read/resolved independently; the product remains in
+        // this result for as long as its canonical stock condition requires it.
+        return $this->db->query("SELECT a.id,p.id product_id,
+                CASE WHEN {$stock['out']} THEN 'out' ELSE 'low' END severity,
+                p.current_stock,p.minimum_stock,a.detected_at,a.last_seen_at,
+                p.name product_name,p.sku,p.barcode,
+                (a.id IS NOT NULL AND r.user_id IS NULL) unread,
+                (a.id IS NOT NULL AND a.status='open') open_notification
+            FROM products p
+            LEFT JOIN pos_stock_alerts a ON a.company_id=p.company_id AND a.product_id=p.id AND a.status='open'
+            LEFT JOIN pos_stock_alert_reads r ON r.alert_id=a.id AND r.user_id=:user
+            WHERE p.company_id=:company AND p.deleted_at IS NULL AND p.status='active'
+              AND (({$stock['out']}) OR ({$stock['low']}))
+            ORDER BY ({$stock['out']}) DESC,p.name",['user'=>$userId,'company'=>$companyId])->fetchAll();
     }
 
     private function syncStockAlerts(int $companyId): void
     {
-        $this->db->query("UPDATE pos_stock_alerts a LEFT JOIN products p ON p.id=a.product_id SET a.status='resolved',a.resolved_at=NOW(),a.last_seen_at=NOW() WHERE a.company_id=:company AND a.status='open' AND (p.id IS NULL OR p.deleted_at IS NOT NULL OR p.current_stock>p.minimum_stock)",['company'=>$companyId]);
-        $products=$this->db->query("SELECT id,current_stock,minimum_stock FROM products WHERE company_id=:company AND deleted_at IS NULL AND current_stock<=minimum_stock",['company'=>$companyId])->fetchAll();
+        $productStock=$this->stockConditionSql('p');$stock=$this->stockConditionSql();
+        $this->db->query("UPDATE pos_stock_alerts a LEFT JOIN products p ON p.id=a.product_id SET a.status='resolved',a.resolved_at=NOW(),a.last_seen_at=NOW() WHERE a.company_id=:company AND a.status='open' AND (p.id IS NULL OR p.deleted_at IS NOT NULL OR p.status<>'active' OR ({$productStock['normal']}))",['company'=>$companyId]);
+        $products=$this->db->query("SELECT id,current_stock,minimum_stock FROM products WHERE company_id=:company AND deleted_at IS NULL AND status='active' AND (({$stock['out']}) OR ({$stock['low']}))",['company'=>$companyId])->fetchAll();
         foreach($products as $product){$severity=(float)$product['current_stock']<=0?'out':'low';$existing=$this->db->query("SELECT id,severity,status FROM pos_stock_alerts WHERE company_id=:company AND product_id=:product",['company'=>$companyId,'product'=>$product['id']])->fetch();$changed=!$existing||$existing['status']!=='open'||$existing['severity']!==$severity;
             $this->db->query("INSERT INTO pos_stock_alerts (company_id,product_id,severity,current_stock,minimum_stock,status) VALUES (:company,:product,:severity,:stock,:minimum,'open') ON DUPLICATE KEY UPDATE detected_at=IF(status='resolved',NOW(),detected_at),severity=VALUES(severity),current_stock=VALUES(current_stock),minimum_stock=VALUES(minimum_stock),status='open',last_seen_at=NOW(),resolved_at=NULL",['company'=>$companyId,'product'=>$product['id'],'severity'=>$severity,'stock'=>$product['current_stock'],'minimum'=>$product['minimum_stock']]);
             if($changed){$alertId=$existing['id']??$this->db->lastInsertId();$this->db->query("DELETE FROM pos_stock_alert_reads WHERE alert_id=:alert",['alert'=>$alertId]);}
@@ -270,7 +304,7 @@ class PosService
 
     private function dashboardData(int $companyId): array
     {
-        $params=['company'=>$companyId];
+        $params=['company'=>$companyId];$stock=$this->stockConditionSql();
         return [
             'today_revenue'=>(float)($this->db->query("SELECT COALESCE(SUM(total_amount),0) FROM orders WHERE company_id=:company AND status='COMPLETED' AND order_date=CURDATE()",$params)->fetchColumn() ?: 0),
             'gross_sales'=>(float)($this->db->query("SELECT COALESCE(SUM(total_amount),0) FROM orders WHERE company_id=:company AND status='COMPLETED' AND total_amount>0 AND order_date=CURDATE()",$params)->fetchColumn() ?: 0),
@@ -278,7 +312,8 @@ class PosService
             'today_orders'=>(int)$this->db->query("SELECT COUNT(*) FROM orders WHERE company_id=:company AND status='COMPLETED' AND total_amount>0 AND order_date=CURDATE()",$params)->fetchColumn(),
             'customers'=>(int)$this->db->query("SELECT COUNT(*) FROM customers WHERE company_id=:company AND deleted_at IS NULL",$params)->fetchColumn(),
             'products'=>(int)$this->db->query("SELECT COUNT(*) FROM products WHERE company_id=:company AND deleted_at IS NULL",$params)->fetchColumn(),
-            'low_stock'=>(int)$this->db->query("SELECT COUNT(*) FROM products WHERE company_id=:company AND deleted_at IS NULL AND current_stock<=minimum_stock",$params)->fetchColumn(),
+            'low_stock'=>(int)$this->db->query("SELECT COUNT(*) FROM products WHERE company_id=:company AND deleted_at IS NULL AND status='active' AND ({$stock['low']})",$params)->fetchColumn(),
+            'out_of_stock'=>(int)$this->db->query("SELECT COUNT(*) FROM products WHERE company_id=:company AND deleted_at IS NULL AND status='active' AND ({$stock['out']})",$params)->fetchColumn(),
             'active_staff'=>(int)$this->db->query("SELECT COUNT(*) FROM users WHERE company_id=:company AND deleted_at IS NULL AND status='active'",$params)->fetchColumn(),
             'outstanding_debt'=>(float)($this->db->query("SELECT COALESCE(SUM(balance),0) FROM customers WHERE company_id=:company AND deleted_at IS NULL",$params)->fetchColumn() ?: 0),
             'hourly_sales'=>$this->db->query("SELECT HOUR(created_at) hour,ROUND(SUM(total_amount),2) total,COUNT(*) orders FROM orders WHERE company_id=:company AND status='COMPLETED' AND order_date=CURDATE() GROUP BY HOUR(created_at) ORDER BY hour",$params)->fetchAll(),

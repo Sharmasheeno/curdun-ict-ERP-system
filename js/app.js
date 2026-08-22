@@ -303,9 +303,11 @@ function posStockThreshold(product) {
   return Number.isFinite(n) && n >= 0 ? n : 5;
 }
 function posIsOutOfStock(product) {
+  if (product?.status && product.status !== 'active') return false;
   return Number(product?.stock ?? product?.current_stock ?? 0) <= 0;
 }
 function posIsLowStock(product) {
+  if (product?.status && product.status !== 'active') return false;
   const stock = Number(product?.stock ?? product?.current_stock ?? 0);
   return stock > 0 && stock <= posStockThreshold(product);
 }
@@ -315,7 +317,10 @@ function posStockStatus(product) {
   return 'OK';
 }
 function posCountLowStock() {
-  return POS_PRODUCTS.filter(p => posIsLowStock(p) || posIsOutOfStock(p)).length;
+  return POS_PRODUCTS.filter(posIsLowStock).length;
+}
+function posCountOutOfStock() {
+  return POS_PRODUCTS.filter(posIsOutOfStock).length;
 }
 
 /**
@@ -4901,6 +4906,7 @@ function renderPOSDash() {
         <div class="kpi-trend">Per transaction</div>
       </div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Open registers</div><div class="kpi-value">${Number(dashboard.open_sessions||0)}</div><div class="kpi-trend">${Number(dashboard.active_staff||0)} active staff accounts</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Low stock</div><div class="kpi-value trend-warn">${Number(dashboard.low_stock||0)}</div><div class="kpi-trend">${Number(dashboard.out_of_stock||0)} out of stock · live inventory</div></div>
     </div>
     <div style="display:grid;grid-template-columns:2fr 1fr;gap:16px">
       <div class="chart-card">
@@ -5317,7 +5323,8 @@ function renderPOSProducts() {
     <div class="kpi-grid">
       <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Total products</div><div class="kpi-value">${POS_PRODUCTS.length}</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Categories</div><div class="kpi-value">${cats.length}</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Low stock</div><div class="kpi-value trend-warn">${posCountLowStock()}</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Low stock</div><div class="kpi-value trend-warn">${posCountLowStock()}</div><div class="kpi-trend">In stock at or below minimum</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Out of stock</div><div class="kpi-value trend-warn">${posCountOutOfStock()}</div><div class="kpi-trend">Current stock is zero</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Total value</div><div class="kpi-value">$${POS_PRODUCTS.reduce((s,p)=>s+p.price*p.stock,0).toFixed(0)}</div></div>
     </div>
     <div class="data-section">
@@ -6363,6 +6370,7 @@ function renderPOSReports() {
 function renderPOSNotifications() {
   const alerts = S.posStockAlerts || [];
   const unread = alerts.filter(alert=>Number(alert.unread));
+  const openNotifications = alerts.filter(alert=>Number(alert.open_notification));
   const out = alerts.filter(alert=>alert.severity==='out');
   const low = alerts.filter(alert=>alert.severity==='low');
   return `
@@ -6370,11 +6378,11 @@ function renderPOSNotifications() {
       <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Unread alerts</div><div class="kpi-value">${unread.length}</div><div class="kpi-trend" style="color:#EFEAFB">Personal notification count</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Out of stock</div><div class="kpi-value" style="color:${out.length?'#B91C1C':'inherit'}">${out.length}</div><div class="kpi-trend">Needs immediate restock</div></div>
       <div class="kpi-card light"><div class="kpi-eyebrow">Low stock</div><div class="kpi-value">${low.length}</div><div class="kpi-trend">At or below minimum level</div></div>
-      <div class="kpi-card light"><div class="kpi-eyebrow">Open notifications</div><div class="kpi-value">${alerts.length}</div><div class="kpi-trend">Automatically resolves after restock</div></div>
+      <div class="kpi-card light"><div class="kpi-eyebrow">Open notifications</div><div class="kpi-value">${openNotifications.length}</div><div class="kpi-trend">Notification state, separate from inventory</div></div>
     </div>
     <div class="data-section">
       <div class="section-header-bar">
-        <div><h3 class="chart-title">Products Needed</h3><div style="font-size:11px;color:var(--text-muted);margin-top:3px">Notifications are created when stock reaches its configured minimum.</div></div>
+        <div><h3 class="chart-title">Products Needed</h3><div style="font-size:11px;color:var(--text-muted);margin-top:3px">Live inventory condition; read status only affects the personal notification count.</div></div>
         <button class="btn btn-outline btn-sm ml-auto" id="btn-refresh-stock-alerts">Refresh</button>
         <button class="btn btn-primary btn-sm" id="btn-read-all-stock-alerts" ${unread.length?'':'disabled'}>Mark all read</button>
       </div>

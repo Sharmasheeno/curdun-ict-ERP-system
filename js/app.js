@@ -3882,6 +3882,7 @@ function wireRegisterModal() {
 
   // Cash In / Cash Out
   document.getElementById('rc-cash-submit')?.addEventListener('click', async () => {
+    if(m.busy)return;
     const amount = Number(document.getElementById('rc-cash-amount').value);
     const reason = (document.getElementById('rc-cash-reason').value || '').trim();
     if (!Number.isFinite(amount) || amount <= 0) { m.error = 'Enter an amount greater than zero.'; render(); return; }
@@ -5162,7 +5163,7 @@ function renderPOSCheckout() {
 
         <div class="pos-cart-actions">
           <button class="pos-charge-btn" id="btn-pos-charge" ${canValidate?'':'disabled'}>
-            ${canValidate ? `Validate $${total.toFixed(2)}` : `Validate`}
+            ${S.posCheckoutUncertain ? 'Retry sale' : (canValidate ? `Validate $${total.toFixed(2)}` : `Validate`)}
           </button>
           <button class="pos-clear-btn" id="btn-pos-clear" ${cart.length===0?'disabled':''}>Clear</button>
         </div>
@@ -5889,7 +5890,8 @@ function wireRefundModal() {
   });
   const submit = document.getElementById('btn-refund-submit');
   if (submit && submit.dataset.posWired !== '1') { submit.dataset.posWired = '1'; submit.addEventListener('click', async () => {
-    if (submit.disabled) return;
+    if (submit.disabled || S.posRefundModal?.submitting) return;
+    S.posRefundModal.submitting=true;
     submit.disabled = true; submit.textContent = 'Validating…';
     const items = S.posRefundModal.lines
         .filter(l => Number(l.refund_qty) > 0)
@@ -5915,6 +5917,7 @@ function wireRefundModal() {
         originalOrder: modalOrder,
       };
       S.posReceiptVisible = true;
+      S.posRefundModal && (S.posRefundModal.submitting=false);
       render();
     };
     try {
@@ -5930,7 +5933,8 @@ function wireRefundModal() {
         return;
       }
       alert(e.message || 'Refund failed.');
-      if(e.simulatedLostResponse){S.posRefundModal.uncertain=true;S.posRefundModal.error=e.message;render();return;}
+      if(S.posRefundModal)S.posRefundModal.submitting=false;
+      if(e.simulatedLostResponse){S.posRefundModal.uncertain=true;S.posRefundModal.uncertainMessage=e.message;render();return;}
       submit.disabled = false; submit.textContent = 'Validate refund';
     }
   }); }
@@ -6885,6 +6889,7 @@ function wirePOSEvents() {
   document.getElementById('btn-account-close')?.addEventListener('click', () => { S.posCustomerAccount=null; render(); });
   document.getElementById('btn-account-payment-open')?.addEventListener('click', () => { S.posCustomerAccount={...S.posCustomerAccount,settleOpen:true}; render(); });
   document.getElementById('btn-account-payment-cancel')?.addEventListener('click', () => { if(S.posCustomerAccount?.uncertain)return;S.posCustomerAccount={...S.posCustomerAccount,settleOpen:false,submitError:''}; render(); });
+  document.getElementById('account-payment-amount')?.addEventListener('input', event => { if(S.posCustomerAccount?.uncertain){render();return;}S.posCustomerAccount={...S.posCustomerAccount,amount:event.target.value}; });
   document.getElementById('account-payment-method')?.addEventListener('change', event => { if(S.posCustomerAccount?.uncertain){render();return;}S.posCustomerAccount={...S.posCustomerAccount,method:event.target.value,reference:''}; render(); });
   document.getElementById('btn-account-payment-submit')?.addEventListener('click', async () => {
     const state=S.posCustomerAccount; if(!state?.data||state.submitting)return;
@@ -7183,13 +7188,14 @@ function wirePOSEvents() {
     if (chargeBtn && chargeBtn.dataset.posWired !== '1') {
       chargeBtn.dataset.posWired = '1';
       chargeBtn.addEventListener('click', async () => {
-        if (chargeBtn.disabled) return;
+        if (chargeBtn.disabled || S.posCheckoutSubmitting) return;
         // Guard against double-click while the request is in flight —
         // idempotency UUID also protects the backend, but this is a UX belt.
         chargeBtn.disabled = true;
         chargeBtn.textContent = 'Validating…';
+        S.posCheckoutSubmitting=true;
         try { await finalizeCharge(); }
-        finally { /* render() re-renders the button anyway */ }
+        finally { S.posCheckoutSubmitting=false; /* render() re-renders the button anyway */ }
       });
     }
     const clearBtn = document.getElementById('btn-pos-clear');

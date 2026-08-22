@@ -1,0 +1,53 @@
+param([int]$Port=9460)
+$ErrorActionPreference='Stop'
+$edge='C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
+$profile=Join-Path $env:TEMP "curdun-p14c-visible-$Port"
+$url='http://localhost:8000/app.html?pos_test_drop=ALL&pos_test_reset=1'
+$proc=Start-Process -FilePath $edge -ArgumentList @('--headless','--disable-gpu','--disable-extensions','--no-first-run','--remote-allow-origins=*',"--remote-debugging-port=$Port","--user-data-dir=$profile",$url) -WindowStyle Hidden -PassThru
+$ws=$null
+try {
+ $page=$null;for($i=0;$i -lt 60 -and !$page;$i++){Start-Sleep -Milliseconds 200;try{foreach($candidate in (Invoke-RestMethod "http://localhost:$Port/json/list")){if($candidate.type -eq 'page' -and $candidate.url -like 'http://localhost:8000/*'){$page=$candidate;break}}}catch{}}
+ if(!$page){throw 'No browser page'}
+ $ws=[Net.WebSockets.ClientWebSocket]::new();$ws.ConnectAsync([Uri]$page.webSocketDebuggerUrl,[Threading.CancellationToken]::None).GetAwaiter().GetResult()|Out-Null
+ $script=@'
+(async()=>{
+ const pause=ms=>new Promise(r=>setTimeout(r,ms));
+ const wait=async(fn,label)=>{for(let i=0;i<150;i++){const v=fn();if(v)return v;await pause(100);}throw new Error('Timeout '+label)};
+ const fill=(el,value)=>{el.value=value;el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));};
+ window.alert=m=>{window.__cAlerts=(window.__cAlerts||[]).concat(String(m));};
+ await wait(()=>typeof posPinLogin==='function','scripts');await posPinLogin('1234',3,1);if(!S.posSession||S.posSession.state!=='OPENED')await posOpenSession(0);
+ const evidence=action=>posIdempotencyEvidence().filter(x=>x.action===action);
+ const keyState=action=>{const rows=evidence(action);return{first:rows[0],replay:rows[1],pending:{...(S.posPendingKeys||{})}}};
+ const product=POS_PRODUCTS.find(p=>p.id===1)||POS_PRODUCTS[0];
+
+ // C1 actual product, payment and Validate controls.
+ S.view='pos';S.posStoreType='retail';S.posView='session';S.posTab='checkout';S.posCart=[];posResetPaymentLines();S.posCheckoutUncertain=false;render();await pause(400);
+ (await wait(()=>document.querySelector(`[data-add-product="${product.id}"]`),'product control')).click();await wait(()=>S.posCart.length===1&&S.posQuote&&!S.posQuoteLoading,'checkout quote');
+ document.querySelector('[data-add-method="Cash"]').click();await wait(()=>!document.querySelector('#btn-pos-charge').disabled,'Validate enabled');
+ const beforeCheckout={cart:JSON.stringify(S.posCart),customer:S.posDebtCustomerId,pricelist:S.posSelectedPricelistId,reward:S.posSelectedRewardId,payments:JSON.stringify(S.posPaymentLines)};
+ const validate=document.querySelector('#btn-pos-charge');validate.click();validate.click();await wait(()=>S.posCheckoutUncertain,'checkout uncertain');
+ const lostCheckout=evidence('CHECKOUT')[0];const pendingCheckout=S.posPendingOrderId===lostCheckout.key;
+ document.querySelector('[data-qty-plus="0"]')?.click();const customer=document.querySelector('#pos-deyn-customer');if(customer){customer.value=customer.options[customer.options.length-1]?.value||'';customer.dispatchEvent(new Event('change',{bubbles:true}));}const price=document.querySelector('#pos-pricelist-select');if(price){price.value=price.options[price.options.length-1]?.value||'';price.dispatchEvent(new Event('change',{bubbles:true}));}document.querySelector('#btn-pos-rewards')?.click();document.querySelector('[data-add-method="EVC Plus"]')?.click();document.querySelector('.pos-pay-line-remove')?.click();document.querySelector('#btn-hold-order')?.click();await pause(250);
+ const afterMutation={cart:JSON.stringify(S.posCart),customer:S.posDebtCustomerId,pricelist:S.posSelectedPricelistId,reward:S.posSelectedRewardId,payments:JSON.stringify(S.posPaymentLines)};
+ const checkoutLocked=JSON.stringify(beforeCheckout)===JSON.stringify(afterMutation);
+ const retrySale=document.querySelector('#btn-pos-charge');const retrySaleText=retrySale.textContent.trim();retrySale.click();await wait(()=>S.posReceiptVisible&&!S.posCheckoutUncertain,'checkout replay');const checkoutRef=S.posLastReceipt.id;const checkoutKey=keyState('CHECKOUT');const checkoutKeyCleared=S.posPendingOrderId===null;S.posReceiptVisible=false;
+
+ // C2 actual Orders -> Refund composer -> Validate/Retry.
+ S.posView='backoffice';S.posBackofficeTab='orders';render();await pause(500);const refundLaunch=await wait(()=>document.querySelector(`[data-refund-txn="${checkoutRef}"]`),'refund control');refundLaunch.click();await wait(()=>document.querySelector('.pos-refund-qty'),'refund modal');await pause(300);
+ fill(document.querySelector('.pos-refund-qty'),'1');await pause(250);document.querySelector('.pos-refund-add-method[data-add-method="Cash"]').click();await pause(300);const refundIntent=()=>JSON.stringify({qty:S.posRefundModal.lines.map(x=>x.refund_qty),payments:S.posRefundModal.payments});const refundBefore=refundIntent();const refundSubmit=document.querySelector('#btn-refund-submit');refundSubmit.click();refundSubmit.click();await wait(()=>S.posRefundModal?.uncertain,'refund uncertain');const lostRefund=evidence('REFUND')[0];const lockedQty=document.querySelector('.pos-refund-qty');if(lockedQty)fill(lockedQty,'0');document.querySelector('.pos-refund-pay-remove')?.click();await pause(200);const refundLocked=refundIntent()===refundBefore;const retryRefundText=document.querySelector('#btn-refund-submit').textContent.trim();document.querySelector('#btn-refund-submit').click();await wait(()=>S.posReceiptVisible&&S.posLastReceipt?.isRefund,'refund replay');const refundRef=S.posLastReceipt.id;const refundKey=keyState('REFUND');const refundKeyCleared=!Object.values(S.posPendingKeys).includes(lostRefund.key);S.posReceiptVisible=false;
+
+ const cashFlow=async(type,amount,reason)=>{S.posView='backoffice';S.posBackofficeTab='sessions';render();await pause(400);document.querySelector(type==='IN'?'#btn-cash-in':'#btn-cash-out').click();await wait(()=>document.querySelector('#rc-cash-amount'),'cash modal');await pause(250);fill(document.querySelector('#rc-cash-amount'),String(amount));fill(document.querySelector('#rc-cash-reason'),reason);const before={amount:String(amount),reason};const submit=document.querySelector('#rc-cash-submit');submit.click();submit.click();await wait(()=>S.posRegisterModal?.uncertain,'cash uncertain');const action=`CASH_${type}`,lost=evidence(action)[0];const amountDisabled=document.querySelector('#rc-cash-amount').disabled,reasonDisabled=document.querySelector('#rc-cash-reason').disabled,retryText=document.querySelector('#rc-cash-submit').textContent.trim();document.querySelector('#rc-cash-submit').click();await wait(()=>!S.posRegisterModal,'cash replay');const keys=keyState(action);return{before,lost,keys,retryText,locked:amountDisabled&&reasonDisabled,keyCleared:!Object.values(S.posPendingKeys).includes(lost.key)};};
+ const cashIn=await cashFlow('IN',30,'C visible Small bills');const cashOut=await cashFlow('OUT',20,'C visible Supplies');
+
+ // C5 actual Customer Account form.
+ await posBootstrap();const debtCustomer=POS_CUSTOMERS.find(c=>Number(c.debtBalance)>=25);if(!debtCustomer)throw new Error('No customer debt >=25');S.posView='backoffice';S.posBackofficeTab='customers';render();await pause(400);document.querySelector(`[data-account-customer="${debtCustomer.id}"]`).click();await wait(()=>S.posCustomerAccount?.data&&!S.posCustomerAccount.loading,'account');const debtBefore=Number(S.posCustomerAccount.data.customer.balance);await pause(250);document.querySelector('#btn-account-payment-open').click();await wait(()=>document.querySelector('#account-payment-amount'),'payment form');await pause(250);fill(document.querySelector('#account-payment-amount'),'25');const method=document.querySelector('#account-payment-method');method.value='Cash';method.dispatchEvent(new Event('change',{bubbles:true}));await pause(250);const settle=document.querySelector('#btn-account-payment-submit');settle.click();settle.click();await wait(()=>S.posCustomerAccount?.uncertain,'settlement uncertain');const lostSettlement=evidence('CUSTOMER_ACCOUNT_PAYMENT')[0];const settlementLocked=document.querySelector('#account-payment-amount').disabled&&document.querySelector('#account-payment-method').disabled;const retryPaymentText=document.querySelector('#btn-account-payment-submit').textContent.trim();document.querySelector('#btn-account-payment-submit').click();await wait(()=>S.posCustomerAccount?.data&&!S.posCustomerAccount.settleOpen&&!S.posCustomerAccount.submitting,'settlement replay');const debtAfter=Number(S.posCustomerAccount.data.customer.balance),settlementKey=keyState('CUSTOMER_ACCOUNT_PAYMENT');const settlementKeyCleared=!Object.values(S.posPendingKeys).includes(lostSettlement.key);
+
+ // Known validation failure stays a normal failure, not uncertain.
+ S.posCustomerAccount={...S.posCustomerAccount,settleOpen:true,amount:'999999',uncertain:false};render();await pause(250);fill(document.querySelector('#account-payment-amount'),'999999');document.querySelector('#btn-account-payment-submit').click();await pause(250);const knownFailure={uncertain:Boolean(S.posCustomerAccount.uncertain),message:S.posCustomerAccount.submitError};
+ return{sessionId:S.posSession.id,checkout:{reference:checkoutRef,lost:lostCheckout,key:checkoutKey,pendingAfterLoss:pendingCheckout,keyCleared:checkoutKeyCleared,retryText:retrySaleText,locked:checkoutLocked},refund:{reference:refundRef,lost:lostRefund,key:refundKey,keyCleared:refundKeyCleared,retryText:retryRefundText,locked:refundLocked},cashIn,cashOut,settlement:{customerId:debtCustomer.id,debtBefore,debtAfter,lost:lostSettlement,key:settlementKey,keyCleared:settlementKeyCleared,retryText:retryPaymentText,locked:settlementLocked},knownFailure,allEvidence:posIdempotencyEvidence()};
+})()
+'@
+ $msg=@{id=1;method='Runtime.evaluate';params=@{expression=$script;awaitPromise=$true;returnByValue=$true}}|ConvertTo-Json -Depth 8 -Compress;$bytes=[Text.Encoding]::UTF8.GetBytes($msg);$ws.SendAsync([ArraySegment[byte]]::new($bytes),[Net.WebSockets.WebSocketMessageType]::Text,$true,[Threading.CancellationToken]::None).GetAwaiter().GetResult()|Out-Null
+ while($true){$buf=New-Object byte[] 1048576;$recv=$ws.ReceiveAsync([ArraySegment[byte]]::new($buf),[Threading.CancellationToken]::None).GetAwaiter().GetResult();$response=([Text.Encoding]::UTF8.GetString($buf,0,$recv.Count)|ConvertFrom-Json);if($response.id -eq 1){if($response.result.exceptionDetails){throw($response.result.exceptionDetails|ConvertTo-Json -Depth 8)};$browser=$response.result.result.value;break}}
+ $browser|ConvertTo-Json -Depth 15
+} finally {if($ws){$ws.Dispose()};if($proc -and !$proc.HasExited){Stop-Process -Id $proc.Id -Force}}

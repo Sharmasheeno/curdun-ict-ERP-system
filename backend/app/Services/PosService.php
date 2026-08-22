@@ -731,17 +731,33 @@ class PosService
     {
         [$user,$companyId]=$this->context();$type=strtoupper((string)($data['type']??''));$amount=round((float)($data['amount']??0),2);$reason=trim((string)($data['reason']??''));
         if(!in_array($type,['IN','OUT'],true)||$amount<=0||$reason==='')throw new Exception('Cash movement type, amount, and reason are required.',422);
-        // Optional Curdun Extra Security (Rule #9): cash OUT can require an
-        // approval token when the tenant enables the extra_security.cash_out
-        // toggle. Cash IN never does — Odoo treats it as a routine deposit.
-        if ($type === 'OUT') {
-            $this->enforceExtraSecurity($companyId,'cash-out',['target_id'=>$sessionId,'amount'=>$amount],'cash_out');
+        // P13 - idempotency covers both IN and OUT; scoped by cash direction
+        // via the action tag so a Cash In and Cash Out with the same UUID
+        // don't collide (they legitimately are different intended ops).
+        $idemKey = $this->idemKey($data);
+        $action = 'CASH_' . $type;
+        $payloadForHash = $data + ['_session' => $sessionId, '_direction' => $type];
+        unset($payloadForHash['idempotency_key']);
+        $replay = $this->idemBegin($companyId, $action, $idemKey, $payloadForHash);
+        if ($replay !== null) return $replay;
+        try {
+            // Optional Curdun Extra Security (Rule #9): cash OUT can require an
+            // approval token when the tenant enables the extra_security.cash_out
+            // toggle. Cash IN never does — Odoo treats it as a routine deposit.
+            if ($type === 'OUT') {
+                $this->enforceExtraSecurity($companyId,'cash-out',['target_id'=>$sessionId,'amount'=>$amount],'cash_out');
+            }
+            $session=$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company AND state='OPENED'",['id'=>$sessionId,'company'=>$companyId])->fetch();
+            if(!$session)throw new Exception('The POS register is not open.',409);
+            $this->db->query("INSERT INTO pos_cash_movements (company_id,session_id,user_id,movement_type,subtype,amount,reason) VALUES (:company,:session,:user,:type,'MANUAL',:amount,:reason)",['company'=>$companyId,'session'=>$sessionId,'user'=>$user['id'],'type'=>$type,'amount'=>$amount,'reason'=>$reason]);
+            $id=(int)$this->db->lastInsertId();$this->log($user,$companyId,'CASH_'.$type,$id,['session_id'=>$sessionId,'amount'=>$amount,'reason'=>$reason]);
+            $response = ['id'=>$id,'session_id'=>$sessionId,'type'=>$type,'amount'=>$amount,'reason'=>$reason,'created_at'=>date('c')];
+            $this->idemComplete($companyId, $action, $idemKey, $response);
+            return $response;
+        } catch (\Throwable $e) {
+            $this->idemRelease($companyId, $action, $idemKey);
+            throw $e;
         }
-        $session=$this->db->query("SELECT * FROM pos_sessions WHERE id=:id AND company_id=:company AND state='OPENED'",['id'=>$sessionId,'company'=>$companyId])->fetch();
-        if(!$session)throw new Exception('The POS register is not open.',409);
-        $this->db->query("INSERT INTO pos_cash_movements (company_id,session_id,user_id,movement_type,subtype,amount,reason) VALUES (:company,:session,:user,:type,'MANUAL',:amount,:reason)",['company'=>$companyId,'session'=>$sessionId,'user'=>$user['id'],'type'=>$type,'amount'=>$amount,'reason'=>$reason]);
-        $id=(int)$this->db->lastInsertId();$this->log($user,$companyId,'CASH_'.$type,$id,['session_id'=>$sessionId,'amount'=>$amount,'reason'=>$reason]);
-        return ['id'=>$id,'session_id'=>$sessionId,'type'=>$type,'amount'=>$amount,'reason'=>$reason,'created_at'=>date('c')];
     }
 
     private function transactionsData(int $companyId): array
@@ -880,8 +896,22 @@ class PosService
     {
         // BASIC-level operation — pos.refund is enforced by the route.
         [$user,$companyId]=$this->context();
+        // P13 - Refund idempotency. Key is scoped to the ORIGINAL order id +
+        // the client's idempotency_key so retries against the same target
+        // don't double-refund. Different quantities under the same key hit
+        // 409 KEY_REUSED.
+        $refundKey = $this->idemKey($data);
+        $payloadForHash = $data + ['_target_order' => $id];
+        unset($payloadForHash['idempotency_key']);
+        $replay = $this->idemBegin($companyId, 'REFUND', $refundKey, $payloadForHash);
+        if ($replay !== null) return $replay;
         // Optional Curdun Extra Security (Rule #9). Odoo default = off.
-        $this->enforceExtraSecurity($companyId,'refund',['target_id'=>$id],'refund');
+        try {
+            $this->enforceExtraSecurity($companyId,'refund',['target_id'=>$id],'refund');
+        } catch (\Throwable $e) {
+            $this->idemRelease($companyId, 'REFUND', $refundKey);
+            throw $e;
+        }
         $this->db->beginTransaction();
         try {
             $order=$this->db->query("SELECT * FROM orders WHERE id=:id AND company_id=:company FOR UPDATE",['id'=>$id,'company'=>$companyId])->fetch();
@@ -1076,9 +1106,13 @@ class PosService
                 'payments'          => array_map(fn($l)=>['method'=>$l['method']['name'],'amount'=>$l['amount']], $refundPaymentLines),
             ]);
             $this->db->commit();
-        } catch(\Throwable $e){if($this->db->getConnection()->inTransaction())$this->db->rollback();throw $e;}
+        } catch(\Throwable $e){
+            if($this->db->getConnection()->inTransaction())$this->db->rollback();
+            $this->idemRelease($companyId, 'REFUND', $refundKey);
+            throw $e;
+        }
         $this->syncStockAlerts($companyId);
-        return [
+        $response = [
             'id'                => $refundId,
             'reference_number'  => $reference,
             'status'            => 'COMPLETED',
@@ -1090,6 +1124,8 @@ class PosService
             'created_at'        => date('c'),
             'original_refund_status' => $this->computeRefundStatus($companyId, $id),
         ];
+        $this->idemComplete($companyId, 'REFUND', $refundKey, $response);
+        return $response;
     }
 
     /**
@@ -1125,9 +1161,15 @@ class PosService
     {
         [$user,$companyId]=$this->context();
         $items=$data['items']??[];if(!is_array($items)||!$items)throw new Exception('Cart is empty.',422);
-        $clientUuid=trim((string)($data['client_order_id']??$data['uuid']??''));if($clientUuid===''||!preg_match('/^[a-f0-9-]{36}$/i',$clientUuid))$clientUuid=$this->uuid();
-        $existing=$this->db->query("SELECT id FROM orders WHERE company_id=:company AND uuid=:uuid LIMIT 1",['company'=>$companyId,'uuid'=>$clientUuid])->fetch();
-        if($existing)return $this->checkoutResponse((int)$existing['id'],$companyId,true);
+        // P13 - Real idempotency guard. The client_order_id is the intended
+        // key; if absent we generate one but the guarantee only kicks in for
+        // callers that reuse the SAME key on retry. Same key + same payload
+        // replays the stored response. Same key + different payload rejects
+        // with 409. Cross-tenant isolation via company_id in the UNIQUE.
+        $clientUuid = $this->idemKey($data);
+        $payloadForHash = $data; unset($payloadForHash['client_order_id'], $payloadForHash['idempotency_key'], $payloadForHash['uuid']);
+        $replay = $this->idemBegin($companyId, 'CHECKOUT', $clientUuid, $payloadForHash);
+        if ($replay !== null) return $replay;
         $customerId=!empty($data['customer_id'])?(int)$data['customer_id']:null;
         $customer=$customerId?$this->customer($customerId,$companyId):null;
         $config=$this->resolveConfig($companyId,isset($user['branch_id'])?(int)$user['branch_id']:null);
@@ -1490,10 +1532,16 @@ class PosService
             }
 
             $this->log($user,$companyId,'CHECKOUT',$orderId,['reference'=>$reference,'uuid'=>$clientUuid,'session_id'=>$session['id'],'total'=>$total,'payments'=>array_map(fn($p)=>['method'=>$p['method']['name'],'amount'=>$p['amount']],$payments),'change'=>$change,'loyalty_earned'=>$pointsEarned,'loyalty_redeemed'=>$redeemedPoints]);$this->db->commit();
-        }catch(\Throwable $e){if($this->db->getConnection()->inTransaction())$this->db->rollback();throw $e;}
+        }catch(\Throwable $e){
+            if($this->db->getConnection()->inTransaction())$this->db->rollback();
+            // Release the idempotency reservation so a fresh retry can proceed.
+            $this->idemRelease($companyId, 'CHECKOUT', $clientUuid);
+            throw $e;
+        }
         $this->syncStockAlerts($companyId);
         $response = $this->checkoutResponse($orderId,$companyId,false);
         if (!empty($creditWarning)) $response['credit_warning'] = $creditWarning;
+        $this->idemComplete($companyId, 'CHECKOUT', $clientUuid, $response);
         return $response;
     }
 
@@ -1606,6 +1654,206 @@ class PosService
     private function uuid(): string
     {
         $bytes=random_bytes(16);$bytes[6]=chr((ord($bytes[6])&0x0f)|0x40);$bytes[8]=chr((ord($bytes[8])&0x3f)|0x80);$hex=bin2hex($bytes);return substr($hex,0,8).'-'.substr($hex,8,4).'-'.substr($hex,12,4).'-'.substr($hex,16,4).'-'.substr($hex,20);
+    }
+
+    // =========================================================================
+    // P13 - Backend idempotency for financial mutations
+    // =========================================================================
+    //
+    // Contract:
+    //   Same (company_id, action, idempotency_key)
+    //     + same request_hash  -> replay the stored response.
+    //   Same key + DIFFERENT request_hash -> 409 KEY_REUSED.
+    //   Different key         -> new operation.
+    //   Cross-tenant collision on the UUID is impossible because company_id
+    //     is part of the UNIQUE constraint; Company B cannot read A's row.
+    //
+    // Reservation is atomic via the UNIQUE key: a lost race INSERT throws
+    // SQLSTATE 23000 and the loser falls back to the read/replay branch.
+    // On failure of the wrapped operation, the reservation row is DELETED
+    // so a fresh retry with the same key succeeds — never "stuck PROCESSING".
+
+    private function requestHash(array $payload): string
+    {
+        // Canonical sort so key order doesn't affect the hash.
+        $canonical = function(array $arr) use (&$canonical) {
+            ksort($arr);
+            foreach ($arr as $k => $v) if (is_array($v)) $arr[$k] = $canonical($v);
+            return $arr;
+        };
+        return hash('sha256', json_encode($canonical($payload)));
+    }
+
+    /**
+     * Split-phase idempotency helpers. Callers use this shape:
+     *
+     *   $key = $this->idemKey($data);        // pick or generate
+     *   $existing = $this->idemBegin($companyId, 'CHECKOUT', $key, $data);
+     *   if ($existing !== null) return $existing;   // replay stored response
+     *   try {
+     *       ... existing operation body ...
+     *       $result = ...;                   // MUST include 'id' when applicable
+     *       $this->idemComplete($companyId, 'CHECKOUT', $key, $result);
+     *       return $result;
+     *   } catch (\Throwable $e) {
+     *       $this->idemRelease($companyId, 'CHECKOUT', $key);
+     *       throw $e;
+     *   }
+     */
+    private function idemKey(array $data): string
+    {
+        $raw = trim((string)($data['idempotency_key'] ?? $data['client_order_id'] ?? $data['uuid'] ?? ''));
+        if ($raw === '' || !preg_match('/^[a-f0-9\-]{8,64}$/i', $raw)) return $this->uuid();
+        return $raw;
+    }
+
+    private function idemBegin(int $companyId, string $action, string $key, array $payload): ?array
+    {
+        $hash = $this->requestHash($payload);
+        try {
+            $this->db->query(
+                "INSERT INTO pos_idempotency_keys
+                    (company_id, action, idempotency_key, request_hash, status)
+                 VALUES (:company, :action, :key, :hash, 'PROCESSING')",
+                ['company' => $companyId, 'action' => $action, 'key' => $key, 'hash' => $hash]
+            );
+            return null; // caller proceeds
+        } catch (\PDOException $e) {
+            if (!in_array((string)$e->getCode(), ['23000', '23505'], true)) throw $e;
+            $row = $this->db->query(
+                "SELECT * FROM pos_idempotency_keys
+                 WHERE company_id=:company AND action=:action AND idempotency_key=:key LIMIT 1",
+                ['company' => $companyId, 'action' => $action, 'key' => $key]
+            )->fetch();
+            if (!$row) throw $e;
+            if ($row['request_hash'] !== $hash) {
+                throw new Exception('Idempotency key already used with a different request. Generate a new key for a new operation.', 409);
+            }
+            if ($row['status'] === 'PROCESSING') {
+                throw new Exception('This operation is already being processed. Retry momentarily.', 409);
+            }
+            $prior = json_decode($row['response_data'], true) ?? [];
+            $prior['idempotent_replay'] = true;
+            return $prior;
+        }
+    }
+
+    private function idemComplete(int $companyId, string $action, string $key, array $result): void
+    {
+        $this->db->query(
+            "UPDATE pos_idempotency_keys
+             SET status='COMPLETED', response_data=:body, entity_id=:eid, http_status=201, completed_at=NOW()
+             WHERE company_id=:company AND action=:action AND idempotency_key=:key",
+            [
+                'body'    => json_encode($result),
+                'eid'     => is_numeric($result['id'] ?? null) ? (int)$result['id'] : null,
+                'company' => $companyId,
+                'action'  => $action,
+                'key'     => $key,
+            ]
+        );
+    }
+
+    private function idemRelease(int $companyId, string $action, string $key): void
+    {
+        $this->db->query(
+            "DELETE FROM pos_idempotency_keys
+             WHERE company_id=:company AND action=:action AND idempotency_key=:key AND status='PROCESSING'",
+            ['company' => $companyId, 'action' => $action, 'key' => $key]
+        );
+    }
+
+    /**
+     * @param string   $action  CHECKOUT | REFUND | CASH_MOVEMENT | CUSTOMER_ACCOUNT_PAYMENT
+     * @param string   $key     Client-supplied UUID
+     * @param array    $payload The request body (used for request_hash)
+     * @param callable $do      fn(): array — the actual operation. Return
+     *                          value becomes response_data. Must be safe to
+     *                          NOT run if a duplicate is detected.
+     * @param array    $extras  Optional pos_config_id / session_id snapshot.
+     * @return array [ 'result' => mixed, 'replayed' => bool ]
+     */
+    private function withIdempotency(int $companyId, string $action, string $key, array $payload, callable $do, array $extras = []): array
+    {
+        if ($key === '' || !preg_match('/^[a-f0-9\-]{8,64}$/i', $key)) {
+            // Auto-generate a key if the client didn't send one — protects
+            // legacy callers, but the guarantee only kicks in for callers
+            // that send a stable key across retries.
+            $key = $this->uuid();
+        }
+        $hash = $this->requestHash($payload);
+
+        try {
+            $this->db->query(
+                "INSERT INTO pos_idempotency_keys
+                    (company_id, pos_config_id, session_id, action, idempotency_key, request_hash, status)
+                 VALUES
+                    (:company, :config, :session, :action, :key, :hash, 'PROCESSING')",
+                [
+                    'company' => $companyId,
+                    'config'  => $extras['pos_config_id'] ?? null,
+                    'session' => $extras['session_id'] ?? null,
+                    'action'  => $action,
+                    'key'     => $key,
+                    'hash'    => $hash,
+                ]
+            );
+        } catch (\PDOException $e) {
+            // Duplicate key hit — investigate the existing row.
+            if (!in_array((string)$e->getCode(), ['23000', '23505'], true)) {
+                throw $e; // real DB error, bubble up
+            }
+            $existing = $this->db->query(
+                "SELECT * FROM pos_idempotency_keys
+                 WHERE company_id = :company AND action = :action AND idempotency_key = :key
+                 LIMIT 1",
+                ['company' => $companyId, 'action' => $action, 'key' => $key]
+            )->fetch();
+            if (!$existing) throw $e; // race + gone; unexpected
+            if ($existing['request_hash'] !== $hash) {
+                throw new Exception('Idempotency key already used with a different request. If this is a new operation, generate a new key.', 409);
+            }
+            if ($existing['status'] === 'PROCESSING') {
+                // Another concurrent request holds the reservation.
+                throw new Exception('This operation is already being processed. Retry momentarily.', 409);
+            }
+            // COMPLETED — replay the stored response.
+            return [
+                'result'   => json_decode($existing['response_data'], true) ?? [],
+                'replayed' => true,
+            ];
+        }
+
+        // Ownership secured. Run the actual operation.
+        try {
+            $result = $do($key);
+            $this->db->query(
+                "UPDATE pos_idempotency_keys
+                 SET status='COMPLETED', response_data = :body, http_status = 201,
+                     entity_type = :etype, entity_id = :eid, completed_at = NOW()
+                 WHERE company_id = :company AND action = :action AND idempotency_key = :key",
+                [
+                    'body'    => json_encode($result),
+                    'etype'   => $extras['entity_type'] ?? null,
+                    'eid'     => is_array($result) ? ($result['id'] ?? null) : null,
+                    'company' => $companyId,
+                    'action'  => $action,
+                    'key'     => $key,
+                ]
+            );
+            return ['result' => $result, 'replayed' => false];
+        } catch (\Throwable $e) {
+            // Operation failed — release the reservation so a fresh retry
+            // (with the SAME key) can proceed cleanly. Never leave the row
+            // in PROCESSING forever.
+            $this->db->query(
+                "DELETE FROM pos_idempotency_keys
+                 WHERE company_id = :company AND action = :action AND idempotency_key = :key
+                   AND status = 'PROCESSING'",
+                ['company' => $companyId, 'action' => $action, 'key' => $key]
+            );
+            throw $e;
+        }
     }
 
     // =========================================================================
@@ -1822,6 +2070,14 @@ class PosService
     public function collectDebt(int $customerId,array $data): array
     {
         [$user,$companyId]=$this->context();
+        // P13 - Settlement idempotency. Scoped by customer to prevent
+        // accidental collision across customers.
+        $idemKey = $this->idemKey($data);
+        $payloadForHash = $data + ['_customer_id' => $customerId];
+        unset($payloadForHash['idempotency_key']);
+        $replay = $this->idemBegin($companyId, 'CUSTOMER_ACCOUNT_PAYMENT', $idemKey, $payloadForHash);
+        if ($replay !== null) return $replay;
+        try {
         $customer=$this->customer($customerId,$companyId);
         $amount = round((float)($data['amount'] ?? $customer['balance']), 2);
         if ($amount <= 0) throw new Exception('Settlement amount must be greater than zero.', 422);
@@ -1907,7 +2163,13 @@ class PosService
             if ($this->db->getConnection()->inTransaction()) $this->db->rollback();
             throw $e;
         }
-        return $this->customer($customerId,$companyId);
+        $response = $this->customer($customerId,$companyId);
+        $this->idemComplete($companyId, 'CUSTOMER_ACCOUNT_PAYMENT', $idemKey, $response);
+        return $response;
+        } catch (\Throwable $e) {
+            $this->idemRelease($companyId, 'CUSTOMER_ACCOUNT_PAYMENT', $idemKey);
+            throw $e;
+        }
     }
 
     /**

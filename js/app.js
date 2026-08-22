@@ -5574,6 +5574,12 @@ function renderPOSTransactions() {
               <div class="txn-detail-row"><span>Status</span><span>${esc(t.status)}</span></div>
               <div class="txn-detail-row"><span>Order state</span><span>${esc(t.posState||'legacy')}</span></div>
               <div class="txn-detail-row"><span>Document type</span><span>${t.isRefund?'Linked refund':'Sale order'}</span></div>
+              ${(t.loyaltyPointsEarned||t.loyaltyPointsRedeemed||t.loyaltyDiscount) ? `
+                <div class="txn-detail-row"><span>Loyalty earned</span><span>${Number(t.loyaltyPointsEarned||0).toFixed(2)} pts</span></div>
+                <div class="txn-detail-row"><span>Loyalty redeemed</span><span>${Number(t.loyaltyPointsRedeemed||0).toFixed(2)} pts</span></div>
+                <div class="txn-detail-row"><span>Loyalty reward</span><span>${t.loyaltyRewardId ? `Reward #${Number(t.loyaltyRewardId)}` : '—'}</span></div>
+                <div class="txn-detail-row"><span>Loyalty discount</span><span>$${Number(t.loyaltyDiscount||0).toFixed(2)}</span></div>
+              ` : ''}
               <div class="txn-detail-row txn-total-row"><span>Total</span><span>$${t.total.toFixed(2)}</span></div>
             </div>
           </div>
@@ -5757,7 +5763,7 @@ function renderPOSRefundModal() {
               </div>
             `).join('')}
             <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
-              ${methods.map(mm => `<button class="btn btn-outline btn-sm pos-refund-add-method" data-add-method="${esc(mm.name)}" ${refundTotal<=0||remaining<=0.001?'disabled':''}>+ ${esc(mm.name)}</button>`).join('')}
+              ${methods.map(mm => `<button class="btn btn-outline btn-sm pos-refund-add-method" data-add-method="${esc(mm.name)}" onclick="posAddRefundMethod(this)" ${refundTotal<=0||remaining<=0.001?'disabled':''}>+ ${esc(mm.name)}</button>`).join('')}
             </div>
             <div style="font-size:11px;color:var(--text-muted);margin-top:8px">
               Cash refund reduces this session's Expected Cash by exactly this amount. Deyn reversals reduce the customer's outstanding balance.
@@ -5798,30 +5804,33 @@ async function openRefundModal(orderId) {
   render();
 }
 
+function posAddRefundMethod(btn) {
+  if (btn.disabled || !S.posRefundModal) return;
+  const name = btn.dataset.addMethod;
+  const totalPrecise = S.posRefundModal.lines.reduce((sum, line) => {
+    const originalQty = Number(line.item.original_qty || 0);
+    return originalQty > 0
+      ? sum + Number(line.item.total || 0) * (Number(line.refund_qty || 0) / originalQty)
+      : sum;
+  }, 0);
+  const refundTotal = Number(totalPrecise.toFixed(2));
+  const allocated = S.posRefundModal.payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+  const remaining = Number((refundTotal - allocated).toFixed(2));
+  S.posRefundModal.payments.push({ method: name, amount: Math.max(0, remaining) });
+  render();
+}
+
 function wireRefundModal() {
-  document.getElementById('btn-refund-close')?.addEventListener('click', () => { S.posRefundModal = null; render(); });
+  const refundClose = document.getElementById('btn-refund-close');
+  if (refundClose && refundClose.dataset.posWired !== '1') { refundClose.dataset.posWired = '1'; refundClose.addEventListener('click', () => { S.posRefundModal = null; render(); }); }
   document.querySelectorAll('.pos-refund-qty').forEach(inp => {
+    if (inp.dataset.posWired === '1') return;
+    inp.dataset.posWired = '1';
     inp.addEventListener('input', () => {
       const i = parseInt(inp.dataset.lineIdx);
       const v = Math.max(0, Number(inp.value) || 0);
       const max = Number(S.posRefundModal.lines[i].item.refundable_qty || 0);
       S.posRefundModal.lines[i].refund_qty = Math.min(v, max);
-      render();
-    });
-  });
-  document.querySelectorAll('.pos-refund-add-method').forEach(btn => {
-    btn.addEventListener('click', () => {
-      if (btn.disabled) return;
-      const name = btn.dataset.addMethod;
-      const lines = S.posRefundModal.lines;
-      const totalPrecise = lines.reduce((s, l) => {
-        const o = Number(l.item.original_qty || 0);
-        return o > 0 ? s + Number(l.item.total || 0) * (Number(l.refund_qty || 0) / o) : s;
-      }, 0);
-      const refundTotal = Number(totalPrecise.toFixed(2));
-      const already = S.posRefundModal.payments.reduce((s,p) => s + Number(p.amount || 0), 0);
-      const remaining = Number((refundTotal - already).toFixed(2));
-      S.posRefundModal.payments.push({ method: name, amount: Math.max(0, remaining) });
       render();
     });
   });
@@ -5840,7 +5849,7 @@ function wireRefundModal() {
     });
   });
   const submit = document.getElementById('btn-refund-submit');
-  if (submit) submit.addEventListener('click', async () => {
+  if (submit && submit.dataset.posWired !== '1') { submit.dataset.posWired = '1'; submit.addEventListener('click', async () => {
     if (submit.disabled) return;
     submit.disabled = true; submit.textContent = 'Validating…';
     const items = S.posRefundModal.lines
@@ -5884,7 +5893,7 @@ function wireRefundModal() {
       alert(e.message || 'Refund failed.');
       submit.disabled = false; submit.textContent = 'Validate refund';
     }
-  });
+  }); }
 }
 
 function renderStaffCredentialResult() {
@@ -6990,6 +6999,8 @@ function wirePOSEvents() {
     // Add-line buttons — push a new line for the given method with amount
     // defaulted to the remaining unallocated.
     document.querySelectorAll('[data-add-method]').forEach(btn => {
+      if (btn.dataset.posWired === '1') return;
+      btn.dataset.posWired = '1';
       btn.addEventListener('click', () => {
         if (btn.disabled) return;
         posAddPaymentLine(btn.dataset.addMethod, _payTotal);
@@ -7057,11 +7068,14 @@ function wirePOSEvents() {
       posScheduleQuote(0);
       render();
     }); }
-    document.getElementById('btn-pos-rewards')?.addEventListener('click', () => {
+    const rewardsToggle = document.getElementById('btn-pos-rewards');
+    if (rewardsToggle && rewardsToggle.dataset.posWired !== '1') { rewardsToggle.dataset.posWired = '1'; rewardsToggle.addEventListener('click', () => {
       S.posRewardsOpen = !S.posRewardsOpen;
       render();
-    });
+    }); }
     document.querySelectorAll('[data-loyalty-reward]').forEach(btn => {
+      if (btn.dataset.posWired === '1') return;
+      btn.dataset.posWired = '1';
       btn.addEventListener('click', () => {
         if (S.posCheckoutUncertain) return;
         S.posPendingOrderId = null;
@@ -7100,7 +7114,8 @@ function wirePOSEvents() {
     });
 
     const chargeBtn = document.getElementById('btn-pos-charge');
-    if (chargeBtn) {
+    if (chargeBtn && chargeBtn.dataset.posWired !== '1') {
+      chargeBtn.dataset.posWired = '1';
       chargeBtn.addEventListener('click', async () => {
         if (chargeBtn.disabled) return;
         // Guard against double-click while the request is in flight —

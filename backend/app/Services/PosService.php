@@ -772,7 +772,9 @@ class PosService
         // authoritative refund data so the UI can hide "Refund" on fully-
         // refunded orders and badge partial ones.
         $rows = $this->db->query(
-            "SELECT o.id,o.reference_number,o.order_date,o.total_amount,o.status,o.pos_state,o.refunded_order_id,o.amount_paid,o.amount_return,o.created_at,o.pos_session_id,c.name customer_name,u.name cashier_name,
+            "SELECT o.id,o.reference_number,o.order_date,o.total_amount,o.status,o.pos_state,o.refunded_order_id,o.amount_paid,o.amount_return,o.created_at,o.pos_session_id,
+                    o.loyalty_points_earned,o.loyalty_points_redeemed,o.loyalty_reward_id,o.loyalty_discount_amount,
+                    c.name customer_name,u.name cashier_name,
                     COUNT(DISTINCT oi.id) items_count,COALESCE(GROUP_CONCAT(DISTINCT pp.method_name ORDER BY pp.id SEPARATOR ' + '),MAX(pm.name)) payment_method,
                     (SELECT COALESCE(SUM(oi2.quantity),0) FROM order_items oi2 WHERE oi2.order_id=o.id) original_qty_sum,
                     (SELECT COALESCE(SUM(ABS(ri.quantity)),0) FROM order_items ri JOIN orders ro ON ro.id=ri.order_id

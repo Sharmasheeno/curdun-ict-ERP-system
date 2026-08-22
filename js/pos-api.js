@@ -98,6 +98,10 @@ function mapTransaction(order) {
     method: order.payment_method || 'Deyn', time: order.created_at ? new Date(order.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—',
     date: order.order_date || '', status: order.status || 'COMPLETED', isRefund:Boolean(Number(order.refunded_order_id)),
     posState:order.pos_state || null, amountPaid:Number(order.amount_paid || 0), change:Number(order.amount_return || 0),
+    loyaltyPointsEarned:Number(order.loyalty_points_earned || 0),
+    loyaltyPointsRedeemed:Number(order.loyalty_points_redeemed || 0),
+    loyaltyRewardId:order.loyalty_reward_id ? Number(order.loyalty_reward_id) : null,
+    loyaltyDiscount:Number(order.loyalty_discount_amount || 0),
     // P6 — computed original-order refund status ('' | PARTIALLY_REFUNDED | REFUNDED).
     // The row action button uses this to decide whether to show "Refund",
     // "Refund more", or nothing.

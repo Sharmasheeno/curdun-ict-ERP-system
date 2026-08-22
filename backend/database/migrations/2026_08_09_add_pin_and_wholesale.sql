@@ -7,16 +7,16 @@
 -- 1. Add pin_hash to users (POS 4-digit PIN, bcrypt-hashed)
 --    Also add pin_last_used_at for audit + rate-limiting.
 ALTER TABLE users
-    ADD COLUMN pin_hash          VARCHAR(255) NULL AFTER password,
-    ADD COLUMN pin_last_used_at  TIMESTAMP    NULL DEFAULT NULL AFTER pin_hash;
+    ADD COLUMN IF NOT EXISTS pin_hash          VARCHAR(255) NULL AFTER password,
+    ADD COLUMN IF NOT EXISTS pin_last_used_at  TIMESTAMP    NULL DEFAULT NULL AFTER pin_hash;
 
 -- Optional index for fast reverse-lookup during PIN sign-in
 -- (we look up by (branch_id, id) after loading candidates, not by pin_hash directly)
-CREATE INDEX idx_users_branch_status ON users (branch_id, status);
+CREATE INDEX IF NOT EXISTS idx_users_branch_status ON users (branch_id, status);
 
 -- 2. Add wholesale_price to products (Jumlo pricing shown alongside retail)
 ALTER TABLE products
-    ADD COLUMN wholesale_price DECIMAL(15,2) NULL DEFAULT NULL AFTER selling_price;
+    ADD COLUMN IF NOT EXISTS wholesale_price DECIMAL(15,2) NULL DEFAULT NULL AFTER selling_price;
 
 -- 3. (Optional but recommended) shifts table for POS cashier shift tracking
 CREATE TABLE IF NOT EXISTS shifts (

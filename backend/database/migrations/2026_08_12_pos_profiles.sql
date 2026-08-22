@@ -18,10 +18,13 @@ SET profile_type='retail',
     capabilities=JSON_OBJECT('barcode',true,'stock',true,'variants',false,'combos',false,'preparation',false,'tables',false,'tabs',false,'split_bills',false,'tips',false,'ship_later',true,'self_order',false,'discounts',true,'pricelists',true)
 WHERE profile_type='retail';
 
-SET @index_exists = (SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='pos_configs' AND index_name='pos_config_company_branch');
-SET @index_sql = IF(@index_exists>0,'ALTER TABLE pos_configs DROP INDEX pos_config_company_branch','SELECT 1'); PREPARE index_stmt FROM @index_sql; EXECUTE index_stmt; DEALLOCATE PREPARE index_stmt;
 SET @index_exists = (SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='pos_configs' AND index_name='pos_config_company_branch_profile');
 SET @index_sql = IF(@index_exists=0,'ALTER TABLE pos_configs ADD UNIQUE KEY pos_config_company_branch_profile (company_id,branch_id,profile_type)','SELECT 1'); PREPARE index_stmt FROM @index_sql; EXECUTE index_stmt; DEALLOCATE PREPARE index_stmt;
+-- Add the replacement first. The original key may currently be the index
+-- InnoDB uses for the company/branch foreign keys and cannot be dropped until
+-- another compatible left-prefix index exists.
+SET @index_exists = (SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='pos_configs' AND index_name='pos_config_company_branch');
+SET @index_sql = IF(@index_exists>0,'ALTER TABLE pos_configs DROP INDEX pos_config_company_branch','SELECT 1'); PREPARE index_stmt FROM @index_sql; EXECUTE index_stmt; DEALLOCATE PREPARE index_stmt;
 
 INSERT INTO pos_configs (company_id,branch_id,name,profile_type,description,default_screen,capabilities)
 SELECT b.company_id,b.id,CONCAT(b.name,' ',profiles.title),profiles.profile_type,profiles.description,profiles.default_screen,profiles.capabilities

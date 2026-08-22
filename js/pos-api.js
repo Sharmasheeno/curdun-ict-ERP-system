@@ -290,6 +290,7 @@ async function posCompleteCheckout(cart, customerId, payments) {
   // Only an explicit cashier choice is sent. In automatic mode the backend
   // remains authoritative and applies customer preference before POS default.
   if (S.posPricelistManual && S.posSelectedPricelistId) body.pricelist_id = S.posSelectedPricelistId;
+  if (S.posSelectedRewardId) body.loyalty_reward_id = S.posSelectedRewardId;
   const data = await posApiFetch('/pos/checkout', { method:'POST', body });
   const mapped = mapTransaction({ ...data, id:data.id, total_amount:data.total_amount, items_count:cart.reduce((n,item)=>n+item.qty,0), customer_name:POS_CUSTOMERS.find(item=>item.id===customerId)?.name, cashier_name:S.posActiveUser?.name });
   const existing = POS_TRANSACTIONS.findIndex(item => item._backendId === mapped._backendId);

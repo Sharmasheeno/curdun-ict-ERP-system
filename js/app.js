@@ -196,6 +196,7 @@ const S = {
   posQuoteLoading: false,
   posQuoteError: null,
   posSelectedRewardId: null,
+  posRewardsOpen: false,
 
   // POS — management reports and stock notifications
   posReportFrom: new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10),
@@ -3351,6 +3352,7 @@ function posResetPaymentLines() {
   S.posQuote = null;
   S.posQuoteError = null;
   S.posSelectedRewardId = null;
+  S.posRewardsOpen = false;
   S.posPricelistManual = false;
   const defaultPricelist = (S.posPricelists || []).find(p => Number(p.is_default) === 1);
   S.posSelectedPricelistId = defaultPricelist ? Number(defaultPricelist.id) : null;
@@ -4874,6 +4876,8 @@ function renderPOSCheckout() {
   const cart = S.posCart;
   const quote = S.posQuote;
   const quotedLines = new Map((quote?.lines || []).map(line => [Number(line.product_id), line]));
+  const eligibleRewards = quote?.loyalty?.eligible_rewards || [];
+  const selectedReward = quote?.loyalty?.selected_reward || null;
   const subtotal = quote ? Number(quote.subtotal || 0) : cart.reduce((s,item)=>s+item.price*item.qty,0);
   const taxRate = quote ? Number(quote.tax_rate || 0) : Number(S.storeSettings.taxRate || 0);
   const tax = quote ? Number(quote.tax || 0) : subtotal * taxRate / 100;
@@ -5004,7 +5008,20 @@ function renderPOSCheckout() {
           <span style="font-size:14px">🎁</span>
           <span style="font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:800;color:#F5C411">Loyalty</span>
           <span style="color:#FFF;font-size:13px;font-weight:800">${Number(S.posCustomerLoyalty.customer.loyalty_points || 0).toFixed(0)} pts</span>
-          ${(() => { const eligible=(S.posCustomerLoyalty.rewards||[]).filter(r=>Number(r.points_cost)<=Number(S.posCustomerLoyalty.customer.loyalty_points||0)); return eligible.length ? `<span style="font-size:11px;color:rgba(255,255,255,0.6);margin-left:auto">${eligible.length} reward${eligible.length===1?'':'s'} available</span>` : ''; })()}
+          <button class="btn btn-outline btn-sm" id="btn-pos-rewards" ${!posCan('pos.loyalty_operate')||eligibleRewards.length===0?'disabled':''} style="margin-left:auto;color:#F5C411;border-color:rgba(245,196,17,0.5);padding:4px 9px">Rewards${eligibleRewards.length ? ` (${eligibleRewards.length})` : ''}</button>
+        </div>` : ''}
+
+        ${S.posRewardsOpen && S.posCustomerLoyalty?.customer ? `
+        <div style="padding:10px;background:rgba(245,196,17,0.08);border:1px solid rgba(245,196,17,0.25);border-radius:8px;margin-bottom:8px">
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:900;color:#F5C411;margin-bottom:8px">Eligible rewards — server confirmed</div>
+          ${eligibleRewards.length ? eligibleRewards.map(reward => {
+            const current=Number(quote?.loyalty?.current_points||0); const cost=Number(reward.points_cost||0); const active=Number(S.posSelectedRewardId)===Number(reward.id);
+            const benefit=reward.reward_type==='discount_percent' ? `${Number(reward.discount_percent||0)}% discount` : reward.reward_type==='discount_amount' ? `$${Number(reward.discount_amount||0).toFixed(2)} discount` : 'Reward product';
+            return `<div style="display:flex;align-items:center;gap:10px;padding:8px;border-radius:6px;background:rgba(255,255,255,0.05);margin-top:6px">
+              <div style="flex:1"><strong style="color:#FFF">${esc(reward.name)}</strong><div style="font-size:11px;color:rgba(255,255,255,0.65)">${benefit} · Cost ${cost.toFixed(0)} pts · Current ${current.toFixed(0)} · After ${(current-cost).toFixed(0)}</div></div>
+              <button class="btn btn-sm ${active?'btn-danger':'btn-primary'}" data-loyalty-reward="${reward.id}">${active?'Remove':'Apply'}</button>
+            </div>`;
+          }).join('') : '<div style="font-size:12px;color:rgba(255,255,255,0.6)">No rewards are currently eligible.</div>'}
         </div>` : ''}
 
         <div class="pos-cart-summary">
@@ -5145,13 +5162,14 @@ function renderPOSReceipt() {
             ${r.items.map(item=>`
               <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0">
                 <span>${esc(item.name)} × ${item.qty}</span>
-                <span style="font-weight:700">$${((item.isWholesale?item.wholesalePrice:item.price)*item.qty).toFixed(2)}</span>
+                <span style="font-weight:700">$${Number(item.quotedLineTotal ?? item.price*item.qty).toFixed(2)}</span>
               </div>
             `).join('')}
           </div>
           <div style="padding:12px 0">
             <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text-muted)"><span>Subtotal</span><span>$${r.subtotal.toFixed(2)}</span></div>
             <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text-muted)"><span>Tax (${Number(S.storeSettings.taxRate || 0)}%)</span><span>$${r.tax.toFixed(2)}</span></div>
+            ${Number(r.loyaltyDiscount||0)>0 ? `<div style="display:flex;justify-content:space-between;font-size:13px;color:#B45309"><span>Loyalty · ${esc(r.loyaltyRewardName||'Reward')}</span><span>−$${Number(r.loyaltyDiscount).toFixed(2)}</span></div>` : ''}
             <div style="display:flex;justify-content:space-between;font-size:16px;font-weight:900;margin-top:8px;color:var(--purple-800)"><span>Total</span><span>$${r.total.toFixed(2)}</span></div>
             ${Array.isArray(r.payment_lines) && r.payment_lines.length > 0 ? `
               <div style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)">
@@ -6838,6 +6856,8 @@ function wirePOSEvents() {
     const deynSel = document.getElementById('pos-deyn-customer');
     if (deynSel) deynSel.addEventListener('change', async () => {
       S.posPendingOrderId = null;
+      S.posSelectedRewardId = null;
+      S.posRewardsOpen = false;
       S.posDebtCustomerId = parseInt(deynSel.value) || null;
       const customer = POS_CUSTOMERS.find(c => c.id === S.posDebtCustomerId);
       const defaultPricelist = (S.posPricelists || []).find(p => Number(p.is_default) === 1);
@@ -6857,6 +6877,19 @@ function wirePOSEvents() {
       S.posPricelistManual = true;
       posScheduleQuote(0);
       render();
+    });
+    document.getElementById('btn-pos-rewards')?.addEventListener('click', () => {
+      S.posRewardsOpen = !S.posRewardsOpen;
+      render();
+    });
+    document.querySelectorAll('[data-loyalty-reward]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        S.posPendingOrderId = null;
+        const id = Number(btn.dataset.loyaltyReward);
+        S.posSelectedRewardId = Number(S.posSelectedRewardId) === id ? null : id;
+        posScheduleQuote(0);
+        render();
+      });
     });
 
     // ---- Hold / Resume / Discard ----
@@ -7012,6 +7045,7 @@ async function finalizeCharge() {
   const subtotal = Number(S.posQuote?.subtotal || 0);
   const tax = Number(S.posQuote?.tax || 0);
   const total = Number(S.posQuote?.total || 0);
+  const acceptedQuote = S.posQuote;
   // Front-side validation gate (backend re-validates every line).
   const check = posPaymentLinesValid(total);
   if (!check.ok) { alert(check.reason); render(); return; }
@@ -7029,7 +7063,10 @@ async function finalizeCharge() {
     S.posLastReceipt = {
       id: result.reference_number,
       date: new Date(result.created_at || Date.now()).toLocaleString(),
-      items: cart,
+      items: cart.map(item => {
+        const line=(acceptedQuote?.lines||[]).find(q=>Number(q.product_id)===Number(item.id));
+        return { ...item, price:Number(line?.final_unit_price ?? item.price), quotedLineTotal:Number(line?.line_subtotal ?? item.price*item.qty) };
+      }),
       subtotal: Number(result.subtotal ?? subtotal),
       tax: Number(result.tax_amount ?? tax),
       total: Number(result.total_amount ?? total),
@@ -7039,6 +7076,10 @@ async function finalizeCharge() {
       change: lines.filter(l => l.tendered !== undefined).reduce((s,l) => s + Math.max(0, (l.tendered - l.amount)), 0),
       credit_warning: result.credit_warning || null,
       customer_id: S.posDebtCustomerId || null,
+      loyaltyDiscount: Number(result.loyalty_discount_amount ?? acceptedQuote?.discounts?.loyalty ?? 0),
+      loyaltyRewardName: acceptedQuote?.loyalty?.selected_reward?.name || null,
+      loyaltyPointsRedeemed: Number(result.loyalty_points_redeemed ?? acceptedQuote?.loyalty?.redeemed_points ?? 0),
+      loyaltyPointsEarned: Number(result.loyalty_points_earned ?? acceptedQuote?.loyalty?.points_earned ?? 0),
     };
     S.posReceiptVisible = true;
     S.posCart = [];

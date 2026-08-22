@@ -666,6 +666,19 @@
 }
 .pos-charge-btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(245,196,17,0.3); }
 .pos-charge-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.pos-intent-locked button:not(#btn-pos-charge),
+.pos-intent-locked input,
+.pos-intent-locked select {
+  opacity: .42 !important;
+  cursor: not-allowed !important;
+  pointer-events: none !important;
+  filter: grayscale(.35);
+}
+.pos-intent-locked #btn-pos-charge {
+  opacity: 1;
+  pointer-events: auto;
+  box-shadow: 0 0 0 3px rgba(245,196,17,.22);
+}
 .pos-clear-btn {
   padding: 10px; border-radius: 8px;
   border: 1px solid rgba(255,255,255,0.15);

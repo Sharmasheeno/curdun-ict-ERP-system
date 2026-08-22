@@ -237,6 +237,7 @@ const S = {
   //   { mode: 'open' | 'close' | 'cash-in' | 'cash-out' | 'closed-summary',
   //     amount, note, counted, managerPin, error, result }
   posRegisterModal: null,
+  posDialog: null,          // application notice/confirmation; never native browser UI
   posCashTendered: '',       // USD amount entered by cashier for cash payment
   posHeldOrders: [],         // [{ id, cashier, items, customer, ts }]
   posShowHeld: false,        // toggle held orders panel
@@ -3595,7 +3596,45 @@ function renderPOSRouter() {
     wrap.appendChild(refundHost);
     setTimeout(() => wireRefundModal(), 0);
   }
+  if (S.posDialog) {
+    const dialogHost = document.createElement('div');
+    dialogHost.innerHTML = renderPOSDialog();
+    wrap.appendChild(dialogHost);
+    setTimeout(() => wirePOSDialog(), 0);
+  }
   return wrap;
+}
+
+function showPOSNotice(message, title='Point of Sale') {
+  S.posDialog = { kind:'notice', title, message:String(message || 'Something went wrong.') };
+  render();
+}
+
+function showPOSConfirm(message, onConfirm, title='Please confirm', confirmLabel='Continue') {
+  S.posDialog = { kind:'confirm', title, message:String(message), onConfirm, confirmLabel };
+  render();
+}
+
+function renderPOSDialog() {
+  const d=S.posDialog;
+  if(!d)return '';
+  return `<div class="crud-overlay" style="z-index:10020" role="dialog" aria-modal="true" aria-labelledby="pos-dialog-title">
+    <div class="crud-modal" style="max-width:440px" onclick="event.stopPropagation()">
+      <div class="crud-modal-header"><h3 id="pos-dialog-title">${esc(d.title)}</h3><button class="crud-close-btn" data-pos-dialog-cancel aria-label="Close">×</button></div>
+      <div class="crud-modal-body"><p style="margin:0;line-height:1.55;color:var(--text-secondary);white-space:pre-line">${esc(d.message)}</p></div>
+      <div class="crud-modal-footer"><button class="btn btn-ghost" data-pos-dialog-cancel>${d.kind==='confirm'?'Cancel':'Close'}</button>${d.kind==='confirm'?`<button class="btn btn-primary" id="pos-dialog-confirm">${esc(d.confirmLabel||'Continue')}</button>`:''}</div>
+    </div>
+  </div>`;
+}
+
+function wirePOSDialog() {
+  const close=()=>{S.posDialog=null;render();};
+  document.querySelectorAll('[data-pos-dialog-cancel]').forEach(el=>el.addEventListener('click',close));
+  document.getElementById('pos-dialog-confirm')?.addEventListener('click',()=>{
+    const callback=S.posDialog?.onConfirm;S.posDialog=null;
+    if(typeof callback==='function')callback();else render();
+  });
+  document.querySelector('#pos-dialog-confirm,[data-pos-dialog-cancel]')?.focus();
 }
 
 // ============================================================
@@ -3826,7 +3865,7 @@ function wireRegisterModal() {
             try {
               const approved=await posCloseShift(Number(S.posSession?.opened_by||S.posActiveUser?.id),counted,true,approvalId);
               S.posRegisterModal={mode:'closed-summary',result:approved}; await posBootstrap(); render();
-            } catch(error){ alert(error.message||'Approved register close failed.'); }
+            } catch(error){ showPOSNotice(error.message||'Approved register close failed.','Register close failed'); }
           });
           return;
         } else { throw err; }
@@ -3872,7 +3911,7 @@ function wireRegisterModal() {
       S.posRegisterModal = null;
       POS_APPROVAL_CONTINUATION = null;
       render();
-      try { await approvedAction?.({ approvalId, approved_by:result.approved_by, reason }); } catch (e) { alert(e.message || String(e)); }
+      try { await approvedAction?.({ approvalId, approved_by:result.approved_by, reason }); } catch (e) { showPOSNotice(e.message || String(e),'Approved action failed'); }
     } catch (err) {
       m.busy = false;
       m.error = err.message || 'That PIN does not match any Store Manager or Admin.';
@@ -3899,7 +3938,7 @@ function wireRegisterModal() {
           targetId:Number(S.posSession?.id), sessionId:Number(S.posSession?.id),
         }, async ({approvalId}) => {
           try { await posRecordCashMovement('OUT',amount,reason,approvalId); S.posRegisterModal=null; render(); }
-          catch(error){ alert(error.message||'Approved Cash Out failed.'); }
+          catch(error){ showPOSNotice(error.message||'Approved Cash Out failed.','Cash Out failed'); }
         });
         return;
       }
@@ -4023,7 +4062,7 @@ function renderPOSTopNav() {
   const canControlRegister = isOpen ? posCan('closeRegister') : posCan('openRegister');
 
   const navItem = (key, label, hasChild) => {
-    const menuTabs = { orders:['orders','sessions','payments','customers'], products:['products','categories','combos'], reporting:['reports-orders','reports-sales','reports-session','reports-stock'], configuration:['config-settings','config-payments','config-staff','config-currencies','config-audit'] };
+    const menuTabs = { orders:['orders','sessions','payments','customers'], products:['products','categories'], reporting:['reports-orders','reports-sales','reports-session','reports-stock'], configuration:['config-settings','config-payments','config-staff','config-currencies','config-audit'] };
     const active = menuTabs[key]?.includes(tab) || tab === key;
     return `
       <div class="pos-topnav-item ${active?'active':''}" data-nav-menu="${key}">
@@ -4038,7 +4077,6 @@ function renderPOSTopNav() {
           ` : key === 'products' ? `
             <button class="pos-dd-item" data-bo-tab="products">Products</button>
             ${canEditProducts ? `<button class="pos-dd-item" data-bo-tab="categories">Categories</button>` : ''}
-            ${canEditProducts ? `<button class="pos-dd-item" data-bo-tab="combos">Combo Choices</button>` : ''}
           ` : key === 'reporting' ? `
             <button class="pos-dd-item" data-bo-tab="reports-orders">Orders</button>
             ${canReports ? `<button class="pos-dd-item" data-bo-tab="reports-sales">Sales Details</button>` : ''}
@@ -4167,15 +4205,10 @@ function wirePOSTopNav(wrap) {
   // "Sign out" — leaves the whole workspace. If a register is open, warn the
   // operator so they don't accidentally abandon an open session with cash in it.
   wrap.querySelector('#btn-bo-logout')?.addEventListener('click', () => {
-    if (S.posSession?.state === 'OPENED' &&
-        !confirm('The register is still open. Sign out anyway? (The session stays open and can be closed from another device.)')) {
-      return;
-    }
-    S.posActiveUser = null;
-    S.posView = 'selector';
-    S.posStoreType = null;
-    S.view = 'workspace';
-    render();
+    const signOut=()=>{S.posActiveUser=null;S.posView='selector';S.posStoreType=null;S.view='workspace';render();};
+    if(S.posSession?.state==='OPENED'){
+      showPOSConfirm('The register is still open. The session will stay open and can be closed from another device.',signOut,'Sign out with an open register','Sign out');
+    }else signOut();
   });
 }
 
@@ -4970,7 +5003,7 @@ function renderPOSCheckout() {
   return `
     ${S.posSession?.state==='OPENED' ? `<div class="cashier-shift-banner" style="margin-bottom:12px"><span>🟢 Register #${S.posSession.id} open · ${esc(S.posSession.config_name||S.posConfig?.name||'Main Register')}</span><span class="shift-duration-badge">Expected $${Number(S.posSessionSummary?.expected_cash||S.posSession.opening_cash||0).toFixed(2)}</span></div>` : `<div class="cashier-shift-banner cashier-shift-idle" style="margin-bottom:12px;display:flex;align-items:center"><span style="flex:1">🔒 Register closed — ${posCan('openRegister')?'open it before validating an order':'a Senior Cashier or higher must open it'}</span>${posCan('openRegister')?'<button class="btn btn-primary btn-sm" id="btn-checkout-open-register">Open register</button>':''}</div>`}
     ${S.posCheckoutUncertain ? `<div class="pos-deyn-warning" style="margin-bottom:10px"><strong>We couldn't confirm the sale.</strong> Retry Validate to check the committed transaction. Cart, customer, pricing, reward and payments stay locked until the retry succeeds.</div>` : ''}
-    <div class="pos-checkout-layout">
+    <div class="pos-checkout-layout ${S.posCheckoutUncertain?'pos-intent-locked':''}" aria-busy="${S.posCheckoutUncertain?'true':'false'}">
       <div class="pos-product-panel">
         <div class="pos-product-search-bar">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
@@ -5291,8 +5324,7 @@ function renderPOSProducts() {
                   ${['Groceries','Beverages','Household','Personal Care','Snacks','Bakery','Fresh'].map(c=>`<option ${(f.cat||'Groceries')===c?'selected':''}>${c}</option>`).join('')}
                 </select>
               </div>
-              <div class="form-group"><label class="form-label">Retail Price (USD) *</label><input class="form-input" id="cf-price" type="number" step="0.01" min="0" value="${f.price||''}"/></div>
-              <div class="form-group"><label class="form-label">Wholesale Price (USD)</label><input class="form-input" id="cf-wholesalePrice" type="number" step="0.01" min="0" value="${f.wholesalePrice||''}"/></div>
+              <div class="form-group"><label class="form-label">Selling Price (USD) *</label><input class="form-input" id="cf-price" type="number" step="0.01" min="0" value="${f.price||''}"/><div style="font-size:11px;color:var(--text-muted);margin-top:4px">Pricelists and promotion rules determine the final checkout price.</div></div>
               <div class="form-group"><label class="form-label">Stock Qty *</label><input class="form-input" id="cf-stock" type="number" min="0" value="${f.stock||''}"/></div>
               <div class="form-group"><label class="form-label">Low-stock alert level</label><input class="form-input" id="cf-minimumStock" type="number" min="0" value="${f.minimumStock ?? 5}"/><div style="font-size:11px;color:var(--text-muted);margin-top:4px">Managers are notified at or below this quantity.</div></div>
               <div class="form-group"><label class="form-label">Barcode</label><input class="form-input" id="cf-barcode" value="${esc(f.barcode||'')}"/></div>
@@ -5345,17 +5377,17 @@ function renderPOSProducts() {
       </div>
       <div class="overflow-x-auto">
         <table class="data-table" style="min-width:820px">
-          <thead><tr><th>Product</th><th>Category</th><th>Retail</th><th>Wholesale</th><th>Stock</th><th>Barcode</th><th>Status</th><th class="col-right">Actions</th></tr></thead>
+          <thead><tr><th>Product</th><th>Category</th><th>Price</th><th>Stock</th><th>Minimum</th><th>Barcode</th><th>Status</th><th class="col-right">Actions</th></tr></thead>
           <tbody>
             ${POS_PRODUCTS.map(p=>`
               <tr>
                 <td style="font-weight:700">${esc(p.name)}</td>
                 <td><span class="pill" style="background:var(--gray-50);color:var(--text-secondary)">${esc(p.cat)}</span></td>
                 <td style="font-weight:800">$${p.price.toFixed(2)}</td>
-                <td style="font-size:13px;color:var(--text-muted)">$${p.wholesalePrice.toFixed(2)}</td>
                 <td style="font-weight:700;color:${p.stock<40?'#B45309':'var(--text-primary)'}">${p.stock}</td>
+                <td>${Number(p.minimumStock||0)}</td>
                 <td style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">${esc(p.barcode)}</td>
-                <td><span class="pill ${p.stock<40?'pill-amber':'pill-green'}">● ${p.stock<40?'Low':'In stock'}</span></td>
+                <td><span class="pill ${p.stock<=0?'pill-red':(p.stock<=p.minimumStock?'pill-amber':'pill-green')}">${p.stock<=0?'Out of Stock':(p.stock<=p.minimumStock?'Low Stock':'Normal')}</span></td>
                 <td class="col-right">
                   <div class="crud-actions">
                     <button class="crud-btn crud-btn-edit" data-edit-product="${p.id}" title="Edit">✏️</button>
@@ -5928,11 +5960,11 @@ function wireRefundModal() {
           label:'Refund', reason:'Approve the selected refund lines', amount:refundAmount,
           targetType:'order', targetId:orderId, sessionId:Number(S.posSession?.id),
         }, async ({approvalId}) => {
-          try { await finishRefund(approvalId); } catch(error){ alert(error.message||'Approved refund failed.'); }
+          try { await finishRefund(approvalId); } catch(error){ showPOSNotice(error.message||'Approved refund failed.','Refund failed'); }
         });
         return;
       }
-      alert(e.message || 'Refund failed.');
+      showPOSNotice(e.message || 'Refund failed.','Refund failed');
       if(S.posRefundModal)S.posRefundModal.submitting=false;
       if(e.simulatedLostResponse){S.posRefundModal.uncertain=true;S.posRefundModal.uncertainMessage=e.message;render();return;}
       submit.disabled = false; submit.textContent = 'Validate refund';
@@ -6308,7 +6340,7 @@ function posReportConfig(section, data) {
     },
     inventory: {
       title:'Inventory', rows:data.inventory || [],
-      columns:[['sku','SKU'],['name','Product'],['category','Category'],['current_stock','Stock'],['minimum_stock','Minimum'],['purchase_price','Cost',posMoney],['selling_price','Retail',posMoney],['wholesale_price','Wholesale',posMoney],['retail_value','Retail Value',posMoney],['stock_status','Status']],
+      columns:[['sku','SKU'],['name','Product'],['category','Category'],['current_stock','Stock'],['minimum_stock','Minimum'],['purchase_price','Cost',posMoney],['selling_price','Selling Price',posMoney],['retail_value','Stock Value',posMoney],['stock_status','Status']],
     },
     customers: {
       title:'Customers & Debt', rows:data.customers || [],
@@ -6575,7 +6607,7 @@ function wirePOSEvents() {
         try {
           S.posReportSelectedSummary = await posApiFetch(`/pos/sessions/${id}/summary`);
         } catch (e) {
-          alert(e.message || 'Could not load session report.');
+          showPOSNotice(e.message || 'Could not load session report.','Session report');
         }
       }
       render();
@@ -6585,7 +6617,7 @@ function wirePOSEvents() {
     const sum = S.posReportSelectedSummary && S.posReportSelectedSummary.session && Number(S.posReportSelectedSummary.session.id) === Number(S.posReportSelectedSessionId)
       ? S.posReportSelectedSummary
       : (S.posSession && (S.posReportSelectedSessionId ? Number(S.posReportSelectedSessionId) === Number(S.posSession.id) : true) ? S.posSessionSummary : null);
-    if (!sum) { alert('Select a session first.'); return; }
+    if (!sum) { showPOSNotice('Select a session first.','Session report'); return; }
     exportSessionReportCSV(sum);
   });
 
@@ -6612,7 +6644,7 @@ function wirePOSEvents() {
     if (perm === 'pin') return requireManagerApproval('cashInOut', {
       label: `Cash ${direction === 'IN' ? 'In' : 'Out'} — needs Senior Cashier or Manager`,
     }, () => openCashMovementModal(direction));
-    alert('Your role cannot record cash movements.');
+    showPOSNotice('Your role cannot record cash movements.','Access denied');
   };
   document.getElementById('btn-cash-in') ?.addEventListener('click', () => doCashMovement('IN'));
   document.getElementById('btn-cash-out')?.addEventListener('click', () => doCashMovement('OUT'));
@@ -6624,7 +6656,7 @@ function wirePOSEvents() {
     if (perm === 'pin') return requireManagerApproval('closeRegister', {
       label: 'Close register — Manager approval required',
     }, () => openRegisterModal('close'));
-    alert('Only a Senior Cashier or above can close the register.');
+    showPOSNotice('Only a Senior Cashier or above can close the register.','Access denied');
   });
   const closeStaffCredentials=()=>{S.staffCredentialResult=null;render();};
   document.getElementById('btn-staff-credentials-done')?.addEventListener('click',closeStaffCredentials);
@@ -6633,12 +6665,12 @@ function wirePOSEvents() {
     const result=S.staffCredentialResult;if(!result)return;
     const text=`Curdun Retail POS\nStaff: ${result.name}\nEmail: ${result.email}\nTemporary password: ${result.temporaryPassword}\nPOS PIN: ${result.pin}`;
     try{await navigator.clipboard.writeText(text);event.currentTarget.textContent='Copied ✓';}
-    catch(_){alert(text);}
+    catch(_){showPOSNotice(text);}
   });
 
   document.getElementById('btn-dashboard-stock-alerts')?.addEventListener('click', async ()=>{
     S.posTab='notifications'; render();
-    try{await posLoadStockAlerts();}catch(error){alert(error.message);}
+    try{await posLoadStockAlerts();}catch(error){showPOSNotice(error.message,'Stock alerts');}
   });
 
   // ---- Reports ----
@@ -6656,9 +6688,9 @@ function wirePOSEvents() {
   document.getElementById('btn-print-pos-report')?.addEventListener('click', ()=>window.print());
 
   // ---- Stock notifications ----
-  document.getElementById('btn-refresh-stock-alerts')?.addEventListener('click', async ()=>{ try{await posLoadStockAlerts();}catch(error){alert(error.message);} });
-  document.getElementById('btn-read-all-stock-alerts')?.addEventListener('click', async ()=>{ try{await posMarkAllStockAlertsRead();}catch(error){alert(error.message);} });
-  document.querySelectorAll('[data-read-stock-alert]').forEach(btn=>btn.addEventListener('click', async ()=>{ try{await posMarkStockAlertRead(btn.dataset.readStockAlert);}catch(error){alert(error.message);} }));
+  document.getElementById('btn-refresh-stock-alerts')?.addEventListener('click', async ()=>{ try{await posLoadStockAlerts();}catch(error){showPOSNotice(error.message,'Stock alerts');} });
+  document.getElementById('btn-read-all-stock-alerts')?.addEventListener('click', async ()=>{ try{await posMarkAllStockAlertsRead();}catch(error){showPOSNotice(error.message,'Stock alerts');} });
+  document.querySelectorAll('[data-read-stock-alert]').forEach(btn=>btn.addEventListener('click', async ()=>{ try{await posMarkStockAlertRead(btn.dataset.readStockAlert);}catch(error){showPOSNotice(error.message,'Stock alerts');} }));
   document.querySelectorAll('[data-restock-product]').forEach(btn=>btn.addEventListener('click', ()=>{
     const product=POS_PRODUCTS.find(item=>item.id===Number(btn.dataset.restockProduct));
     if(!product)return;
@@ -6769,7 +6801,7 @@ function wirePOSEvents() {
       e.stopPropagation();
       const refId = btn.dataset.refundTxn;
       const backendId = POS_TRANSACTIONS.find(t => t.id === refId)?._backendId;
-      if (!backendId) { alert('Could not resolve order id.'); return; }
+      if (!backendId) { showPOSNotice('Could not resolve order id.','Order unavailable'); return; }
       await openRefundModal(backendId);
     });
   });
@@ -6791,7 +6823,7 @@ function wirePOSEvents() {
     });
     const branchInput=document.getElementById('cf-branchId');
     if(branchInput)f.branchId=parseInt(branchInput.value)||null;
-    ['price','wholesalePrice','stock','minimumStock','creditLimit'].forEach(id => {
+    ['price','stock','minimumStock','creditLimit'].forEach(id => {
       const el = document.getElementById('cf-'+id);
       if (el) f[id] = parseFloat(el.value)||0;
     });
@@ -6850,14 +6882,14 @@ function wirePOSEvents() {
       if (!transaction?._backendId) throw new Error('Transaction record is unavailable.');
       // Refund permission — Cashier needs Manager PIN; Senior+ passes silently.
       const perm = posCan('refund');
-      if (perm === false) { alert('Your role cannot issue refunds.'); return; }
+      if (perm === false) { showPOSNotice('Your role cannot issue refunds.','Access denied'); return; }
       const runRefund = async approvalId => {
         try { await posVoidTransaction(transaction._backendId,approvalId); S.confirmDeleteModal=null; render(); }
         catch(error) {
           if (!approvalId && error.status===403 && /approval/i.test(error.message)) {
             S.confirmDeleteModal=null;
             requireManagerApproval('refund', { label:`Refund order #${transaction._backendId}`,reason:'Approve full refund',amount:Math.abs(Number(transaction.total||0)),targetType:'order',targetId:transaction._backendId }, ({approvalId:id})=>runRefund(id));
-          } else alert(error.message);
+          } else showPOSNotice(error.message,'Refund failed');
         }
       };
       await runRefund(null);
@@ -6912,7 +6944,7 @@ function wirePOSEvents() {
   const btnSaveStore = document.getElementById('btn-save-store-settings');
   if (btnSaveStore) btnSaveStore.addEventListener('click', async () => {
     const name = document.getElementById('ss-store-name').value.trim();
-    if (!name) { alert('Store name is required.'); return; }
+    if (!name) { showPOSNotice('Store name is required.','Settings'); return; }
     S.storeSettings.storeName    = name;
     S.storeSettings.taxRate      = parseFloat(document.getElementById('ss-tax-rate').value) || 0;
     S.storeSettings.defaultStore = document.getElementById('ss-default-store').value;
@@ -6923,7 +6955,7 @@ function wirePOSEvents() {
       S._settingsSaved = true;
       render();
       setTimeout(() => { S._settingsSaved = false; render(); }, 2500);
-    } catch (error) { alert(error.message); }
+    } catch (error) { showPOSNotice(error.message,'Settings'); }
   });
   const btnSaveReceipt = document.getElementById('btn-save-receipt-settings');
   if (btnSaveReceipt) btnSaveReceipt.addEventListener('click', async () => {
@@ -6935,20 +6967,20 @@ function wirePOSEvents() {
       S._settingsSaved = true;
       render();
       setTimeout(() => { S._settingsSaved = false; render(); }, 2500);
-    } catch (error) { alert(error.message); }
+    } catch (error) { showPOSNotice(error.message,'Settings'); }
   });
   const btnSaveRegister = document.getElementById('btn-save-register-settings');
   if (btnSaveRegister) btnSaveRegister.addEventListener('click', async () => {
     S.storeSettings.cashControl = document.getElementById('ss-cash-control').checked;
     S.storeSettings.openingControl = document.getElementById('ss-opening-control').checked;
     S.storeSettings.maximumDifference = Math.max(0, Number(document.getElementById('ss-max-difference').value)||0);
-    try { await posSaveSettings(S.storeSettings);await posBootstrap();S._settingsSaved=true;render();setTimeout(()=>{S._settingsSaved=false;render();},2500); } catch(error){alert(error.message);}
+    try { await posSaveSettings(S.storeSettings);await posBootstrap();S._settingsSaved=true;render();setTimeout(()=>{S._settingsSaved=false;render();},2500); } catch(error){showPOSNotice(error.message,'Settings');}
   });
   document.querySelectorAll('[data-payment-toggle]').forEach(cb => {
     cb.addEventListener('change', async () => {
       S.storeSettings.payments[cb.dataset.paymentToggle] = cb.checked;
       try { await posSaveSettings(S.storeSettings); }
-      catch (error) { cb.checked = !cb.checked; S.storeSettings.payments[cb.dataset.paymentToggle] = cb.checked; alert(error.message); }
+      catch (error) { cb.checked = !cb.checked; S.storeSettings.payments[cb.dataset.paymentToggle] = cb.checked; showPOSNotice(error.message,'Payment methods'); }
     });
   });
   document.getElementById('btn-save-extra-security')?.addEventListener('click', async () => {
@@ -6957,7 +6989,7 @@ function wirePOSEvents() {
       refund: Boolean(document.getElementById('ss-security-refund')?.checked),
       cash_out: Boolean(document.getElementById('ss-security-cash-out')?.checked),
     };
-    try { await posSaveSettings(S.storeSettings);await posBootstrap();S._settingsSaved=true;render();setTimeout(()=>{S._settingsSaved=false;render();},2500); } catch(error){alert(error.message);}
+    try { await posSaveSettings(S.storeSettings);await posBootstrap();S._settingsSaved=true;render();setTimeout(()=>{S._settingsSaved=false;render();},2500); } catch(error){showPOSNotice(error.message,'Settings');}
   });
 
   document.querySelectorAll('.pos-audit-filter').forEach(input => {
@@ -6983,7 +7015,7 @@ function wirePOSEvents() {
   if (shiftUSD) shiftUSD.addEventListener('input', () => { S.shiftCountedUSD = shiftUSD.value; render(); });
   const closeShiftBtn = document.getElementById('btn-close-shift');
   if (closeShiftBtn) closeShiftBtn.addEventListener('click', async () => {
-    if (!S.shiftCashier) { alert('Select a cashier before closing the shift.'); return; }
+    if (!S.shiftCashier) { showPOSNotice('Select a cashier before closing the shift.','Closing control'); return; }
     try {
       let result;
       try { result = await posCloseShift(S.shiftCashier, parseFloat(S.shiftCountedUSD)||0); }
@@ -6992,16 +7024,16 @@ function wirePOSEvents() {
           const cashierId=S.shiftCashier; const counted=parseFloat(S.shiftCountedUSD)||0;
           const expected=Number(S.posSessionSummary?.expected_cash||0); const variance=Math.abs(counted-expected);
           requireManagerApproval('close-variance', {label:'Close Register Difference',reason:'Approve closing cash variance',amount:variance,targetType:'pos_session',targetId:Number(S.posSession?.id),sessionId:Number(S.posSession?.id)}, async ({approvalId})=>{
-            try { const approved=await posCloseShift(cashierId,counted,true,approvalId); alert(`Shift saved.\nSystem cash: $${Number(approved.system_cash).toFixed(2)}\nCounted: $${Number(approved.counted_cash).toFixed(2)}\nVariance: $${Number(approved.variance).toFixed(2)}`); S.shiftCountedUSD='';S.shiftCashier=null;render(); }
-            catch(err){alert(err.message||'Approved register close failed.');}
+            try { const approved=await posCloseShift(cashierId,counted,true,approvalId); S.shiftCountedUSD='';S.shiftCashier=null;showPOSNotice(`System cash: $${Number(approved.system_cash).toFixed(2)}\nCounted: $${Number(approved.counted_cash).toFixed(2)}\nVariance: $${Number(approved.variance).toFixed(2)}`,'Shift saved'); }
+            catch(err){showPOSNotice(err.message||'Approved register close failed.','Register close failed');}
           });
           return;
         } else throw error;
       }
-      alert(`Shift saved.\nSystem cash: $${Number(result.system_cash).toFixed(2)}\nCounted: $${Number(result.counted_cash).toFixed(2)}\nVariance: $${Number(result.variance).toFixed(2)}`);
+      showPOSNotice(`System cash: $${Number(result.system_cash).toFixed(2)}\nCounted: $${Number(result.counted_cash).toFixed(2)}\nVariance: $${Number(result.variance).toFixed(2)}`,'Shift saved');
       S.shiftCountedUSD=''; S.shiftCashier=null;
       render();
-    } catch (error) { alert(error.message); }
+    } catch (error) { showPOSNotice(error.message,'Register close failed'); }
   });
   const resetShiftBtn = document.getElementById('btn-reset-shift');
   if (resetShiftBtn) resetShiftBtn.addEventListener('click', () => { S.shiftCountedUSD=''; render(); });
@@ -7171,13 +7203,9 @@ function wirePOSEvents() {
         const idx = parseInt(btn.dataset.resumeHeld);
         const held = (S.posHeldOrders||[])[idx];
         if (!held) return;
-        if (S.posCart.length > 0 && !confirm('Replace current cart with held order?')) return;
-        S.posCart = [...held.items];
-        S.posDebtCustomerId = held.customer || null;
-        S.posPaymentLines = Array.isArray(held.payment_lines) ? [...held.payment_lines] : [];
-        S.posCashTendered = '';
-        posScheduleQuote(0);
-        S.posHeldOrders.splice(idx, 1); S.posShowHeld = false; render();
+        const resume=()=>{S.posCart=[...held.items];S.posDebtCustomerId=held.customer||null;S.posPaymentLines=Array.isArray(held.payment_lines)?[...held.payment_lines]:[];S.posCashTendered='';posScheduleQuote(0);S.posHeldOrders.splice(idx,1);S.posShowHeld=false;render();};
+        if(S.posCart.length>0)showPOSConfirm('Replace the current cart with this held order?',resume,'Resume held order','Replace cart');
+        else resume();
       });
     });
     document.querySelectorAll('[data-discard-held]').forEach(btn => {
@@ -7247,7 +7275,7 @@ function wirePOSEvents() {
       catch (error) {
         cb.checked = !cb.checked;
         S.storeSettings.payments[pmName] = cb.checked;
-        alert(error.message);
+        showPOSNotice(error.message,'Payment methods');
       }
     });
   });
@@ -7257,7 +7285,7 @@ function wirePOSEvents() {
       S.storeSettings.payments[cb.dataset.pm] = cb.checked;
     });
     try { await posSaveSettings(S.storeSettings); S._settingsSaved=true; render(); setTimeout(()=>{S._settingsSaved=false;render();},2500); }
-    catch (error) { alert(error.message); }
+    catch (error) { showPOSNotice(error.message,'Payment methods'); }
   });
 
   // ---- Config → Currencies ----
@@ -7274,7 +7302,7 @@ function wirePOSEvents() {
   // ---- Back-office stock alert link ----
   document.getElementById('btn-dashboard-stock-alerts')?.addEventListener('click', async () => {
     S.posBackofficeTab = 'reports-stock'; render();
-    try { await posLoadStockAlerts(); } catch(error) { alert(error.message); }
+    try { await posLoadStockAlerts(); } catch(error) { showPOSNotice(error.message,'Stock alerts'); }
   });
 
 }
@@ -7282,13 +7310,13 @@ function wirePOSEvents() {
 
 async function finalizeCharge() {
   if (S.isOffline) {
-    alert('Checkout needs a connection so stock and the receipt can be saved safely.');
+    showPOSNotice('Checkout needs a connection so stock and the receipt can be saved safely.','Connection required');
     return;
   }
   if (!S.posSession || S.posSession.state !== 'OPENED') {
     // Odoo pattern: block, force operator through Opening Control, then retry.
     openRegisterModal('open');
-    alert('The register is closed. Open it (with the correct opening cash) before validating this sale.');
+    showPOSNotice('The register is closed. Open it with the correct opening cash before validating this sale.','Register closed');
     render(); return;
   }
   const cart = S.posCart.map(item => ({ ...item }));
@@ -7298,7 +7326,7 @@ async function finalizeCharge() {
   const acceptedQuote = S.posQuote;
   // Front-side validation gate (backend re-validates every line).
   const check = posPaymentLinesValid(total);
-  if (!check.ok) { alert(check.reason); render(); return; }
+  if (!check.ok) { showPOSNotice(check.reason,'Check payment'); return; }
   const lines = (S.posPaymentLines || []).map(l => ({
     method: l.method_name,
     amount: Number(l.amount),
@@ -7340,12 +7368,12 @@ async function finalizeCharge() {
     if (S.posLastReceipt.credit_warning) {
       // Odoo-mode warn: surface after the sale succeeded (Rule #28).
       const w = S.posLastReceipt.credit_warning;
-      setTimeout(() => alert(`Credit warning: this customer's balance is now $${Number(w.projected_balance).toFixed(2)}, which is $${Number(w.overage).toFixed(2)} over their $${Number(w.credit_limit).toFixed(2)} limit.`), 50);
+      setTimeout(() => showPOSNotice(`This customer's balance is now $${Number(w.projected_balance).toFixed(2)}, which is $${Number(w.overage).toFixed(2)} over their $${Number(w.credit_limit).toFixed(2)} limit.`,'Credit limit warning'), 50);
     }
   } catch (error) {
     if (error.simulatedLostResponse) S.posCheckoutUncertain = true;
     S.posMobileMoneyModal = false;
-    alert(error.message);
+    showPOSNotice(error.message,'Checkout failed');
     render();
   }
 }

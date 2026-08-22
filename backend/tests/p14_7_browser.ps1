@@ -43,7 +43,9 @@ try {
   const customer=POS_CUSTOMERS.find(c=>Number(c.debtBalance)>=25);if(!customer)throw new Error('No customer with $25 debt');
   const debtBefore=Number(customer.debtBalance);
   const settlement=await twice(()=>posCollectDebt(customer.id,25,'Cash','P14.7 settlement'));
-  return {session_id:S.posSession.id,order_id:orderId,refund_id:refund.replay.id,cash_in_id:cashIn.replay.id,cash_out_id:cashOut.replay.id,customer_id:customer.id,debt_before:debtBefore,debt_after:Number(settlement.replay.balance),results:{checkout,refund,cashIn,cashOut,settlement},evidence:posIdempotencyEvidence()};
+  const harness_scope={localhost:posTestLossAllowed('localhost'),loopback:posTestLossAllowed('127.0.0.1'),production:posTestLossAllowed('pos.curdun.so'),lookalike:posTestLossAllowed('localhost.example.com')};
+  if(!harness_scope.localhost||!harness_scope.loopback||harness_scope.production||harness_scope.lookalike)throw new Error(`Unsafe loss-harness scope: ${JSON.stringify(harness_scope)}`);
+  return {session_id:S.posSession.id,order_id:orderId,refund_id:refund.replay.id,cash_in_id:cashIn.replay.id,cash_out_id:cashOut.replay.id,customer_id:customer.id,debt_before:debtBefore,debt_after:Number(settlement.replay.balance),harness_scope,results:{checkout,refund,cashIn,cashOut,settlement},evidence:posIdempotencyEvidence()};
 })()
 '@
     $message = @{id=1;method='Runtime.evaluate';params=@{expression=$script;awaitPromise=$true;returnByValue=$true}} | ConvertTo-Json -Depth 8 -Compress

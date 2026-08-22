@@ -9,8 +9,11 @@ const API_BASE = '/api/v1';
 // then withheld from application code exactly once per action/key. Evidence
 // remains in sessionStorage for browser/DB assertions. No production request
 // is ever randomly intercepted.
+function posTestLossAllowed(hostname) {
+  return ['localhost','127.0.0.1'].includes(String(hostname || '').toLowerCase());
+}
 function posTestLossConfig() {
-  if (!['localhost','127.0.0.1'].includes(location.hostname)) return new Set();
+  if (!posTestLossAllowed(location.hostname)) return new Set();
   const params=new URLSearchParams(location.search);
   if (params.get('pos_test_reset')==='1' && !sessionStorage.getItem('pos_test_reset_done')) {
     sessionStorage.removeItem('pos_idempotency_evidence');

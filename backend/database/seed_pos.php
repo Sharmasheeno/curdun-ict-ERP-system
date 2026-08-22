@@ -72,6 +72,24 @@ try {
         $stmt->execute([$companyId,$categoryId,$sku,'6901234'.str_pad((string)($index+1),3,'0',STR_PAD_LEFT),$name,$retail,$wholesale,10,$stock]);
     }
 
+    // P14.8 deterministic pricing fixture. A clean seeded environment must
+    // reproduce the cashier threshold scenario without relying on rules that
+    // were created manually in a developer database. Deliberately seed only
+    // the qty-10 product rule: qty 9 remains the $12 base price.
+    $stmt=$pdo->prepare("INSERT INTO pos_pricelists (company_id,name,currency,active,`sequence`) VALUES (?,'Promotion','USD',1,30) ON DUPLICATE KEY UPDATE active=1,`sequence`=VALUES(`sequence`)");
+    $stmt->execute([$companyId]);
+    $stmt=$pdo->prepare("SELECT id FROM pos_pricelists WHERE company_id=? AND name='Promotion' LIMIT 1");$stmt->execute([$companyId]);$promotionPricelistId=(int)$stmt->fetchColumn();
+    $stmt=$pdo->prepare("SELECT id FROM products WHERE company_id=? AND name='Basmati Rice 5kg' AND deleted_at IS NULL LIMIT 1");$stmt->execute([$companyId]);$basmatiId=(int)$stmt->fetchColumn();
+    $stmt=$pdo->prepare("SELECT id FROM pos_pricelist_items WHERE pricelist_id=? AND applies_to='product' AND product_id=? AND min_quantity=10 LIMIT 1");
+    $stmt->execute([$promotionPricelistId,$basmatiId]);$thresholdRuleId=(int)($stmt->fetchColumn()?:0);
+    if($thresholdRuleId){
+        $stmt=$pdo->prepare("UPDATE pos_pricelist_items SET price_type='fixed',fixed_price=10.50,discount_percent=NULL,`sequence`=40,active=1 WHERE id=?");$stmt->execute([$thresholdRuleId]);
+    }else{
+        $stmt=$pdo->prepare("INSERT INTO pos_pricelist_items (pricelist_id,applies_to,product_id,min_quantity,price_type,fixed_price,`sequence`,active) VALUES (?,'product',?,10,'fixed',10.50,40,1)");$stmt->execute([$promotionPricelistId,$basmatiId]);
+    }
+    $stmt=$pdo->prepare("INSERT INTO pos_config_pricelists (pos_config_id,pricelist_id,is_default,`sequence`) SELECT id,?,0,30 FROM pos_configs WHERE company_id=? ON DUPLICATE KEY UPDATE is_default=0,`sequence`=VALUES(`sequence`)");
+    $stmt->execute([$promotionPricelistId,$companyId]);
+
     $customers=[['Abdi Mohamed','061-234-5678',500,120],['Halima Farah','061-345-6789',200,0],['Yusuf Hassan','061-456-7890',800,645.50],['Amina Osman','061-901-2345',700,0]];
     foreach($customers as $index=>$customer){[$name,$phone,$limit,$balance]=$customer;$code='SHIFO-C'.str_pad((string)($index+1),3,'0',STR_PAD_LEFT);
         $stmt=$pdo->prepare("INSERT INTO customers (company_id,customer_code,name,phone,credit_limit,balance,status) VALUES (?,?,?,?,?,?,'active') ON DUPLICATE KEY UPDATE company_id=VALUES(company_id),name=VALUES(name),phone=VALUES(phone),credit_limit=VALUES(credit_limit),deleted_at=NULL,status='active'");$stmt->execute([$companyId,$code,$name,$phone,$limit,$balance]);}

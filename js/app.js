@@ -5357,7 +5357,7 @@ function renderPOSCustomerAccountModal() {
   const methods=posConfiguredMethods().filter(method=>method.type!=='credit'&&!method.identifyCustomer);
   const selectedMethod=state.method || methods[0]?.name || '';
   const selectedMeta=methods.find(method=>method.name===selectedMethod);
-  const typeLabels={DEYN_SALE:'Deyn Sale',DEYN_PAYMENT:'Payment',DEYN_REFUND_REVERSAL:'Refund Reversal'};
+  const typeLabels={DEYN_SALE:'Customer Account Sale',DEYN_PAYMENT:'Customer Account Payment',DEYN_REFUND_REVERSAL:'Refund Reversal'};
   return `<div class="crud-overlay">
     <div class="crud-modal" style="max-width:980px;width:calc(100vw - 30px)">
       <div class="crud-modal-header"><div><h3>Customer Account — ${esc(c.name)}</h3><div style="font-size:11px;color:var(--text-muted)">Sales, payments and refund reversals are kept separate from Loyalty.</div></div><button class="crud-close-btn" id="btn-account-close">×</button></div>
@@ -5367,7 +5367,7 @@ function renderPOSCustomerAccountModal() {
           <div class="kpi-card dark"><div class="kpi-eyebrow" style="color:#F5C411">Outstanding Balance</div><div class="kpi-value">$${Number(c.balance).toFixed(2)}</div></div>
           <div class="kpi-card light"><div class="kpi-eyebrow">Credit Limit</div><div class="kpi-value">$${Number(c.credit_limit).toFixed(2)}</div></div>
           <div class="kpi-card light"><div class="kpi-eyebrow">Available Credit</div><div class="kpi-value">$${Number(c.available_credit).toFixed(2)}</div></div>
-          <div class="kpi-card light"><div class="kpi-eyebrow">Deyn Sales</div><div class="kpi-value">$${Number(totals.purchases||0).toFixed(2)}</div><div class="kpi-trend">Payments $${Number(totals.payments||0).toFixed(2)} · Reversals $${Number(totals.reversals||0).toFixed(2)}</div></div>
+          <div class="kpi-card light"><div class="kpi-eyebrow">Customer Account Sales</div><div class="kpi-value">$${Number(totals.purchases||0).toFixed(2)}</div><div class="kpi-trend">Payments $${Number(totals.payments||0).toFixed(2)} · Refund Reversals $${Number(totals.reversals||0).toFixed(2)}</div></div>
         </div>
         ${state.settleOpen ? `<div style="padding:14px;border:1px solid var(--border);border-radius:10px;margin-bottom:14px;background:var(--gray-50)">
           <h4 style="margin:0 0 10px;color:var(--purple-800)">Customer Account Payment</h4>
@@ -5518,7 +5518,9 @@ function renderPOSCustomers() {
                     <button class="btn btn-xs btn-outline" data-account-customer="${c.id}">Account</button>
                     <button class="btn btn-xs btn-outline" data-collect-deyn="${c.id}" ${c.debtBalance===0?'disabled':''}>Payment</button>
                     <button class="crud-btn crud-btn-edit" data-edit-customer="${c.id}" title="Edit">✏️</button>
-                    <button class="crud-btn crud-btn-delete" data-delete-customer="${c.id}" title="Delete">🗑️</button>
+                    ${hasDebt
+                      ? '<button class="crud-btn crud-btn-delete" disabled title="Customers with outstanding debt cannot be deleted; settle or archive after payment." aria-label="Delete unavailable while debt is outstanding">🗑️</button>'
+                      : `<button class="crud-btn crud-btn-delete" data-delete-customer="${c.id}" title="Archive customer">🗑️</button>`}
                   </div>
                 </td>
               </tr>`;

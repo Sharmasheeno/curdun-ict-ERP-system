@@ -20,3 +20,11 @@ The backend owns default capability matrices. `pos_configs.capability_overrides`
 Changing a store type is rejected while that POS configuration has an opening, open, or closing-control session. Unknown store types and capability keys are rejected with HTTP 422.
 
 V2-P1 does not implement variants, serials, batches, deliveries, tables, or kitchen workflows. It only provides their authoritative configuration foundation for later V2 phases.
+
+## V2-P2 navigation and configuration
+
+Navigation reads the resolved bootstrap capability matrix through `posHasStoreCapability()`. Store-specific modules that do not yet exist are deliberately absent from production navigation; Settings lists them with their planned V2 phase instead of presenting fake pages.
+
+Settings → Store Features shows the canonical store type, resolved state, store-type default, and any explicit override. Shared financial-core capabilities are visible but cannot be overridden. Only optional store-specific capabilities accept explicit On/Off overrides.
+
+Future specialized service operations must call the backend store-capability guard before reading or changing their domain data. Until those modules exist, their API routes remain unregistered, so hidden navigation cannot be bypassed with a direct request.

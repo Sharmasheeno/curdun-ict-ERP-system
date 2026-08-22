@@ -115,6 +115,10 @@ const S = {
     cashControl: true,
     openingControl: true,
     maximumDifference: 20,
+    storeType: 'retail',
+    storeCapabilities: {},
+    storeCapabilityDefaults: {},
+    capabilityOverrides: {},
     extraSecurity: { refund:false, cash_out:false },
     payments:        { Cash: true, 'EVC Plus': true, eDahab: true, ZAAD: true, Sahal: true, Deyn: true },
   },
@@ -248,6 +252,33 @@ const S = {
 
   liveTick: 0,
 };
+
+const POS_STORE_TYPES = [
+  ['retail','Retail'],['bakery_food','Bakery & Food'],['fashion','Fashion'],
+  ['furniture_home','Furniture & Home'],['restaurant','Restaurant'],['electronics','Electronics'],
+];
+const POS_STORE_FEATURE_CATALOG = [
+  {key:'inventory',label:'Inventory',implemented:true,core:true},
+  {key:'customer_account',label:'Customer Account',implemented:true,core:true},
+  {key:'loyalty',label:'Loyalty',implemented:true,core:true},
+  {key:'pricelists',label:'Pricelists',implemented:true,core:true},
+  {key:'refunds',label:'Refunds',implemented:true,core:true},
+  {key:'cash_control',label:'Cash Control',implemented:true,core:true},
+  {key:'variants',label:'Variants',implemented:false,phase:'V2-P4'},
+  {key:'serial_numbers',label:'Serial Numbers',implemented:false,phase:'V2-P5'},
+  {key:'warranties',label:'Warranties',implemented:false,phase:'V2-P5'},
+  {key:'batches',label:'Batches',implemented:false,phase:'V2-P6'},
+  {key:'expiry_tracking',label:'Expiry Tracking',implemented:false,phase:'V2-P6'},
+  {key:'delivery',label:'Delivery',implemented:false,phase:'V2-P7'},
+  {key:'tables',label:'Tables',implemented:false,phase:'V2-P8'},
+  {key:'kitchen_orders',label:'Kitchen',implemented:false,phase:'V2-P8'},
+  {key:'order_notes',label:'Order Notes',implemented:false,phase:'V2-P8'},
+  {key:'dine_in',label:'Dine In',implemented:false,phase:'V2-P8'},
+  {key:'takeaway',label:'Takeaway',implemented:false,phase:'V2-P8'},
+];
+function posStoreNavigationModel() {
+  return POS_STORE_FEATURE_CATALOG.filter(feature=>feature.implemented&&posHasStoreCapability(feature.key));
+}
 
 // ============================================================
 // HELPERS
@@ -4112,7 +4143,7 @@ function renderPOSTopNav() {
 
       <button class="pos-topnav-item${tab==='dashboard'?' active':''}" data-nav-direct="dashboard">Dashboard</button>
       ${navItem('orders','Orders',true)}
-      ${navItem('products','Products',true)}
+      ${navItem('products',posHasStoreCapability('tables')?'Menu Items':'Products',true)}
       ${navItem('reporting','Reporting',true)}
       ${showConfigMenu ? navItem('configuration','Configuration',true) : ''}
     </div>
@@ -6185,6 +6216,9 @@ function renderPOSPayments() {
 
 function renderPOSSettings() {
   const s = S.storeSettings;
+  const overrides=s.capabilityOverrides||{};
+  const defaults=s.storeCapabilityDefaults||{};
+  const resolved=s.storeCapabilities||S.posStoreCapabilities||{};
   const stores = (S.posBranches || []).length
     ? S.posBranches.map(branch => branch.name)
     : [s.defaultStore || 'Main Store'];
@@ -6196,6 +6230,34 @@ function renderPOSSettings() {
     <div class="section-header-bar" style="margin-bottom:16px"><h3 class="chart-title">⚙️ Configuration Settings</h3></div>
     <div style="max-width:600px">
       ${savedBanner}
+
+      <div class="card" style="padding:24px;margin-bottom:16px" id="pos-store-features">
+        <h3 style="font-size:16px;font-weight:800;margin-bottom:4px">Store Features</h3>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:16px">Backend-resolved capabilities control navigation and future store-specific endpoints. Unfinished modules stay hidden in production.</div>
+        <div class="form-group" style="margin-bottom:16px">
+          <label class="form-label">Store Type</label>
+          <select class="form-select" id="ss-store-type" ${S.posSession&&S.posSession.state!=='CLOSED'?'disabled':''}>
+            ${POS_STORE_TYPES.map(([key,label])=>`<option value="${key}" ${s.storeType===key?'selected':''}>${label}</option>`).join('')}
+          </select>
+          ${S.posSession&&S.posSession.state!=='CLOSED'?'<div style="font-size:11px;color:#B45309;margin-top:5px">Close the register before changing store type.</div>':''}
+        </div>
+        <div class="pos-store-feature-list">
+          ${POS_STORE_FEATURE_CATALOG.map(feature=>{
+            const explicit=Object.prototype.hasOwnProperty.call(overrides,feature.key);
+            const enabled=Boolean(resolved[feature.key]);
+            return `<div class="pos-store-feature-row" data-store-feature-row="${feature.key}">
+              <div><strong>${feature.label}</strong><small>${feature.implemented?'Available now':`Planned ${feature.phase}`}</small></div>
+              <span class="pill ${enabled?'pill-green':'pill-gray'}">${enabled?'Enabled':'Disabled'}</span>
+              <select class="form-select pos-store-capability-override" data-store-capability="${feature.key}" aria-label="${feature.label} override" ${feature.core?'disabled':''}>
+                <option value="default" ${!explicit?'selected':''}>Default (${Boolean(defaults[feature.key])?'On':'Off'})</option>
+                <option value="on" ${explicit&&overrides[feature.key]===true?'selected':''}>Explicit On</option>
+                <option value="off" ${explicit&&overrides[feature.key]===false?'selected':''}>Explicit Off</option>
+              </select>
+            </div>`;
+          }).join('')}
+        </div>
+        <button class="btn btn-primary btn-sm" id="btn-save-store-features" style="margin-top:16px">Save Store Features</button>
+      </div>
 
       <div class="card" style="padding:24px;margin-bottom:16px">
         <h3 style="font-size:16px;font-weight:800;margin-bottom:16px">Store Settings</h3>
@@ -6926,6 +6988,17 @@ function wirePOSEvents() {
   });
 
   // ---- POS Settings tab ----
+  document.getElementById('btn-save-store-features')?.addEventListener('click', async () => {
+    const type=document.getElementById('ss-store-type')?.value||S.posStoreType||'retail';
+    const overrides={};
+    document.querySelectorAll('.pos-store-capability-override').forEach(select=>{
+      if(select.value!=='default')overrides[select.dataset.storeCapability]=select.value==='on';
+    });
+    try {
+      await posSetStoreType(type,overrides);
+      S._settingsSaved=true;render();setTimeout(()=>{S._settingsSaved=false;render();},2500);
+    } catch(error) { showPOSNotice(error.message,'Store Features'); }
+  });
   // Store settings save
   const btnSaveStore = document.getElementById('btn-save-store-settings');
   if (btnSaveStore) btnSaveStore.addEventListener('click', async () => {

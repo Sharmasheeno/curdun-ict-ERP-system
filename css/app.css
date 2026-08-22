@@ -1884,6 +1884,19 @@
 
 .pos-stock-alert-mobile-list { display: none; }
 
+.pos-store-feature-list { display: grid; gap: 8px; }
+.pos-store-feature-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) auto minmax(170px, 210px);
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.pos-store-feature-row strong { display: block; font-size: 13px; }
+.pos-store-feature-row small { display: block; margin-top: 3px; color: var(--text-muted); font-size: 10px; }
+.pill-gray { background: var(--gray-100); color: var(--text-muted); border: 1px solid var(--border); }
+
 /* The current POS uses a horizontal top navigation rather than the legacy
    sidebar handled by the older responsive rules above. Keep controls usable
    at laptop/tablet widths, then turn navigation into a touch-scroll row. */
@@ -2048,6 +2061,10 @@
     text-align: center;
     color: var(--text-muted);
   }
+  .pos-store-feature-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .pos-store-feature-row .form-select { grid-column: 1 / -1; }
 }
 
 @media (max-width: 420px) {

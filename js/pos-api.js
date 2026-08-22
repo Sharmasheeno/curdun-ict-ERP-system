@@ -248,6 +248,10 @@ function posApplyBootstrap(data) {
     S.storeSettings.cashControl = Boolean(data.settings.cash_control ?? S.storeSettings.cashControl);
     S.storeSettings.openingControl = Boolean(data.settings.opening_control ?? S.storeSettings.openingControl);
     S.storeSettings.maximumDifference = Number(data.settings.maximum_difference ?? S.storeSettings.maximumDifference);
+    S.storeSettings.storeType = data.settings.store_type || S.posStoreType;
+    S.storeSettings.storeCapabilities = { ...(data.settings.store_capabilities || S.posStoreCapabilities) };
+    S.storeSettings.storeCapabilityDefaults = { ...(data.settings.store_capability_defaults || {}) };
+    S.storeSettings.capabilityOverrides = { ...(data.settings.capability_overrides || {}) };
     S.storeSettings.extraSecurity = { ...(S.storeSettings.extraSecurity || {}), ...(data.settings.extra_security || {}) };
     S.storeSettings.payments = data.settings.payments || S.storeSettings.payments;
     S.posPaymentMethodsMeta = data.settings.payment_methods || [];

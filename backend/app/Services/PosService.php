@@ -532,17 +532,31 @@ class PosService
         });
     }
 
+    private function storeCapabilityOverrideKeys(): array
+    {
+        return ['variants','batches','expiry_tracking','serial_numbers','warranties','tables','kitchen_orders','order_notes','dine_in','takeaway','delivery'];
+    }
+
     private function decorateStoreConfig(array $config): array
     {
         $type=$this->normalizeStoreType($config['store_type']??$config['profile_type']??'retail');
         $overrides=json_decode((string)($config['capability_overrides']??''),true);
         if(!is_array($overrides))$overrides=[];
         $defaults=$this->storeCapabilityDefaults($type);
-        $safe=[];foreach($overrides as $key=>$value)if(array_key_exists($key,$defaults))$safe[$key]=(bool)$value;
+        $safe=[];foreach($overrides as $key=>$value)if(in_array($key,$this->storeCapabilityOverrideKeys(),true))$safe[$key]=(bool)$value;
         $config['store_type']=$type;
         $config['capability_overrides']=$safe;
+        $config['capability_defaults']=$defaults;
         $config['capabilities']=array_replace($defaults,$safe);
         return $config;
+    }
+
+    /** Guard for every future store-specific service operation. */
+    private function requireStoreCapability(array $config,string $capability): void
+    {
+        $resolved=$this->decorateStoreConfig($config);
+        if(!array_key_exists($capability,$resolved['capabilities']))throw new Exception('Unknown store capability: '.$capability,422);
+        if(!$resolved['capabilities'][$capability])throw new Exception('This feature is disabled for the active POS configuration.',403);
     }
 
     private function currentSessionForConfig(int $companyId,int $configId,bool $lock=false): ?array
@@ -2596,7 +2610,7 @@ class PosService
                 'assigned'          => (int)$m['is_assigned'] === 1,
             ];
         }
-        $defaults=['store_name'=>Auth::user()['company_name']??'Retail Store','tax_rate'=>5,'receipt_header'=>Auth::user()['company_name']??'Retail Store','receipt_footer'=>'Thank you for shopping with us!','receipt_barcode'=>true,'default_branch_id'=>Auth::user()['branch_id']??null,'cash_control'=>true,'opening_control'=>true,'maximum_difference'=>20,'payments'=>$paymentsDefault,'payment_methods'=>$paymentMethodsMeta,'pos_config_id'=>$activeConfigId,'store_type'=>$activeConfig['store_type']??'retail','store_capabilities'=>$activeConfig['capabilities']??$this->storeCapabilityDefaults('retail'),'capability_overrides'=>$activeConfig['capability_overrides']??[],'extra_security'=>$extraSecurityDefaults];
+        $defaults=['store_name'=>Auth::user()['company_name']??'Retail Store','tax_rate'=>5,'receipt_header'=>Auth::user()['company_name']??'Retail Store','receipt_footer'=>'Thank you for shopping with us!','receipt_barcode'=>true,'default_branch_id'=>Auth::user()['branch_id']??null,'cash_control'=>true,'opening_control'=>true,'maximum_difference'=>20,'payments'=>$paymentsDefault,'payment_methods'=>$paymentMethodsMeta,'pos_config_id'=>$activeConfigId,'store_type'=>$activeConfig['store_type']??'retail','store_capabilities'=>$activeConfig['capabilities']??$this->storeCapabilityDefaults('retail'),'store_capability_defaults'=>$activeConfig['capability_defaults']??$this->storeCapabilityDefaults('retail'),'capability_overrides'=>$activeConfig['capability_overrides']??[],'extra_security'=>$extraSecurityDefaults];
         $rows=$this->db->query("SELECT `key`,value,type FROM settings WHERE company_id=:company AND `key` LIKE 'pos.%'",['company'=>$companyId])->fetchAll();
         foreach($rows as $row){
             $key=substr($row['key'],4);
@@ -2722,7 +2736,7 @@ class PosService
             $open=(int)$this->db->query("SELECT COUNT(*) FROM pos_sessions WHERE company_id=:company AND config_id=:config AND state IN ('OPENING_CONTROL','OPENED','CLOSING_CONTROL')",['company'=>$companyId,'config'=>$config['id']])->fetchColumn();
             if($open&&$nextType!==$config['store_type'])throw new Exception('Close the register before changing its store type.',409);
             $overrides=$data['capability_overrides']??$config['capability_overrides'];if(!is_array($overrides))throw new Exception('Capability overrides must be an object.',422);
-            $defaults=$this->storeCapabilityDefaults($nextType);$safe=[];foreach($overrides as $key=>$value){if(!array_key_exists($key,$defaults))throw new Exception('Unknown store capability: '.$key,422);$safe[$key]=(bool)$value;}
+            $defaults=$this->storeCapabilityDefaults($nextType);$safe=[];foreach($overrides as $key=>$value){if(!array_key_exists($key,$defaults))throw new Exception('Unknown store capability: '.$key,422);if(!in_array($key,$this->storeCapabilityOverrideKeys(),true))throw new Exception('Core POS capability cannot be overridden: '.$key,422);$safe[$key]=(bool)$value;}
             $this->db->query("UPDATE pos_configs SET store_type=:type,capability_overrides=:overrides WHERE id=:id AND company_id=:company",['type'=>$nextType,'overrides'=>json_encode($safe),'id'=>$config['id'],'company'=>$companyId]);
             $config=$this->resolveConfig($companyId,(int)($config['branch_id']??0));
         }
